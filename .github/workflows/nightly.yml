@@ -1,0 +1,25 @@
+name: Nightly Greenville lead ingest
+
+on:
+  schedule:
+    # 10:00 UTC ≈ 6:00 AM Eastern (5:00 AM during EST). Runs every night.
+    - cron: "0 10 * * *"
+  workflow_dispatch: {}  # lets you click "Run workflow" manually in the Actions tab to test
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tax sale ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/tax_sale_ingest.py
