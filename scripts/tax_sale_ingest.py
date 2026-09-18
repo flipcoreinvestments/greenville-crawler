@@ -30,19 +30,51 @@ import time
 import json
 from datetime import datetime, timezone
 
+import random
+
 import requests
 from bs4 import BeautifulSoup
 import psycopg2
 import psycopg2.extras
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 LIST_URL = "https://www.greenvillecounty.org/appsas400/taxsale/"
 DETAILS_URL = "https://www.greenvillecounty.org/appsas400/RealProperty/Details.aspx?TaxYear={year}&MapNumber={map_number}"
 HEADERS = {
     "User-Agent": "RestartHomesResearch/1.0 (+info@restarthomes.net; one-off public-record lookup, low volume)"
 }
-REQUEST_DELAY_SECONDS = 1.0  # be polite to the county's server
+REQUEST_DELAY_SECONDS = 1.5  # be polite to the county's server
+ROW_RETRY_ATTEMPTS = 3
+CONSECUTIVE_MISS_LIMIT = 5  # this many blocked in a row -> assume a soft block, cool down and reset session
+COOLDOWN_SECONDS = 90
 SOURCE_NAME = "tax_sale"
+
+
+def new_browser_context(browser):
+    context = browser.new_context(user_agent=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ))
+    page = context.new_page()
+    stealth_sync(page)
+    return context, page
+
+
+def fetch_details_html(page, url):
+    """Navigate with retries — the county's Imperva bot-check intermittently
+    serves a challenge page instead of the real content. A retry after a short
+    wait usually gets through."""
+    last_html = None
+    for attempt in range(ROW_RETRY_ATTEMPTS):
+        page.goto(url, timeout=30000)
+        page.wait_for_timeout(1200)  # let any JS challenge/redirect settle
+        html = page.content()
+        last_html = html
+        if "Location:" in html or "Location" in BeautifulSoup(html, "html.parser").get_text():
+            return html
+        time.sleep(2 + attempt * 3)
+    return last_html
 
 
 def fetch(url):
@@ -222,20 +254,16 @@ def main():
     conn = psycopg2.connect(db_url)
     new_count = 0
     error_count = 0
+    consecutive_misses = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        context = browser.new_context(user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        ))
-        page = context.new_page()
+        context, page = new_browser_context(browser)
 
         for i, row in enumerate(rows):
             try:
                 url = DETAILS_URL.format(year=datetime.now().year, map_number=row["map_number"])
-                page.goto(url, timeout=30000)
-                details_html = page.content()
+                details_html = fetch_details_html(page, url)
                 details = parse_details(details_html)
                 location = details.get("Location")
                 mailing = details.get("Mailing Address")
@@ -243,6 +271,7 @@ def main():
                 absentee = guess_absentee(location, mailing)
 
                 if location:
+                    consecutive_misses = 0
                     inserted = upsert_lead(
                         conn,
                         address=location,
@@ -255,7 +284,14 @@ def main():
                     if inserted:
                         new_count += 1
                 else:
-                    print(f"  map {row['map_number']}: no Location field found, skipping")
+                    consecutive_misses += 1
+                    print(f"  map {row['map_number']}: no Location field found after retries, skipping (miss streak {consecutive_misses})")
+                    if consecutive_misses >= CONSECUTIVE_MISS_LIMIT:
+                        print(f"  {consecutive_misses} misses in a row — cooling down {COOLDOWN_SECONDS}s and starting a fresh browser session")
+                        context.close()
+                        time.sleep(COOLDOWN_SECONDS)
+                        context, page = new_browser_context(browser)
+                        consecutive_misses = 0
 
             except Exception as e:
                 error_count += 1
@@ -264,7 +300,7 @@ def main():
             if (i + 1) % 50 == 0:
                 print(f"  ...{i + 1}/{len(rows)} processed ({new_count} ok, {error_count} errors)")
 
-            time.sleep(REQUEST_DELAY_SECONDS)
+            time.sleep(REQUEST_DELAY_SECONDS + random.uniform(0, 0.8))
 
         browser.close()
 
