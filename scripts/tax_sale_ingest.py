@@ -202,6 +202,11 @@ def main():
     rows = parse_list(list_html)
     print(f"Found {len(rows)} parcels on the list.")
 
+    max_rows = os.environ.get("MAX_ROWS")
+    if max_rows:
+        rows = rows[: int(max_rows)]
+        print(f"MAX_ROWS set — processing only the first {len(rows)}.")
+
     if not rows:
         print("No rows parsed — the county likely changed the page layout. Check the HTML structure.")
         conn = psycopg2.connect(db_url)
