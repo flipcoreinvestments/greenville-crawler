@@ -4,7 +4,11 @@ on:
   schedule:
     # 10:00 UTC ≈ 6:00 AM Eastern (5:00 AM during EST). Runs every night.
     - cron: "0 10 * * *"
-  workflow_dispatch: {}  # lets you click "Run workflow" manually in the Actions tab to test
+  workflow_dispatch:
+    inputs:
+      max_rows:
+        description: "Optional: limit how many parcels to process (leave blank for all)"
+        required: false
 
 jobs:
   ingest:
@@ -22,4 +26,5 @@ jobs:
       - name: Run tax sale ingest
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MAX_ROWS: ${{ github.event.inputs.max_rows }}
         run: python scripts/tax_sale_ingest.py
