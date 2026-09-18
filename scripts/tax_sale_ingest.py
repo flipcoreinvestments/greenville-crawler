@@ -9,7 +9,10 @@ robots.txt checked 2026-09-18: /appsas400/ is not disallowed.
 What this does:
 1. Fetches the current tax sale list (owner name, map/parcel number, amount due).
 2. For each parcel, fetches the Real Property Details page to get the actual
-   property address, owner mailing address, and land use.
+   property address, owner mailing address, and land use. The details pages
+   sit behind an Imperva bot-check that blocks plain HTTP requests after the
+   first few dozen, so these are fetched with a real headless browser
+   (Playwright/Chromium) instead of the `requests` library.
 3. Upserts each property into the `leads` table in Supabase, tagging it
    'tax_sale' in source_tags.
 4. Recomputes a transparent, rule-based motivation score for every row this
@@ -31,13 +34,14 @@ import requests
 from bs4 import BeautifulSoup
 import psycopg2
 import psycopg2.extras
+from playwright.sync_api import sync_playwright
 
 LIST_URL = "https://www.greenvillecounty.org/appsas400/taxsale/"
 DETAILS_URL = "https://www.greenvillecounty.org/appsas400/RealProperty/Details.aspx?TaxYear={year}&MapNumber={map_number}"
 HEADERS = {
     "User-Agent": "RestartHomesResearch/1.0 (+info@restarthomes.net; one-off public-record lookup, low volume)"
 }
-REQUEST_DELAY_SECONDS = 1.5  # be polite to the county's server
+REQUEST_DELAY_SECONDS = 1.0  # be polite to the county's server
 SOURCE_NAME = "tax_sale"
 
 
@@ -217,35 +221,52 @@ def main():
 
     conn = psycopg2.connect(db_url)
     new_count = 0
+    error_count = 0
 
-    for i, row in enumerate(rows):
-        try:
-            details_html = fetch(DETAILS_URL.format(year=datetime.now().year, map_number=row["map_number"]))
-            details = parse_details(details_html)
-            location = details.get("Location")
-            mailing = details.get("Mailing Address")
-            owner = details.get("Owner(s)") or row["owner_name"]
-            absentee = guess_absentee(location, mailing)
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        context = browser.new_context(user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ))
+        page = context.new_page()
 
-            if location:
-                inserted = upsert_lead(
-                    conn,
-                    address=location,
-                    owner_name=owner,
-                    mailing_address=mailing,
-                    is_absentee=absentee,
-                    amount_due=row["amount_due"],
-                    map_number=row["map_number"],
-                )
-                if inserted:
-                    new_count += 1
-            else:
-                print(f"  map {row['map_number']}: no Location field found, skipping")
+        for i, row in enumerate(rows):
+            try:
+                url = DETAILS_URL.format(year=datetime.now().year, map_number=row["map_number"])
+                page.goto(url, timeout=30000)
+                details_html = page.content()
+                details = parse_details(details_html)
+                location = details.get("Location")
+                mailing = details.get("Mailing Address")
+                owner = details.get("Owner(s)") or row["owner_name"]
+                absentee = guess_absentee(location, mailing)
 
-        except Exception as e:
-            print(f"  map {row['map_number']}: error {e}", file=sys.stderr)
+                if location:
+                    inserted = upsert_lead(
+                        conn,
+                        address=location,
+                        owner_name=owner,
+                        mailing_address=mailing,
+                        is_absentee=absentee,
+                        amount_due=row["amount_due"],
+                        map_number=row["map_number"],
+                    )
+                    if inserted:
+                        new_count += 1
+                else:
+                    print(f"  map {row['map_number']}: no Location field found, skipping")
 
-        time.sleep(REQUEST_DELAY_SECONDS)
+            except Exception as e:
+                error_count += 1
+                print(f"  map {row['map_number']}: error {e}", file=sys.stderr)
+
+            if (i + 1) % 50 == 0:
+                print(f"  ...{i + 1}/{len(rows)} processed ({new_count} ok, {error_count} errors)")
+
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+        browser.close()
 
     rescore_touched_rows(conn)
     log_run(conn, len(rows), new_count, "ok")
