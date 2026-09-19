@@ -200,12 +200,14 @@ def upsert_lead(conn, address, owner_name, mailing_address, is_absentee, amount_
     return True
 
 
-def rescore_touched_rows(conn):
+def rescore_all(conn):
     """
-    Transparent, rule-based score (not ML — see chat notes for why).
-    score = 25 per source list the property is stacked on
-          + 15 if the owner's mailing address differs from the property address
-          + up to 25 points scaled from the tax-sale amount owed (capped)
+    Shared score formula — kept IDENTICAL in every ingest script so the whole
+    table stays consistently scored no matter which script ran most recently:
+      +25 per list the property is stacked on
+      +15 if owner's mailing address differs from the property (absentee)
+      +up to 25 scaled from tax-sale amount owed (capped)
+      +30 if the property has an active foreclosure sale scheduled
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -214,7 +216,7 @@ def rescore_touched_rows(conn):
                 (list_count * 25)
                 + (case when is_absentee then 15 else 0 end)
                 + least(coalesce((raw->'tax_sale'->>'amount_due')::numeric, 0) / 50, 25)
-            where 'tax_sale' = any(source_tags)
+                + (case when 'foreclosure_mie' = any(source_tags) then 30 else 0 end)
             """
         )
 
@@ -304,7 +306,7 @@ def main():
 
         browser.close()
 
-    rescore_touched_rows(conn)
+    rescore_all(conn)
     log_run(conn, len(rows), new_count, "ok")
     conn.commit()
     conn.close()
