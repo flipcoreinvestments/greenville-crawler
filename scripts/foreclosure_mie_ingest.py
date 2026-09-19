@@ -53,7 +53,7 @@ def fetch_future_sale_dates():
     today = date.today()
     dates = []
     for opt in select.find_all("option"):
-        value = (opt.get("value") or "").strip()
+        value = (opt.get("value") or opt.get_text(strip=True) or "").strip()
         try:
             d = datetime.strptime(value, "%m/%d/%Y").date()
         except ValueError:
