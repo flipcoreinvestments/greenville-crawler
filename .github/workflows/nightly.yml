@@ -31,3 +31,8 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MAX_ROWS: ${{ github.event.inputs.max_rows }}
         run: python scripts/tax_sale_ingest.py
+
+      - name: Run foreclosure (Master-in-Equity) ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/foreclosure_mie_ingest.py
