@@ -60,6 +60,17 @@ CRM/GHL outreach-pipeline field (default 'new', alongside phone/email).
 That would have silently clobbered her pipeline status the next time any
 lead sold. Switched to a dedicated is_sold/sold_at pair so 'status' is
 never touched by this script.
+
+NEEDS-REVIEW / ASTERISK FLAG (added 2026-09-21): T Dawg's explicit ask
+after the 108 Old Augusta Rd stale-lead incident -- she doesn't want to
+spend money reverse-searching/skip-tracing a lead unless it's been cross-
+checked against more than one source. Added dedicated needs_review /
+review_reasons columns (checked information_schema first -- neither
+existed) plus a generated display_address column that prepends a literal
+'*' to the address when needs_review is true, WITHOUT touching the real
+`address` column that lower(address) conflict-matching depends on. This
+script does a full-table pass every night, so it's the natural place to
+keep this current for every lead, not just the ones it upserts this run.
 """
 
 import os
@@ -223,6 +234,78 @@ def ensure_status_column(conn):
         cur.execute("create index if not exists idx_leads_is_sold on leads(is_sold)")
 
 
+def ensure_review_column(conn):
+    """
+    Checked information_schema.columns first -- 'needs_review',
+    'review_reasons', and 'display_address' were all unused. display_address
+    is a STORED GENERATED column (never written directly, always derived from
+    needs_review + address) so it can never drift out of sync and never
+    interferes with the lower(address) upsert conflict target.
+    """
+    with conn.cursor() as cur:
+        cur.execute("alter table leads add column if not exists needs_review boolean not null default false")
+        cur.execute("alter table leads add column if not exists review_reasons text[] not null default '{}'")
+        cur.execute("create index if not exists idx_leads_needs_review on leads(needs_review)")
+        cur.execute(
+            "select 1 from information_schema.columns where table_name='leads' and column_name='display_address'"
+        )
+        if not cur.fetchone():
+            cur.execute(
+                """
+                alter table leads add column display_address text generated always as (
+                    case when needs_review then '*' || address else address end
+                ) stored
+                """
+            )
+
+
+def refresh_needs_review(conn):
+    """
+    Flags a lead for T Dawg to manually double-check before she spends money
+    reverse-searching/skip-tracing it. Any ONE of these triggers a flag:
+      - single_source: only ever touched by one list (list_count <= 1) --
+        never cross-referenced/stacked against a second source
+      - missing_owner: no owner name on file
+      - incomplete_address: missing city or zip
+      - absentee_flag_but_same_address: flagged absentee but the mailing
+        address string is actually identical to the property address --
+        an internal contradiction worth a manual look
+    Runs against every non-sold lead, not just rows this script upserted,
+    since this script already does a full-table pass nightly.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            update leads set
+                needs_review = true,
+                review_reasons = array_remove(array[
+                    case when list_count <= 1 then 'single_source' end,
+                    case when owner_name is null or owner_name = '' then 'missing_owner' end,
+                    case when city is null or city = '' or zip is null or zip = '' then 'incomplete_address' end,
+                    case when mailing_address is not null
+                         and lower(regexp_replace(mailing_address, '[^a-zA-Z0-9]', '', 'g'))
+                           = lower(regexp_replace(address, '[^a-zA-Z0-9]', '', 'g'))
+                         and is_absentee = true then 'absentee_flag_but_same_address' end
+                ], null)
+            where is_sold = false
+            """
+        )
+        cur.execute(
+            """
+            update leads set needs_review = false, review_reasons = '{}'
+            where is_sold = false
+              and list_count > 1
+              and owner_name is not null and owner_name <> ''
+              and city is not null and city <> ''
+              and zip is not null and zip <> ''
+              and not (mailing_address is not null
+                       and lower(regexp_replace(mailing_address, '[^a-zA-Z0-9]', '', 'g'))
+                         = lower(regexp_replace(address, '[^a-zA-Z0-9]', '', 'g'))
+                       and is_absentee = true)
+            """
+        )
+
+
 def mark_sold_by_recent_deed(conn, all_parcels):
     """
     Cross-reference every parcel's deed date against existing leads. A deed
@@ -353,6 +436,7 @@ def main():
 
     conn = psycopg2.connect(db_url)
     ensure_status_column(conn)
+    ensure_review_column(conn)
 
     # De-dupe by lower(address) BEFORE building the batch. LOCATE (the assessor's
     # street name) has no suffix, so two different PINs can normalize to the exact
@@ -418,6 +502,7 @@ def main():
     print(f"Marked {sold_count} leads as sold (deed recorded in last {SOLD_LOOKBACK_DAYS} days).")
 
     rescore_all(conn)
+    refresh_needs_review(conn)
     log_run(conn, len(processed), len(batch_rows),
             f"ok: {len(absentee_rows)} absentee, {len(tired_only_rows)} tired-only, "
             f"{len(tired_owners)} tired-landlord owners, {sold_count} marked sold")
