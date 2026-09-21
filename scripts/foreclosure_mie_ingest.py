@@ -178,6 +178,8 @@ def rescore_all(conn):
       +15 if owner's mailing address differs from the property (absentee)
       +up to 25 scaled from tax-sale amount owed (capped)
       +30 if the property has an active foreclosure sale scheduled
+      +20 if the property has a stalled/expired building permit
+      +20 if the property has a demolition permit
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -187,6 +189,8 @@ def rescore_all(conn):
                 + (case when is_absentee then 15 else 0 end)
                 + least(coalesce((raw->'tax_sale'->>'amount_due')::numeric, 0) / 50, 25)
                 + (case when 'foreclosure_mie' = any(source_tags) then 30 else 0 end)
+                + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
+                + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
             """
         )
 
