@@ -36,3 +36,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/foreclosure_mie_ingest.py
+
+      - name: Run building permits (expired/demolition) ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/building_permits_ingest.py
