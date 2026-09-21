@@ -41,6 +41,18 @@ PERFORMANCE (fixed 2026-09-21): the first version upserted one row at a
 time via individual psycopg2 execute() calls — 33m30s for ~35,800 rows in
 testing, too slow to run nightly. Rewritten to batch upserts via
 psycopg2.extras.execute_values in chunks of 2000.
+
+STALE-LEAD FIX (2026-09-21): confirmed twice in production (9 Monteith Cir,
+108 Old Augusta Rd) that leads never got their tags removed once a property
+actually sold, so already-sold houses kept surfacing as top leads forever.
+This script touches EVERY parcel county-wide and already pulls each one's
+deed date, so it's the natural place to close that gap: any parcel with a
+deed recorded in the last SOLD_LOOKBACK_DAYS is cross-referenced against
+existing leads by PIN (stored under raw->absentee_owner->pin or
+raw->tax_sale->map_number, same assessor parcel ID either way) and flipped
+to status='sold', score=0. Downstream queries should filter
+`where status = 'active'` (or `score > 0`) to keep sold properties out of
+lead lists automatically going forward.
 """
 
 import os
@@ -49,13 +61,14 @@ import sys
 import json
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
 
 SOURCE_NAME = "absentee_owner"
+SOLD_LOOKBACK_DAYS = 270
 
 OUT_FIELDS_BASE = "PIN,OWNAM1,OWNAM2,STREET,CITY,STATE,ZIP5,STRNUM,LOCATE,SLPRICE,TOTTAX,LANDUSE"
 
@@ -76,6 +89,24 @@ LAYERS = [
 
 TIRED_LANDLORD_THRESHOLD = 3
 UPSERT_BATCH_SIZE = 2000
+
+
+def normalize_deed_date(v):
+    """
+    ArcGIS REST returns date fields as epoch milliseconds (UTC) when f=json.
+    Defensively also handle a plain date/datetime string in case a layer ever
+    serializes differently. Returns an ISO date string ('YYYY-MM-DD') or None.
+    """
+    if v is None or v == "":
+        return None
+    try:
+        if isinstance(v, (int, float)):
+            return datetime.fromtimestamp(v / 1000, tz=timezone.utc).date().isoformat()
+        if isinstance(v, str):
+            return v.strip()[:10] or None
+    except Exception:
+        return None
+    return None
 
 
 def fetch_all(layer):
@@ -109,7 +140,7 @@ def fetch_all(layer):
         feats = data.get("features", [])
         for f in feats:
             attrs = f["attributes"]
-            attrs["DEED_DATE_NORM"] = attrs.pop(layer["deed_field"], None)
+            attrs["DEED_DATE_NORM"] = normalize_deed_date(attrs.pop(layer["deed_field"], None))
             out.append(attrs)
         if len(feats) < page_size:
             break
@@ -170,6 +201,48 @@ def upsert_leads_batch(conn, rows):
             print(f"  upserted batch {i // UPSERT_BATCH_SIZE + 1} ({len(chunk)} rows)")
 
 
+def ensure_status_column(conn):
+    with conn.cursor() as cur:
+        cur.execute("alter table leads add column if not exists status text not null default 'active'")
+        cur.execute("create index if not exists idx_leads_status on leads(status)")
+
+
+def mark_sold_by_recent_deed(conn, all_parcels):
+    """
+    Cross-reference every parcel's deed date against existing leads. A deed
+    recorded within SOLD_LOOKBACK_DAYS means the property changed hands, so
+    whatever distress condition put it on a list is resolved. Matches by PIN,
+    stored under either raw->absentee_owner->pin or raw->tax_sale->map_number
+    depending on which source touched the row first — same assessor parcel ID.
+    Returns how many leads got flipped to sold.
+    """
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=SOLD_LOOKBACK_DAYS)).isoformat()
+    recent_sales = [
+        (pin, r["DEED_DATE_NORM"])
+        for pin, r in all_parcels.items()
+        if r.get("DEED_DATE_NORM") and r["DEED_DATE_NORM"] >= cutoff
+    ]
+    if not recent_sales:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("create temporary table pin_deed (pin text, deed_date date) on commit drop")
+        execute_values(cur, "insert into pin_deed (pin, deed_date) values %s", recent_sales)
+        cur.execute(
+            """
+            update leads set status = 'sold', score = 0, updated_at = now()
+            from pin_deed pd
+            where pd.deed_date >= %s
+              and (
+                    leads.raw->'absentee_owner'->>'pin' = pd.pin
+                 or leads.raw->'tax_sale'->>'map_number' = pd.pin
+              )
+              and leads.status is distinct from 'sold'
+            """,
+            (cutoff,),
+        )
+        return cur.rowcount
+
+
 def rescore_all(conn):
     """
     Shared score formula — kept IDENTICAL in every ingest script:
@@ -180,6 +253,9 @@ def rescore_all(conn):
       +20 if the property has a stalled/expired building permit
       +20 if the property has a demolition permit
       +15 if the same owner holds 3+ properties county-wide (tired landlord)
+    Only touches status='active' rows so a property already flipped to
+    'sold' by mark_sold_by_recent_deed() stays at score 0 instead of being
+    rescored back up.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -192,6 +268,7 @@ def rescore_all(conn):
                 + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
                 + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
                 + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
+            where status = 'active'
             """
         )
 
@@ -255,6 +332,7 @@ def main():
     print(f"Additional tired-landlord-only parcels (owner-occupied but 3+ properties): {len(tired_only_rows)}")
 
     conn = psycopg2.connect(db_url)
+    ensure_status_column(conn)
 
     batch_rows = []
     for p in absentee_rows + tired_only_rows:
@@ -280,13 +358,16 @@ def main():
 
     upsert_leads_batch(conn, batch_rows)
 
+    sold_count = mark_sold_by_recent_deed(conn, all_parcels)
+    print(f"Marked {sold_count} leads as sold (deed recorded in last {SOLD_LOOKBACK_DAYS} days).")
+
     rescore_all(conn)
     log_run(conn, len(processed), len(batch_rows),
             f"ok: {len(absentee_rows)} absentee, {len(tired_only_rows)} tired-only, "
-            f"{len(tired_owners)} tired-landlord owners")
+            f"{len(tired_owners)} tired-landlord owners, {sold_count} marked sold")
     conn.commit()
     conn.close()
-    print(f"Done. {len(batch_rows)} properties upserted and rescored.")
+    print(f"Done. {len(batch_rows)} properties upserted and rescored. {sold_count} marked sold.")
 
 
 if __name__ == "__main__":
