@@ -214,6 +214,9 @@ def mark_sold_by_recent_deed(conn, all_parcels):
     whatever distress condition put it on a list is resolved. Matches by PIN,
     stored under either raw->absentee_owner->pin or raw->tax_sale->map_number
     depending on which source touched the row first — same assessor parcel ID.
+    raw->absentee_owner->pin can be a single string OR a json array (when
+    de-duped parcels share one address), so match with jsonb containment (@>)
+    rather than ->>'pin' = text, which only works for the scalar case.
     Returns how many leads got flipped to sold.
     """
     cutoff = (datetime.now(timezone.utc).date() - timedelta(days=SOLD_LOOKBACK_DAYS)).isoformat()
@@ -233,7 +236,7 @@ def mark_sold_by_recent_deed(conn, all_parcels):
             from pin_deed pd
             where pd.deed_date >= %s
               and (
-                    leads.raw->'absentee_owner'->>'pin' = pd.pin
+                    leads.raw->'absentee_owner'->'pin' @> to_jsonb(pd.pin)
                  or leads.raw->'tax_sale'->>'map_number' = pd.pin
               )
               and leads.status is distinct from 'sold'
@@ -334,27 +337,63 @@ def main():
     conn = psycopg2.connect(db_url)
     ensure_status_column(conn)
 
-    batch_rows = []
+    # De-dupe by lower(address) BEFORE building the batch. LOCATE (the assessor's
+    # street name) has no suffix, so two different PINs can normalize to the exact
+    # same address string (e.g. subdivided/multi-unit parcels) -- sending both as
+    # separate rows in the same execute_values() batch trips Postgres's
+    # "ON CONFLICT DO UPDATE command cannot affect row a second time"
+    # (CardinalityViolation), which is exactly what killed run #2. Merge duplicates
+    # into one row instead of crashing the whole batch.
+    merged = {}
     for p in absentee_rows + tired_only_rows:
-        tags = ["absentee_owner"] if p["absentee"] is True else []
+        tags = {"absentee_owner"} if p["absentee"] is True else set()
         if p["owner_name"] in tired_owners:
-            tags.append("tired_landlord")
+            tags.add("tired_landlord")
         if not tags:
             continue
+        key = p["address"].lower()
+        entry = merged.get(key)
+        if entry is None:
+            merged[key] = {
+                "address": p["address"],
+                "mailing_zip": p["mailing_zip"],
+                "owner_name": p["owner_name"],
+                "mailing_address": p["mailing_address"],
+                "absentee": p["absentee"],
+                "tags": tags,
+                "pins": [p["pin"]],
+                "deed_date": p["deed_date"],
+                "sale_price": p["sale_price"],
+                "total_tax": p["total_tax"],
+                "landuse": p["landuse"],
+                "owner_parcel_count": owner_counts.get(p["owner_name"], 1),
+            }
+        else:
+            entry["tags"] |= tags
+            entry["pins"].append(p["pin"])
+            if p["absentee"] is True:
+                entry["absentee"] = True
+
+    batch_rows = []
+    for entry in merged.values():
         extra = {
-            "pin": p["pin"],
-            "deed_date": p["deed_date"],
-            "sale_price": p["sale_price"],
-            "total_tax": p["total_tax"],
-            "landuse": p["landuse"],
-            "owner_parcel_count": owner_counts.get(p["owner_name"], 1),
+            "pin": entry["pins"][0] if len(entry["pins"]) == 1 else entry["pins"],
+            "deed_date": entry["deed_date"],
+            "sale_price": entry["sale_price"],
+            "total_tax": entry["total_tax"],
+            "landuse": entry["landuse"],
+            "owner_parcel_count": entry["owner_parcel_count"],
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
         raw_payload = json.dumps({SOURCE_NAME: extra})
         batch_rows.append((
-            p["address"], p["mailing_zip"], p["owner_name"], p["mailing_address"],
-            p["absentee"], tags, raw_payload,
+            entry["address"], entry["mailing_zip"], entry["owner_name"], entry["mailing_address"],
+            entry["absentee"], sorted(entry["tags"]), raw_payload,
         ))
+
+    dupes_merged = len(absentee_rows) + len(tired_only_rows) - len(batch_rows)
+    if dupes_merged > 0:
+        print(f"Merged {dupes_merged} duplicate-address parcels before upsert.")
 
     upsert_leads_batch(conn, batch_rows)
 
