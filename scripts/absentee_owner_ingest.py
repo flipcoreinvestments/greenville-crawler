@@ -50,9 +50,16 @@ deed date, so it's the natural place to close that gap: any parcel with a
 deed recorded in the last SOLD_LOOKBACK_DAYS is cross-referenced against
 existing leads by PIN (stored under raw->absentee_owner->pin or
 raw->tax_sale->map_number, same assessor parcel ID either way) and flipped
-to status='sold', score=0. Downstream queries should filter
-`where status = 'active'` (or `score > 0`) to keep sold properties out of
+to is_sold=true, score=0. Downstream queries should filter
+`where is_sold = false` (or `score > 0`) to keep sold properties out of
 lead lists automatically going forward.
+
+CORRECTED 2026-09-21: the first version of this fix used a column called
+'status' for this, not realizing 'leads.status' already existed as T Dawg's
+CRM/GHL outreach-pipeline field (default 'new', alongside phone/email).
+That would have silently clobbered her pipeline status the next time any
+lead sold. Switched to a dedicated is_sold/sold_at pair so 'status' is
+never touched by this script.
 """
 
 import os
@@ -202,9 +209,18 @@ def upsert_leads_batch(conn, rows):
 
 
 def ensure_status_column(conn):
+    """
+    IMPORTANT: 'status' already exists on this table as a CRM/GHL pipeline
+    field (default 'new' -- new/contacted/etc, alongside phone/email). An
+    earlier version of this fix mistakenly reused that same column for
+    sold/active tracking, which would have silently overwritten T Dawg's
+    outreach-pipeline status the next time a lead resolved. Use a SEPARATE
+    is_sold boolean + sold_at date instead so this never touches 'status'.
+    """
     with conn.cursor() as cur:
-        cur.execute("alter table leads add column if not exists status text not null default 'active'")
-        cur.execute("create index if not exists idx_leads_status on leads(status)")
+        cur.execute("alter table leads add column if not exists is_sold boolean not null default false")
+        cur.execute("alter table leads add column if not exists sold_at date")
+        cur.execute("create index if not exists idx_leads_is_sold on leads(is_sold)")
 
 
 def mark_sold_by_recent_deed(conn, all_parcels):
@@ -232,14 +248,14 @@ def mark_sold_by_recent_deed(conn, all_parcels):
         execute_values(cur, "insert into pin_deed (pin, deed_date) values %s", recent_sales)
         cur.execute(
             """
-            update leads set status = 'sold', score = 0, updated_at = now()
+            update leads set is_sold = true, sold_at = pd.deed_date, score = 0, updated_at = now()
             from pin_deed pd
             where pd.deed_date >= %s
               and (
                     leads.raw->'absentee_owner'->'pin' @> to_jsonb(pd.pin)
                  or leads.raw->'tax_sale'->>'map_number' = pd.pin
               )
-              and leads.status is distinct from 'sold'
+              and leads.is_sold is distinct from true
             """,
             (cutoff,),
         )
@@ -256,9 +272,10 @@ def rescore_all(conn):
       +20 if the property has a stalled/expired building permit
       +20 if the property has a demolition permit
       +15 if the same owner holds 3+ properties county-wide (tired landlord)
-    Only touches status='active' rows so a property already flipped to
-    'sold' by mark_sold_by_recent_deed() stays at score 0 instead of being
-    rescored back up.
+    Only touches is_sold=false rows so a property already flipped by
+    mark_sold_by_recent_deed() stays at score 0 instead of being rescored
+    back up. Does NOT touch 'status' -- that's T Dawg's CRM/GHL pipeline
+    field (new/contacted/etc), completely separate from is_sold.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -271,7 +288,7 @@ def rescore_all(conn):
                 + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
                 + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
                 + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
-            where status = 'active'
+            where is_sold = false
             """
         )
 
