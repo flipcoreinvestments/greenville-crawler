@@ -41,3 +41,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/building_permits_ingest.py
+
+      - name: Run absentee owner + tired landlord ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/absentee_owner_ingest.py
