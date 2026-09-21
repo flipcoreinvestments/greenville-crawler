@@ -11,8 +11,14 @@ Sources (both public ArcGIS REST Feature Services, no login, no bot protection):
 Both layers expose the SAME assessor schema: STREET/CITY/STATE/ZIP5 is the
 OWNER'S MAILING address, while STRNUM + LOCATE identify the property's own
 site address. Comparing the two is exactly what's needed to flag absentee
-owners with zero manual lookups (confirmed against sample records 2026-09-21,
-e.g. an owner mailing from Cary, NC on a Greenville rental property).
+owners with zero manual lookups.
+
+FIXED 2026-09-21: the two layers use DIFFERENT field names for the deed
+date — city_greenville calls it DEEDTE, county_base calls it DEEDDATE.
+Requesting "DEEDTE" from county_base threw a hard 400 ('outFields'
+parameter is invalid) and silently zeroed out that entire layer (confirmed
+via the layers' own /?f=json metadata). Each layer now requests its own
+deed-date field name and normalizes it to DEED_DATE_NORM before merging.
 
 What this pulls (two of the seller-motivation categories):
 1. "Absentee owner" — owner's mailing address doesn't match the property's
@@ -30,6 +36,11 @@ another source that includes the suffix (e.g. "509 Hampton Townes Dr"). That
 means some genuine stacking matches will be missed until address matching is
 made suffix-tolerant — flagged here as a known limitation, not silently
 hidden.
+
+PERFORMANCE (fixed 2026-09-21): the first version upserted one row at a
+time via individual psycopg2 execute() calls — 33m30s for ~35,800 rows in
+testing, too slow to run nightly. Rewritten to batch upserts via
+psycopg2.extras.execute_values in chunks of 2000.
 """
 
 import os
@@ -42,34 +53,40 @@ from datetime import datetime, timezone
 
 import requests
 import psycopg2
+from psycopg2.extras import execute_values
 
 SOURCE_NAME = "absentee_owner"
+
+OUT_FIELDS_BASE = "PIN,OWNAM1,OWNAM2,STREET,CITY,STATE,ZIP5,STRNUM,LOCATE,SLPRICE,TOTTAX,LANDUSE"
 
 LAYERS = [
     {
         "name": "city_greenville",
         "url": "https://citygis.greenvillesc.gov/arcgis/rest/services/AddressSearch/Property/MapServer/3/query",
         "page_size": 2000,
+        "deed_field": "DEEDTE",
     },
     {
         "name": "county_base",
         "url": "https://services3.arcgis.com/YQLyddqtM8cTAr6Y/arcgis/rest/services/GreenvilleCountyBaseData/FeatureServer/2/query",
         "page_size": 2000,
+        "deed_field": "DEEDDATE",
     },
 ]
 
-OUT_FIELDS = "PIN,OWNAM1,OWNAM2,STREET,CITY,STATE,ZIP5,STRNUM,LOCATE,DEEDTE,SLPRICE,TOTTAX,LANDUSE"
 TIRED_LANDLORD_THRESHOLD = 3
+UPSERT_BATCH_SIZE = 2000
 
 
 def fetch_all(layer):
     out = []
     offset = 0
     page_size = layer["page_size"]
+    out_fields = f"{OUT_FIELDS_BASE},{layer['deed_field']}"
     while True:
         params = {
             "where": "1=1",
-            "outFields": OUT_FIELDS,
+            "outFields": out_fields,
             "returnGeometry": "false",
             "f": "json",
             "resultRecordCount": page_size,
@@ -90,7 +107,10 @@ def fetch_all(layer):
             print(f"  [{layer['name']}] ArcGIS error at offset {offset}: {data['error']}", file=sys.stderr)
             break
         feats = data.get("features", [])
-        out.extend(f["attributes"] for f in feats)
+        for f in feats:
+            attrs = f["attributes"]
+            attrs["DEED_DATE_NORM"] = attrs.pop(layer["deed_field"], None)
+            out.append(attrs)
         if len(feats) < page_size:
             break
         offset += page_size
@@ -123,24 +143,31 @@ def is_absentee(mailing_street, mailing_state, prop_strnum, prop_locate):
     return not mail_n.startswith(prop_n[:8]) if prop_n else None
 
 
-def upsert_lead(conn, address, owner_name, mailing_addr, mailing_zip, absentee, tags, extra):
-    raw_payload = json.dumps({SOURCE_NAME: extra})
+def upsert_leads_batch(conn, rows):
+    """
+    Batched upsert via execute_values — replaces the old per-row execute()
+    loop that took 33+ minutes for ~35,800 rows. Same conflict/merge logic,
+    just sent in chunks of UPSERT_BATCH_SIZE instead of one row per round trip.
+    rows: list of tuples (address, mailing_zip, owner_name, mailing_addr, absentee, tags, raw_json)
+    """
+    sql = """
+        insert into leads (address, city, state, zip, county, owner_name, mailing_address,
+                            is_absentee, source_tags, raw)
+        values %s
+        on conflict (lower(address)) do update set
+            owner_name = coalesce(excluded.owner_name, leads.owner_name),
+            mailing_address = coalesce(excluded.mailing_address, leads.mailing_address),
+            is_absentee = coalesce(excluded.is_absentee, leads.is_absentee),
+            source_tags = array(select distinct unnest(leads.source_tags || excluded.source_tags)),
+            raw = leads.raw || excluded.raw,
+            updated_at = now()
+    """
+    template = "(%s, 'Greenville', 'SC', %s, 'Greenville', %s, %s, %s, %s::text[], %s::jsonb)"
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            insert into leads (address, city, state, zip, county, owner_name, mailing_address,
-                                is_absentee, source_tags, raw)
-            values (%s, 'Greenville', 'SC', %s, 'Greenville', %s, %s, %s, %s::text[], %s::jsonb)
-            on conflict (lower(address)) do update set
-                owner_name = coalesce(excluded.owner_name, leads.owner_name),
-                mailing_address = coalesce(excluded.mailing_address, leads.mailing_address),
-                is_absentee = coalesce(excluded.is_absentee, leads.is_absentee),
-                source_tags = array(select distinct unnest(leads.source_tags || excluded.source_tags)),
-                raw = leads.raw || excluded.raw,
-                updated_at = now()
-            """,
-            (address, mailing_zip, owner_name, mailing_addr, absentee, tags, raw_payload),
-        )
+        for i in range(0, len(rows), UPSERT_BATCH_SIZE):
+            chunk = rows[i:i + UPSERT_BATCH_SIZE]
+            execute_values(cur, sql, chunk, template=template, page_size=len(chunk))
+            print(f"  upserted batch {i // UPSERT_BATCH_SIZE + 1} ({len(chunk)} rows)")
 
 
 def rescore_all(conn):
@@ -211,7 +238,7 @@ def main():
             "mailing_address": (r.get("STREET") or "").strip() or None,
             "mailing_zip": (r.get("ZIP5") or "").strip() or None,
             "absentee": absentee,
-            "deed_date": r.get("DEEDTE"),
+            "deed_date": r.get("DEED_DATE_NORM"),
             "sale_price": r.get("SLPRICE"),
             "total_tax": r.get("TOTTAX"),
             "landuse": r.get("LANDUSE"),
@@ -228,8 +255,8 @@ def main():
     print(f"Additional tired-landlord-only parcels (owner-occupied but 3+ properties): {len(tired_only_rows)}")
 
     conn = psycopg2.connect(db_url)
-    new_count = 0
 
+    batch_rows = []
     for p in absentee_rows + tired_only_rows:
         tags = ["absentee_owner"] if p["absentee"] is True else []
         if p["owner_name"] in tired_owners:
@@ -245,17 +272,21 @@ def main():
             "owner_parcel_count": owner_counts.get(p["owner_name"], 1),
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
-        upsert_lead(conn, p["address"], p["owner_name"], p["mailing_address"],
-                    p["mailing_zip"], p["absentee"], tags, extra)
-        new_count += 1
+        raw_payload = json.dumps({SOURCE_NAME: extra})
+        batch_rows.append((
+            p["address"], p["mailing_zip"], p["owner_name"], p["mailing_address"],
+            p["absentee"], tags, raw_payload,
+        ))
+
+    upsert_leads_batch(conn, batch_rows)
 
     rescore_all(conn)
-    log_run(conn, len(processed), new_count,
+    log_run(conn, len(processed), len(batch_rows),
             f"ok: {len(absentee_rows)} absentee, {len(tired_only_rows)} tired-only, "
             f"{len(tired_owners)} tired-landlord owners")
     conn.commit()
     conn.close()
-    print(f"Done. {new_count} properties upserted and rescored.")
+    print(f"Done. {len(batch_rows)} properties upserted and rescored.")
 
 
 if __name__ == "__main__":
