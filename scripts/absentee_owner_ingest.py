@@ -175,7 +175,7 @@ def normalize_owner(name):
 
 
 def normalize_addr(strnum, locate):
-    if not strnum or not locate or locate.strip().upper() in ("SYMBOLIC", ""):
+    if not strnum or not locate or locate.strip().upper() in ("SYMBOLIC", "", "NONE"):
         return None
     addr = f"{strnum.strip()} {locate.strip()}"
     addr = re.sub(r"\s+", " ", addr).strip()
@@ -270,6 +270,12 @@ def refresh_needs_review(conn):
       - absentee_flag_but_same_address: flagged absentee but the mailing
         address string is actually identical to the property address --
         an internal contradiction worth a manual look
+      - corrupted_address: the address string contains the literal word
+        "none" -- confirmed 2026-09-21 that the county assessor's LOCATE
+        field is sometimes literally the text "None" (not a null value,
+        an actual 4-character string), which produces addresses like
+        "24749 None". Catches this regardless of which ingest script wrote
+        the row, since this function runs a full-table pass every night.
     Runs against every non-sold lead, not just rows this script upserted,
     since this script already does a full-table pass nightly.
     """
@@ -285,7 +291,8 @@ def refresh_needs_review(conn):
                     case when mailing_address is not null
                          and lower(regexp_replace(mailing_address, '[^a-zA-Z0-9]', '', 'g'))
                            = lower(regexp_replace(address, '[^a-zA-Z0-9]', '', 'g'))
-                         and is_absentee = true then 'absentee_flag_but_same_address' end
+                         and is_absentee = true then 'absentee_flag_but_same_address' end,
+                    case when address ~* 'none' then 'corrupted_address' end
                 ], null)
             where is_sold = false
             """
@@ -298,6 +305,7 @@ def refresh_needs_review(conn):
               and owner_name is not null and owner_name <> ''
               and city is not null and city <> ''
               and zip is not null and zip <> ''
+              and address !~* 'none'
               and not (mailing_address is not null
                        and lower(regexp_replace(mailing_address, '[^a-zA-Z0-9]', '', 'g'))
                          = lower(regexp_replace(address, '[^a-zA-Z0-9]', '', 'g'))
