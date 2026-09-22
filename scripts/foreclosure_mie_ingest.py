@@ -116,6 +116,7 @@ def fetch_future_sale_dates(page):
         return []
     today = date.today()
     dates = []
+    all_parsed = []
     skipped_unparsed = 0
     for opt in select.find_all("option"):
         value = (opt.get("value") or opt.get_text(strip=True) or "").strip()
@@ -124,6 +125,7 @@ def fetch_future_sale_dates(page):
         except ValueError:
             skipped_unparsed += 1
             continue
+        all_parsed.append(value)
         if d >= today:
             dates.append(value)
     if skipped_unparsed:
@@ -132,6 +134,16 @@ def fetch_future_sale_dates(page):
             f"closedate select didn't parse as MM/DD/YYYY.",
             file=sys.stderr,
         )
+    # DIAGNOSTIC (added 2026-09-22 after a run returned 0 future dates while
+    # a real logged-in browser session showed 5 -- print exactly what this
+    # run saw so a future "0 dates" result is debuggable from the log alone
+    # instead of requiring a fresh manual re-check every time.
+    print(
+        f"  diag: today={today.isoformat()}, {len(select.find_all('option'))} <option> "
+        f"tag(s) found, {len(all_parsed)} parsed as dates, {len(dates)} >= today. "
+        f"All parsed dates: {all_parsed}",
+        file=sys.stderr,
+    )
     return dates
 
 
