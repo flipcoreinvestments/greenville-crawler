@@ -41,6 +41,7 @@ jobs:
       - name: Run foreclosure (Master-in-Equity) ingest
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SCRAPFLY_KEY: ${{ secrets.SCRAPFLY_KEY }}
         run: python scripts/foreclosure_mie_ingest.py
 
       - name: Run building permits (expired/demolition) ingest
