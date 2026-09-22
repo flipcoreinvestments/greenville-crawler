@@ -52,3 +52,9 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/absentee_owner_ingest.py
+
+      - name: Run probate ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MAX_ROWS: ${{ github.event.inputs.max_rows }}
+        run: python scripts/probate_ingest.py
