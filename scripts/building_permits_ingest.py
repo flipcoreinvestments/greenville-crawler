@@ -33,6 +33,15 @@ What this pulls (two of the seller-motivation categories):
    may run through a separate eTrakit system). Ship it for what it covers
    now; revisit county-wide coverage separately.
 
+BUG FIX 2026-09-22: the insurance_damage query was silently returning 0
+results in every production run despite real matches existing (confirmed
+144 real damage-repair permits live, including explicit Hurricane Helene
+damage). A WAF/CDN in front of citygis.greenvillesc.gov blocks the long,
+repeated "LIKE '%...%' OR LIKE '%...%' OR ..." GET querystring this WHERE
+clause produces (looks like a SQLi signature to it) -- see the comment on
+fetch_rows() for the full diagnosis. Fixed by sending all queries in this
+script as POST instead of GET; confirmed working with real data.
+
 Gives address, owner name, and owner mailing address (for absentee
 detection) directly — no second lookup needed.
 """
@@ -92,7 +101,22 @@ def fetch_rows(where_clause):
         "f": "json",
         "resultRecordCount": 2000,
     }
-    resp = requests.get(BASE_URL, params=params, timeout=30)
+    # BUG FIX 2026-09-22 (found via production validation: this query was
+    # unconditionally reporting "0 damage-related permits found" every
+    # night). Root cause: the insurance_damage WHERE clause OR-chains ~30
+    # keyword LIKE conditions across two fields, which is a long, heavily
+    # repeated "X LIKE '%...%' OR Y LIKE '%...%' OR ..." pattern in the
+    # querystring. Something in front of citygis.greenvillesc.gov (a
+    # WAF/CDN) matches that shape as a SQLi signature and silently drops
+    # the GET request -- surfaced as a 404 to `requests`, and as an opaque
+    # network failure when reproduced via browser fetch(). The exact same
+    # WHERE clause succeeds (HTTP 200, real rows back) as a POST with the
+    # where clause in the form body instead of the URL -- confirmed live:
+    # 144 real storm/fire/water-damage repair permits came back, including
+    # explicit Hurricane Helene tree-damage repairs. Using POST for every
+    # query here (not just the long one) so the short demolition/stalled
+    # queries take the same, now-proven-safe path.
+    resp = requests.post(BASE_URL, data=params, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     if "error" in data:
