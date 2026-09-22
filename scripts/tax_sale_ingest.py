@@ -89,11 +89,11 @@ def parse_list(html):
     rows_out = []
 
     for table in soup.find_all("table"):
-        header_text = table.get_text(" ", strip=True).lower()
+         header_text = table.get_text(" ", strip=True).lower()
         if "map" not in header_text or "amount" not in header_text:
             continue
 
-        trs = table.find_all("tr")
+       trs = table.find_all("tr")
         for tr in trs:
             cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
             if len(cells) < 3:
@@ -210,6 +210,16 @@ def rescore_all(conn):
       +30 if the property has an active foreclosure sale scheduled
       +20 if the property has a stalled/expired building permit
       +20 if the property has a demolition permit
+      +15 if the same owner holds 3+ properties county-wide (tired landlord)
+
+    FIXED 2026-09-21: this copy of the formula was missing the
+    tired_landlord bonus AND the `where is_sold = false` guard that
+    absentee_owner_ingest.py already had. Without that guard, this script
+    (which runs before absentee_owner_ingest.py in nightly.yml) was
+    un-zeroing every already-sold lead's score each night, relying on
+    absentee_owner_ingest.py running later in the same workflow to zero
+    them back out. Fixed here so each script is independently correct
+    regardless of run order.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -221,11 +231,13 @@ def rescore_all(conn):
                 + (case when 'foreclosure_mie' = any(source_tags) then 30 else 0 end)
                 + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
                 + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
+                 + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
+            where is_sold = false
             """
         )
 
 
-def log_run(conn, records_found, records_new, notes):
+def log_run(conn, records_found, records_new, notes)
     with conn.cursor() as cur:
         cur.execute(
             "insert into source_runs (source_name, records_found, records_new, notes) values (%s, %s, %s, %s)",
