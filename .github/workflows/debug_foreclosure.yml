@@ -1,0 +1,23 @@
+name: Debug foreclosure_mie date parsing (throwaway)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install headless browser
+        run: playwright install --with-deps chromium
+
+      - name: Run debug script
+        run: cd scripts && python debug_foreclosure_dates.py
