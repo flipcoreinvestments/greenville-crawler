@@ -136,6 +136,13 @@ def rescore_all(conn):
       +30 if the property has an active foreclosure sale scheduled
       +20 if the property has a stalled/expired building permit
       +20 if the property has a demolition permit
+      +15 if the same owner holds 3+ properties county-wide (tired landlord)
+
+    FIXED 2026-09-21: was missing the tired_landlord bonus AND the
+    `where is_sold = false` guard, so this script (runs before
+    absentee_owner_ingest.py in nightly.yml) was un-zeroing already-sold
+    leads' scores each night. Fixed so this script is independently
+    correct regardless of run order.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -147,6 +154,8 @@ def rescore_all(conn):
                 + (case when 'foreclosure_mie' = any(source_tags) then 30 else 0 end)
                 + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
                 + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
+                + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
+            where is_sold = false
             """
         )
 
