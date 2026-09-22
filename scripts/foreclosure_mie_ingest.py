@@ -101,6 +101,12 @@ def scrapfly_request(method, url, api_key, data=None):
         "unblocker": "true",
         "session": SCRAPFLY_SESSION,
         "country": "us",
+        # FIX 2026-09-22: the default datacenter proxy pool got an outright
+        # "Website connection refused" from this site -- same story as our
+        # own GitHub Actions IP, just on Scrapfly's infrastructure instead.
+        # Forcing the residential pool (25 credits/request instead of 1)
+        # is what actually gets past this wall.
+        "proxy_pool": "public_residential_pool",
     }
     resp = requests.request(method, SCRAPFLY_ENDPOINT, params=params, data=data, timeout=60)
     try:
