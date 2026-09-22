@@ -58,3 +58,8 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MAX_ROWS: ${{ github.event.inputs.max_rows }}
         run: python scripts/probate_ingest.py
+
+      - name: Run code enforcement (unfit structures) ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/code_enforcement_ingest.py
