@@ -61,6 +61,20 @@ That would have silently clobbered her pipeline status the next time any
 lead sold. Switched to a dedicated is_sold/sold_at pair so 'status' is
 never touched by this script.
 
+HIGH EQUITY / FREE-AND-CLEAR (added 2026-09-22): both layers already carry
+TAXMKTVAL/FAIRMKTVAL (assessed value) alongside SLPRICE (last recorded sale
+price) and the deed date this script already pulls -- no new data source
+needed, just two more fields off the same query. There's no public lien-
+balance data anywhere (confirmed: ROD's recorded-document index has no bulk
+API), so this is a PROXY, not a confirmed "free and clear" fact: a parcel is
+tagged 'high_equity' when EITHER (a) it's been owned 15+ years (matches the
+15-years-ownership PropStream filter T Dawg was already using manually), OR
+(b) the last recorded sale price is <= 50% of current FAIRMKTVAL (catches
+long-paid-off or inherited-at-low-basis homes regardless of hold length).
+equity_pct is populated as a rough 0-100 estimate (1 - SLPRICE/FAIRMKTVAL)
+when both values exist; null otherwise -- treat it as directional, not exact,
+since it can't see an actual mortgage balance.
+
 NEEDS-REVIEW / ASTERISK FLAG (added 2026-09-21): T Dawg's explicit ask
 after the 108 Old Augusta Rd stale-lead incident -- she doesn't want to
 spend money reverse-searching/skip-tracing a lead unless it's been cross-
@@ -79,7 +93,7 @@ import sys
 import json
 import time
 from collections import Counter
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 
 import requests
 import psycopg2
@@ -88,7 +102,10 @@ from psycopg2.extras import execute_values
 SOURCE_NAME = "absentee_owner"
 SOLD_LOOKBACK_DAYS = 270
 
-OUT_FIELDS_BASE = "PIN,OWNAM1,OWNAM2,STREET,CITY,STATE,ZIP5,STRNUM,LOCATE,SLPRICE,TOTTAX,LANDUSE"
+OUT_FIELDS_BASE = "PIN,OWNAM1,OWNAM2,STREET,CITY,STATE,ZIP5,STRNUM,LOCATE,SLPRICE,TOTTAX,LANDUSE,TAXMKTVAL,FAIRMKTVAL"
+
+HIGH_EQUITY_YEARS = 15  # matches the manual PropStream filter T Dawg was already using
+HIGH_EQUITY_SALE_RATIO = 0.5  # last sale price <= 50% of current fair market value
 
 LAYERS = [
     {
@@ -192,16 +209,46 @@ def is_absentee(mailing_street, mailing_state, prop_strnum, prop_locate):
     return not mail_n.startswith(prop_n[:8]) if prop_n else None
 
 
+def compute_equity(deed_date_str, slprice, fairmktval):
+    """
+    Returns (is_high_equity: bool|None, equity_pct: float|None).
+    Proxy only -- no lien-balance data exists publicly, see module docstring.
+    """
+    years_owned = None
+    if deed_date_str:
+        try:
+            deed_date = datetime.strptime(deed_date_str[:10], "%Y-%m-%d").date()
+            years_owned = (date.today() - deed_date).days / 365.25
+        except ValueError:
+            pass
+
+    equity_pct = None
+    sale_ratio_hit = False
+    try:
+        sp = float(slprice) if slprice not in (None, "", 0) else None
+        fmv = float(fairmktval) if fairmktval not in (None, "", 0) else None
+        if sp is not None and fmv is not None and fmv > 0:
+            equity_pct = max(0.0, min(100.0, round((1 - sp / fmv) * 100, 1)))
+            sale_ratio_hit = (sp / fmv) <= HIGH_EQUITY_SALE_RATIO
+    except (TypeError, ZeroDivisionError):
+        pass
+
+    years_hit = years_owned is not None and years_owned >= HIGH_EQUITY_YEARS
+    if years_owned is None and equity_pct is None:
+        return None, None
+    return (years_hit or sale_ratio_hit), equity_pct
+
+
 def upsert_leads_batch(conn, rows):
     """
     Batched upsert via execute_values — replaces the old per-row execute()
     loop that took 33+ minutes for ~35,800 rows. Same conflict/merge logic,
     just sent in chunks of UPSERT_BATCH_SIZE instead of one row per round trip.
-    rows: list of tuples (address, mailing_zip, owner_name, mailing_addr, absentee, tags, raw_json)
+    rows: list of tuples (address, mailing_zip, owner_name, mailing_addr, absentee, tags, raw_json, equity_pct)
     """
     sql = """
         insert into leads (address, city, state, zip, county, owner_name, mailing_address,
-                            is_absentee, source_tags, raw)
+                            is_absentee, source_tags, raw, equity_pct)
         values %s
         on conflict (lower(address)) do update set
             owner_name = coalesce(excluded.owner_name, leads.owner_name),
@@ -209,9 +256,10 @@ def upsert_leads_batch(conn, rows):
             is_absentee = coalesce(excluded.is_absentee, leads.is_absentee),
             source_tags = array(select distinct unnest(leads.source_tags || excluded.source_tags)),
             raw = leads.raw || excluded.raw,
+            equity_pct = coalesce(excluded.equity_pct, leads.equity_pct),
             updated_at = now()
     """
-    template = "(%s, 'Greenville', 'SC', %s, 'Greenville', %s, %s, %s, %s::text[], %s::jsonb)"
+    template = "(%s, 'Greenville', 'SC', %s, 'Greenville', %s, %s, %s, %s::text[], %s::jsonb, %s)"
     with conn.cursor() as cur:
         for i in range(0, len(rows), UPSERT_BATCH_SIZE):
             chunk = rows[i:i + UPSERT_BATCH_SIZE]
@@ -238,25 +286,48 @@ def ensure_review_column(conn):
     """
     Checked information_schema.columns first -- 'needs_review',
     'review_reasons', and 'display_address' were all unused. display_address
-    is a STORED GENERATED column (never written directly, always derived from
-    needs_review + address) so it can never drift out of sync and never
-    interferes with the lower(address) upsert conflict target.
+    is a STORED GENERATED column (never written directly, always derived)
+    so it can never drift out of sync and never interferes with the
+    lower(address) upsert conflict target.
+
+    TRIPLE-ASTERISK FLAG (added 2026-09-22, T Dawg's explicit ask): '***'
+    prefix means "confirmed vacant AND behind on taxes" -- the opposite of
+    the single-'*' needs_review flag (that one means "double check this,
+    might be wrong"; '***' means "high-confidence, act on this one first").
+    HONEST CAVEAT, don't remove this comment: is_vacant is NOT currently
+    populated by any script in this pipeline. Exhaustive research (2026-09-22)
+    into every public vacancy proxy for Greenville County -- USPS vacancy
+    data (access restricted to government/nonprofit entities), Greenville
+    Water / Blue Ridge Rural Water disconnect data (no public dataset), a
+    vacant-property registration ordinance (none exists for the county or
+    city) -- came back NOT VIABLE across the board. Being tax-delinquent
+    does NOT by itself mean a property is vacant (plenty of occupied owners
+    fall behind on taxes), so this pipeline will not guess at is_vacant.
+    Generated-column logic is wired up and ready to fire the moment a real
+    vacancy source is found and is_vacant starts getting set to true/false
+    (not just left null) -- until then this will correctly show '***' on
+    zero properties rather than fabricate confidence the data doesn't support.
+    Recreated (drop+re-add) every run rather than "if not exists" so this
+    expression always reflects the latest logic.
     """
     with conn.cursor() as cur:
         cur.execute("alter table leads add column if not exists needs_review boolean not null default false")
         cur.execute("alter table leads add column if not exists review_reasons text[] not null default '{}'")
         cur.execute("create index if not exists idx_leads_needs_review on leads(needs_review)")
+        cur.execute("alter table leads drop column if exists display_address")
         cur.execute(
-            "select 1 from information_schema.columns where table_name='leads' and column_name='display_address'"
+            """
+            alter table leads add column display_address text generated always as (
+                case
+                    when is_vacant is true and (
+                        'tax_sale' = any(source_tags) or 'redemption_period' = any(source_tags)
+                    ) then '***' || address
+                    when needs_review then '*' || address
+                    else address
+                end
+            ) stored
+            """
         )
-        if not cur.fetchone():
-            cur.execute(
-                """
-                alter table leads add column display_address text generated always as (
-                    case when needs_review then '*' || address else address end
-                ) stored
-                """
-            )
 
 
 def refresh_needs_review(conn):
@@ -365,6 +436,11 @@ def rescore_all(conn):
       +15 if the same owner holds 3+ properties county-wide (tired landlord)
       +35 if the property is in an active tax-sale redemption period (owner
           is about to permanently lose the property if they don't act)
+      +30 if a permit shows storm/fire/water/damage repair language
+          (insurance_damage -- T Dawg's "utmost importance" category)
+      +20 if the MIE foreclosure plaintiff is an HOA/COA (hoa_foreclosure)
+      +20 if the property shows 15+ years of ownership or a last sale price
+          well below current fair market value (high_equity proxy)
     Only touches is_sold=false rows so a property already flipped by
     mark_sold_by_recent_deed() stays at score 0 instead of being rescored
     back up. Does NOT touch 'status' -- that's T Dawg's CRM/GHL pipeline
@@ -372,6 +448,9 @@ def rescore_all(conn):
 
     UPDATED 2026-09-21: added the redemption_period bonus alongside the new
     redemption_period_ingest.py script.
+
+    UPDATED 2026-09-22: added insurance_damage, hoa_foreclosure, and
+    high_equity bonuses alongside this round's new tags/scripts.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -385,6 +464,9 @@ def rescore_all(conn):
                 + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
                 + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
                 + (case when 'redemption_period' = any(source_tags) then 35 else 0 end)
+                + (case when 'insurance_damage' = any(source_tags) then 30 else 0 end)
+                + (case when 'hoa_foreclosure' = any(source_tags) then 20 else 0 end)
+                + (case when 'high_equity' = any(source_tags) then 20 else 0 end)
             where is_sold = false
             """
         )
@@ -425,6 +507,9 @@ def main():
             continue
         owner_name = normalize_owner(r.get("OWNAM1"))
         absentee = is_absentee(r.get("STREET"), r.get("STATE"), r.get("STRNUM"), r.get("LOCATE"))
+        high_equity, equity_pct = compute_equity(
+            r.get("DEED_DATE_NORM"), r.get("SLPRICE"), r.get("FAIRMKTVAL")
+        )
         processed.append({
             "pin": pin,
             "address": address,
@@ -436,6 +521,8 @@ def main():
             "sale_price": r.get("SLPRICE"),
             "total_tax": r.get("TOTTAX"),
             "landuse": r.get("LANDUSE"),
+            "high_equity": high_equity,
+            "equity_pct": equity_pct,
         })
         if owner_name:
             owner_counts[owner_name] += 1
@@ -445,8 +532,13 @@ def main():
 
     absentee_rows = [p for p in processed if p["absentee"] is True]
     tired_only_rows = [p for p in processed if p["absentee"] is not True and p["owner_name"] in tired_owners]
+    high_equity_only_rows = [
+        p for p in processed
+        if p["high_equity"] is True and p["absentee"] is not True and p["owner_name"] not in tired_owners
+    ]
     print(f"Absentee-owner parcels to upsert: {len(absentee_rows)}")
     print(f"Additional tired-landlord-only parcels (owner-occupied but 3+ properties): {len(tired_only_rows)}")
+    print(f"Additional high-equity-only parcels (not absentee/tired but 15yr+ owned or low sale-to-value): {len(high_equity_only_rows)}")
 
     conn = psycopg2.connect(db_url)
     ensure_status_column(conn)
@@ -460,10 +552,12 @@ def main():
     # (CardinalityViolation), which is exactly what killed run #2. Merge duplicates
     # into one row instead of crashing the whole batch.
     merged = {}
-    for p in absentee_rows + tired_only_rows:
+    for p in absentee_rows + tired_only_rows + high_equity_only_rows:
         tags = {"absentee_owner"} if p["absentee"] is True else set()
         if p["owner_name"] in tired_owners:
             tags.add("tired_landlord")
+        if p["high_equity"] is True:
+            tags.add("high_equity")
         if not tags:
             continue
         key = p["address"].lower()
@@ -482,12 +576,15 @@ def main():
                 "total_tax": p["total_tax"],
                 "landuse": p["landuse"],
                 "owner_parcel_count": owner_counts.get(p["owner_name"], 1),
+                "equity_pct": p["equity_pct"],
             }
         else:
             entry["tags"] |= tags
             entry["pins"].append(p["pin"])
             if p["absentee"] is True:
                 entry["absentee"] = True
+            if entry["equity_pct"] is None and p["equity_pct"] is not None:
+                entry["equity_pct"] = p["equity_pct"]
 
     batch_rows = []
     for entry in merged.values():
@@ -498,15 +595,16 @@ def main():
             "total_tax": entry["total_tax"],
             "landuse": entry["landuse"],
             "owner_parcel_count": entry["owner_parcel_count"],
+            "equity_pct": entry["equity_pct"],
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
         raw_payload = json.dumps({SOURCE_NAME: extra})
         batch_rows.append((
             entry["address"], entry["mailing_zip"], entry["owner_name"], entry["mailing_address"],
-            entry["absentee"], sorted(entry["tags"]), raw_payload,
+            entry["absentee"], sorted(entry["tags"]), raw_payload, entry["equity_pct"],
         ))
 
-    dupes_merged = len(absentee_rows) + len(tired_only_rows) - len(batch_rows)
+    dupes_merged = len(absentee_rows) + len(tired_only_rows) + len(high_equity_only_rows) - len(batch_rows)
     if dupes_merged > 0:
         print(f"Merged {dupes_merged} duplicate-address parcels before upsert.")
 
@@ -519,6 +617,7 @@ def main():
     refresh_needs_review(conn)
     log_run(conn, len(processed), len(batch_rows),
             f"ok: {len(absentee_rows)} absentee, {len(tired_only_rows)} tired-only, "
+            f"{len(high_equity_only_rows)} high-equity-only, "
             f"{len(tired_owners)} tired-landlord owners, {sold_count} marked sold")
     conn.commit()
     conn.close()

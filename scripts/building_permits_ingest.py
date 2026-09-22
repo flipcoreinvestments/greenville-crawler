@@ -17,6 +17,21 @@ What this pulls (two of the seller-motivation categories):
    her named 17 categories, but the same query costs nothing extra and it's
    a very strong distress signal (property came down, or is scheduled to),
    so it's included as a bonus tag.
+3. INSURANCE/STORM DAMAGE (added 2026-09-22, T Dawg's "utmost importance"
+   category). No clean address-level public source exists purely for
+   insurance claims (court "Fraud/Bad Faith" filings have no address field
+   without OCR'ing complaint PDFs; FEMA/NOAA data is redacted to
+   zip/census-block; county Assessor has no casualty-loss track). Instead,
+   this reuses the SAME feed already pulled above and keyword-filters the
+   free-text APPLIC_DESCRIPTION/PERMIT_COMMENTS fields for damage/repair
+   language — a repair permit for storm/fire/water damage is the strongest
+   real proxy that (a) something happened and (b) the owner is/was dealing
+   with it, whether or not insurance covered it fully. Tagged
+   'insurance_damage'. CAVEAT: this ArcGIS layer lives on
+   citygis.greenvillesc.gov (City of Greenville InfoHub) — unverified
+   whether it covers unincorporated Greenville County too (county permitting
+   may run through a separate eTrakit system). Ship it for what it covers
+   now; revisit county-wide coverage separately.
 
 Gives address, owner name, and owner mailing address (for absentee
 detection) directly — no second lookup needed.
@@ -35,9 +50,38 @@ BASE_URL = "https://citygis.greenvillesc.gov/arcgis/rest/services/InfoHUB/Buildi
 STALE_DAYS = 270  # ~9 months with no closure = treat as an expired/stalled permit
 OUT_FIELDS = (
     "STREETADDRESS,OWNER_NAME,OWNER_ADDR,OWNER_ADDR2,OWNER_ZIP,APPLICDATE,"
-    "NewIssueDate,BP_STATUS,PERMIT_NUM,PERMIT_TYPE,APPLIC_DESCRIPTION"
+    "NewIssueDate,BP_STATUS,PERMIT_NUM,PERMIT_TYPE,APPLIC_DESCRIPTION,PERMIT_COMMENTS"
 )
 SOURCE_NAME = "building_permits"
+
+# Free-text damage/repair keywords for the insurance_damage signal. Matched
+# case-insensitively against APPLIC_DESCRIPTION and PERMIT_COMMENTS. Kept
+# broad on purpose (repair permits are the proxy, not a legal insurance
+# determination) -- a false positive here just means a normal repair permit
+# picks up a bonus tag, which is harmless; a false negative means a real
+# distress lead gets missed entirely, which is worse. Err toward recall.
+DAMAGE_KEYWORDS = [
+    "fire damage", "fire repair", "storm damage", "storm repair",
+    "water damage", "flood damage", "flood repair", "wind damage",
+    "hail damage", "roof damage", "tornado damage", "tree damage",
+    "tree fell", "collapse", "structural damage", "smoke damage",
+    "burned", "burnt", "hurricane", "helene",
+]
+
+
+def build_damage_where_clause():
+    """
+    ArcGIS REST feature services accept a standard SQL WHERE against the
+    underlying DB for string fields, so UPPER()/LIKE works here the same
+    way it does in tax_sale_ingest.py's queries. OR-chain both free-text
+    fields against every keyword.
+    """
+    clauses = []
+    for kw in DAMAGE_KEYWORDS:
+        kw_upper = kw.upper().replace("'", "''")
+        clauses.append(f"UPPER(APPLIC_DESCRIPTION) LIKE '%{kw_upper}%'")
+        clauses.append(f"UPPER(PERMIT_COMMENTS) LIKE '%{kw_upper}%'")
+    return "(" + " OR ".join(clauses) + ")"
 
 
 def fetch_rows(where_clause):
@@ -96,6 +140,7 @@ def upsert_lead(conn, row, tag):
             "permit_num": (row.get("PERMIT_NUM") or "").strip(),
             "permit_type": (row.get("PERMIT_TYPE") or "").strip(),
             "description": (row.get("APPLIC_DESCRIPTION") or "").strip(),
+            "comments": (row.get("PERMIT_COMMENTS") or "").strip(),
             "bp_status": row.get("BP_STATUS"),
             "applic_date": applic_date_str,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -139,6 +184,11 @@ def rescore_all(conn):
       +15 if the same owner holds 3+ properties county-wide (tired landlord)
       +35 if the property is in an active tax-sale redemption period (owner
           is about to permanently lose the property if they don't act)
+      +30 if a permit shows storm/fire/water/damage repair language
+          (insurance_damage -- T Dawg's "utmost importance" category)
+      +20 if the MIE foreclosure plaintiff is an HOA/COA (hoa_foreclosure)
+      +20 if the property shows 15+ years of ownership or a last sale price
+          well below current fair market value (high_equity proxy)
 
     FIXED 2026-09-21: was missing the tired_landlord bonus AND the
     `where is_sold = false` guard, so this script (runs before
@@ -148,6 +198,9 @@ def rescore_all(conn):
 
     UPDATED 2026-09-21: added the redemption_period bonus alongside the new
     redemption_period_ingest.py script.
+
+    UPDATED 2026-09-22: added insurance_damage, hoa_foreclosure, and
+    high_equity bonuses alongside this round's new tags/scripts.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -161,6 +214,9 @@ def rescore_all(conn):
                 + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
                 + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
                 + (case when 'redemption_period' = any(source_tags) then 35 else 0 end)
+                + (case when 'insurance_damage' = any(source_tags) then 30 else 0 end)
+                + (case when 'hoa_foreclosure' = any(source_tags) then 20 else 0 end)
+                + (case when 'high_equity' = any(source_tags) then 20 else 0 end)
             where is_sold = false
             """
         )
@@ -201,6 +257,14 @@ def main():
         print(f"  stalled query failed: {e}", file=sys.stderr)
     print(f"  {len(stalled_rows)} stalled/expired permits found.")
 
+    print("Fetching insurance/storm-damage permits (keyword match on description/comments)...")
+    try:
+        damage_rows = fetch_rows(build_damage_where_clause())
+    except Exception as e:
+        damage_rows = []
+        print(f"  damage-keyword query failed: {e}", file=sys.stderr)
+    print(f"  {len(damage_rows)} damage-related permits found.")
+
     conn = psycopg2.connect(db_url)
     new_count = 0
 
@@ -210,9 +274,12 @@ def main():
     for row in stalled_rows:
         if upsert_lead(conn, row, "permit_expired"):
             new_count += 1
+    for row in damage_rows:
+        if upsert_lead(conn, row, "insurance_damage"):
+            new_count += 1
 
     rescore_all(conn)
-    log_run(conn, len(demo_rows) + len(stalled_rows), new_count, "ok")
+    log_run(conn, len(demo_rows) + len(stalled_rows) + len(damage_rows), new_count, "ok")
     conn.commit()
     conn.close()
     print(f"Done. {new_count} properties upserted and rescored.")

@@ -285,9 +285,17 @@ def rescore_all(conn):
       +35 if the property is in an active tax-sale redemption period (about
           to permanently lose the property -- added 2026-09-21 alongside
           this script)
+      +30 if a permit shows storm/fire/water/damage repair language
+          (insurance_damage -- T Dawg's "utmost importance" category)
+      +20 if the MIE foreclosure plaintiff is an HOA/COA (hoa_foreclosure)
+      +20 if the property shows 15+ years of ownership or a last sale price
+          well below current fair market value (high_equity proxy)
 
     Always scoped `where is_sold = false` so this script stays independently
     correct regardless of what order nightly.yml runs the scripts in.
+
+    UPDATED 2026-09-22: added insurance_damage, hoa_foreclosure, and
+    high_equity bonuses alongside this round's new tags/scripts.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -301,6 +309,9 @@ def rescore_all(conn):
                 + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
                 + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
                 + (case when 'redemption_period' = any(source_tags) then 35 else 0 end)
+                + (case when 'insurance_damage' = any(source_tags) then 30 else 0 end)
+                + (case when 'hoa_foreclosure' = any(source_tags) then 20 else 0 end)
+                + (case when 'high_equity' = any(source_tags) then 20 else 0 end)
             where is_sold = false
             """
         )

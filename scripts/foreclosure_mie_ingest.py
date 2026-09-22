@@ -20,6 +20,17 @@ What this does:
    seller signal on its own, and a very strong one when stacked with any
    other source (tax sale, etc.) for the same address.
 5. Recomputes the shared score (see rescore_all) and logs the run.
+
+HOA/COA FORECLOSURE (added 2026-09-22): SC law (§27-30-150 for HOAs,
+§27-31-210 for condos) forecloses an unpaid-assessment lien "in like manner
+as a mortgage" -- there is no separate case type/nature-of-action code for
+it, it runs through this exact same Master-in-Equity sale list under
+Foreclosure (420). So this is NOT a new data source, just a plaintiff-name
+classifier bolted onto the feed already being pulled: any row whose
+Plaintiff matches an HOA/COA-style name gets an EXTRA 'hoa_foreclosure' tag
+alongside 'foreclosure_mie'. Expect some false negatives from management
+companies filing on an HOA's behalf under their own name -- acceptable,
+this is a bonus signal, not the primary one.
 """
 
 import os
@@ -41,6 +52,17 @@ HEADERS = {
 }
 REQUEST_DELAY_SECONDS = 1.5
 SOURCE_NAME = "foreclosure_mie"
+
+# Plaintiff-name patterns that mean this foreclosure is an HOA/COA
+# assessment-lien foreclosure rather than a mortgage foreclosure. Matched
+# case-insensitively as a substring. Kept broad -- a missed HOA case just
+# stays tagged as a plain foreclosure_mie lead (still surfaces), a false
+# positive costs nothing since it's an additive bonus tag.
+HOA_PLAINTIFF_PATTERN = re.compile(
+    r"(HOMEOWNERS?\s*ASSOC|PROPERTY\s*OWNERS?\s*ASSOC|OWNERS?\s*ASSOC|"
+    r"CONDOMINIUM\s*ASSOC|COMMUNITY\s*ASSOC|\bHOA\b|\bPOA\b|\bCOA\b)",
+    re.IGNORECASE,
+)
 
 
 def fetch_future_sale_dates():
@@ -142,12 +164,16 @@ def upsert_lead(conn, row, sale_date):
     if not address:
         return False
 
+    is_hoa = bool(HOA_PLAINTIFF_PATTERN.search(row["plaintiff"] or ""))
+    tags = [SOURCE_NAME] + (["hoa_foreclosure"] if is_hoa else [])
+
     raw_payload = json.dumps({
         SOURCE_NAME: {
             "sale_date": sale_date,
             "case_number": row["case_number"],
             "plaintiff": row["plaintiff"],
             "law_firm": row["law_firm"],
+            "hoa_foreclosure": is_hoa,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
     })
@@ -156,7 +182,7 @@ def upsert_lead(conn, row, sale_date):
         cur.execute(
             """
             insert into leads (address, city, state, zip, county, owner_name, source_tags, raw)
-            values (%s, %s, %s, %s, 'Greenville', %s, ARRAY[%s]::text[], %s::jsonb)
+            values (%s, %s, %s, %s, 'Greenville', %s, %s::text[], %s::jsonb)
             on conflict (lower(address)) do update set
                 city = coalesce(excluded.city, leads.city),
                 zip = coalesce(excluded.zip, leads.zip),
@@ -165,7 +191,7 @@ def upsert_lead(conn, row, sale_date):
                 raw = leads.raw || excluded.raw,
                 updated_at = now()
             """,
-            (address, row["city"], row["state"], row["zip"], row["defendant"], SOURCE_NAME, raw_payload),
+            (address, row["city"], row["state"], row["zip"], row["defendant"], tags, raw_payload),
         )
     return True
 
@@ -183,6 +209,11 @@ def rescore_all(conn):
       +15 if the same owner holds 3+ properties county-wide (tired landlord)
       +35 if the property is in an active tax-sale redemption period (owner
           is about to permanently lose the property if they don't act)
+      +30 if a permit shows storm/fire/water/damage repair language
+          (insurance_damage -- T Dawg's "utmost importance" category)
+      +20 if the MIE foreclosure plaintiff is an HOA/COA (hoa_foreclosure)
+      +20 if the property shows 15+ years of ownership or a last sale price
+          well below current fair market value (high_equity proxy)
 
     FIXED 2026-09-21: was missing the tired_landlord bonus AND the
     `where is_sold = false` guard, so this script (runs before
@@ -192,6 +223,9 @@ def rescore_all(conn):
 
     UPDATED 2026-09-21: added the redemption_period bonus alongside the new
     redemption_period_ingest.py script.
+
+    UPDATED 2026-09-22: added insurance_damage, hoa_foreclosure, and
+    high_equity bonuses alongside this round's new tags/scripts.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -205,6 +239,9 @@ def rescore_all(conn):
                 + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
                 + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
                 + (case when 'redemption_period' = any(source_tags) then 35 else 0 end)
+                + (case when 'insurance_damage' = any(source_tags) then 30 else 0 end)
+                + (case when 'hoa_foreclosure' = any(source_tags) then 20 else 0 end)
+                + (case when 'high_equity' = any(source_tags) then 20 else 0 end)
             where is_sold = false
             """
         )
