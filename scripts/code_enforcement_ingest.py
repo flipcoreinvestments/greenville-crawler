@@ -16,10 +16,14 @@ pipeline). Confirmed 2026-09-22 by hand in a real browser:
     +GP1+ENG"). That token is only valid for the session that generated it,
     so this script GETs the search page fresh every run, scrapes the
     current hidden fields + action URL out of the HTML, and POSTs them
-    back unchanged except LDROP_SCR (page size) forced to "ALL" and the
-    free-text filter left blank -- exactly what "leave blank for ALL" on
-    the visible form does. Small dataset (6 open cases county-wide as of
-    2026-09-22), so no pagination logic is needed.
+    back with LDROP_SCR (page size) forced to "ALL", the free-text filter
+    left blank -- exactly what "leave blank for ALL" on the visible form
+    does -- and ASTDRENTST forced to "SEARCH" (the visible Search link's
+    onclick sets this hidden field before submitting; a plain form replay
+    without it gets silently re-served the blank search form instead of
+    running the query -- see the bug-fix note in fetch_all_cases() for how
+    this was caught and confirmed). Small dataset (6 open cases county-wide
+    as of 2026-09-22), so no pagination logic is needed.
   - The results table is plain HTML: Case Number | Case Location | Case
     Map Number (the map number is the county TMS/parcel ID). This alone is
     enough to make a lead -- Case Location is already a normal mailable
@@ -100,6 +104,17 @@ def fetch_all_cases(session):
     action, fields = get_search_form(session)
     fields["LDROP_SCR"] = "ALL"
     fields["ASC_POSTO"] = ""  # blank = ALL, per the visible form's own hint
+    # BUG FIX 2026-09-22 (found via production validation run returning 0
+    # results against a page with 6 real open cases): the visible "Search"
+    # link isn't a plain form submit -- its onclick is
+    # `document.LANSA.ASTDRENTST.value='SEARCH'; HandleEvent(...)`, i.e. it
+    # mutates this hidden field to 'SEARCH' before posting. Without it, the
+    # LANSA backend just re-serves the blank search form (200 OK, same
+    # byte length as the GET) instead of running the query -- no exception,
+    # so it silently looked like "zero cases" instead of a failed request.
+    # Confirmed fix by replaying the exact POST by hand: 0 matches without
+    # this field, 6/6 correct matches with it.
+    fields["ASTDRENTST"] = "SEARCH"
 
     resp = session.post(action, data=fields, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
