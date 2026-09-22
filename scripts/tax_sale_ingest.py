@@ -89,11 +89,11 @@ def parse_list(html):
     rows_out = []
 
     for table in soup.find_all("table"):
-         header_text = table.get_text(" ", strip=True).lower()
+        header_text = table.get_text(" ", strip=True).lower()
         if "map" not in header_text or "amount" not in header_text:
             continue
 
-       trs = table.find_all("tr")
+        trs = table.find_all("tr")
         for tr in trs:
             cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
             if len(cells) < 3:
@@ -231,13 +231,13 @@ def rescore_all(conn):
                 + (case when 'foreclosure_mie' = any(source_tags) then 30 else 0 end)
                 + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
                 + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
-                 + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
+                + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
             where is_sold = false
             """
         )
 
 
-def log_run(conn, records_found, records_new, notes)
+def log_run(conn, records_found, records_new, notes):
     with conn.cursor() as cur:
         cur.execute(
             "insert into source_runs (source_name, records_found, records_new, notes) values (%s, %s, %s, %s)",
