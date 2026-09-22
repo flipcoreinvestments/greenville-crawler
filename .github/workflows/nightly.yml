@@ -63,3 +63,13 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/code_enforcement_ingest.py
+
+      - name: Merge duplicate-address leads (one name per list)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/merge_duplicate_addresses.py
+
+      - name: Alert on leads newly stacked on 2+ lists
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/alert_stacked_leads.py
