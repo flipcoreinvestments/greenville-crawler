@@ -1,0 +1,30 @@
+name: Verify distress signals (3+ list leads)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install headless browser
+        run: playwright install --with-deps chromium
+
+      - name: Freshen absentee/tired-landlord/high-equity (full county sweep)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/absentee_owner_ingest.py
+
+      - name: Cross-verify distress signals against live sources
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/verify_distress_signals.py
