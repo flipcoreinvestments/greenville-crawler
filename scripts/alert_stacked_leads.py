@@ -31,10 +31,39 @@ ALERT_THRESHOLD = 2  # "shows up on multiple lists" = 2 or more
 
 
 def ensure_columns(conn):
+    """
+    Adds last_alerted_list_count if missing. Returns True if the column was
+    just created for the first time (a "bootstrap" run), False if it
+    already existed.
+
+    On a genuine first run, every existing 2+-list lead would otherwise
+    look "newly stacked" (since the new column defaults to 0 for every
+    row), flooding the log with an alert for the entire historical
+    backlog -- tens of thousands of leads -- instead of just what's
+    actually new. main() uses the return value to seed the column to each
+    lead's current list_count silently on that first run, so alerts start
+    firing only for genuine increases from that point forward.
+    """
     with conn.cursor() as cur:
+        cur.execute(
+            "select 1 from information_schema.columns "
+            "where table_name = 'leads' and column_name = 'last_alerted_list_count'"
+        )
+        already_existed = cur.fetchone() is not None
         cur.execute(
             "alter table leads add column if not exists last_alerted_list_count int not null default 0"
         )
+    return not already_existed
+
+
+def bootstrap_baseline(conn):
+    """First-run only: silently set last_alerted_list_count = list_count for
+    every existing lead, so this run alerts on nothing and future runs only
+    alert on genuine new stacking from today's baseline forward."""
+    with conn.cursor() as cur:
+        cur.execute("update leads set last_alerted_list_count = list_count")
+        print(f"  bootstrap: seeded last_alerted_list_count for {cur.rowcount} existing lead(s) "
+              f"(no alerts fired for this historical backlog).")
 
 
 def find_newly_stacked(conn):
@@ -70,8 +99,17 @@ def main():
         sys.exit(1)
 
     conn = psycopg2.connect(db_url)
-    ensure_columns(conn)
+    is_first_run = ensure_columns(conn)
     conn.commit()
+
+    if is_first_run:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] First run -- bootstrapping baseline "
+              f"instead of alerting on the entire historical backlog.")
+        bootstrap_baseline(conn)
+        conn.commit()
+        print("Done. Baseline set; future runs will alert only on genuinely new stacking.")
+        conn.close()
+        return
 
     leads = find_newly_stacked(conn)
     print(f"[{datetime.now(timezone.utc).isoformat()}] {len(leads)} lead(s) newly stacked on "

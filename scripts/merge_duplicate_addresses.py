@@ -53,27 +53,43 @@ def find_pairs(conn):
     Same zip, neither side already flagged, one address = other address +
     ' ' + one more word. Returns the canonical (longer/suffixed) row and
     the redundant (shorter) row for each pair.
+
+    PERFORMANCE NOTE (2026-09-22): the first version of this query joined on
+    `a.address ilike b.address || ' %'` directly -- an unanchored ILIKE
+    pattern that can't use an index and forces a full nested-loop scan
+    across every same-zip pair (effectively O(n^2) string comparisons
+    across ~98k rows). That hit Supabase's statement timeout in production
+    (confirmed both here and independently via the SQL editor on the same
+    query shape). Fixed by normalizing each address down to a "core" (strip
+    the trailing street-type word) in a CTE first, then joining on an exact
+    match of (zip, core) -- a plain equality join Postgres can hash, which
+    is what a manual re-check in the SQL editor confirmed runs instantly
+    (571/571 duplicate pairs found) versus the old query's timeout.
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
+            with normalized as (
+                select id, address, zip,
+                    regexp_replace(
+                        regexp_replace(lower(trim(address)),
+                            '\\s+(dr|drive|st|street|ave|avenue|rd|road|ln|lane|ct|court|cir|circle|way|blvd|boulevard|pl|place|trl|trail|pkwy|parkway)\\.?$',
+                            '', 'g'),
+                        '\\s+', ' ', 'g') as core
+                from leads
+                where is_sold = false and is_duplicate = false and zip is not null
+            )
             select
                 case when length(a.address) >= length(b.address) then a.id else b.id end as canonical_id,
                 case when length(a.address) >= length(b.address) then a.address else b.address end as canonical_address,
                 case when length(a.address) >= length(b.address) then b.id else a.id end as redundant_id,
                 case when length(a.address) >= length(b.address) then b.address else a.address end as redundant_address
-            from leads a
-            join leads b
+            from normalized a
+            join normalized b
                 on a.id < b.id
-                and coalesce(a.zip, '') = coalesce(b.zip, '')
-                and a.zip is not null
-                and a.is_duplicate = false
-                and b.is_duplicate = false
-                and (
-                    a.address ilike b.address || ' %'
-                    or b.address ilike a.address || ' %'
-                )
-            where a.is_sold = false and b.is_sold = false
+                and a.zip = b.zip
+                and a.core = b.core
+                and a.address <> b.address
             """
         )
         return cur.fetchall()
@@ -144,12 +160,18 @@ def main():
     print(f"[{datetime.now(timezone.utc).isoformat()}] Found {len(pairs)} duplicate-address pair(s) to merge.")
 
     merged_ids = []
-    for p in pairs:
+    for i, p in enumerate(pairs, start=1):
         print(f"  merging {p['redundant_address']!r} (id={p['redundant_id']}) "
               f"into {p['canonical_address']!r} (id={p['canonical_id']})")
         merge_pair(conn, p["canonical_id"], p["redundant_id"])
         merged_ids.append(str(p["redundant_id"]))
-        conn.commit()
+        # Commit in batches rather than after every pair -- cuts round trips
+        # to the DB roughly 50x. Still safe to interrupt: an uncommitted
+        # pair simply gets picked up again by find_pairs() next run (this
+        # script is idempotent), never left half-merged.
+        if i % 50 == 0:
+            conn.commit()
+    conn.commit()
 
     rescore_all(conn)
     conn.commit()
