@@ -363,10 +363,15 @@ def rescore_all(conn):
       +20 if the property has a stalled/expired building permit
       +20 if the property has a demolition permit
       +15 if the same owner holds 3+ properties county-wide (tired landlord)
+      +35 if the property is in an active tax-sale redemption period (owner
+          is about to permanently lose the property if they don't act)
     Only touches is_sold=false rows so a property already flipped by
     mark_sold_by_recent_deed() stays at score 0 instead of being rescored
     back up. Does NOT touch 'status' -- that's T Dawg's CRM/GHL pipeline
     field (new/contacted/etc), completely separate from is_sold.
+
+    UPDATED 2026-09-21: added the redemption_period bonus alongside the new
+    redemption_period_ingest.py script.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -379,6 +384,7 @@ def rescore_all(conn):
                 + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
                 + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
                 + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
+                + (case when 'redemption_period' = any(source_tags) then 35 else 0 end)
             where is_sold = false
             """
         )

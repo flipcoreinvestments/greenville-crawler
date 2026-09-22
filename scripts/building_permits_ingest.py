@@ -137,12 +137,17 @@ def rescore_all(conn):
       +20 if the property has a stalled/expired building permit
       +20 if the property has a demolition permit
       +15 if the same owner holds 3+ properties county-wide (tired landlord)
+      +35 if the property is in an active tax-sale redemption period (owner
+          is about to permanently lose the property if they don't act)
 
     FIXED 2026-09-21: was missing the tired_landlord bonus AND the
     `where is_sold = false` guard, so this script (runs before
     absentee_owner_ingest.py in nightly.yml) was un-zeroing already-sold
     leads' scores each night. Fixed so this script is independently
     correct regardless of run order.
+
+    UPDATED 2026-09-21: added the redemption_period bonus alongside the new
+    redemption_period_ingest.py script.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -155,6 +160,7 @@ def rescore_all(conn):
                 + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
                 + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
                 + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
+                + (case when 'redemption_period' = any(source_tags) then 35 else 0 end)
             where is_sold = false
             """
         )
