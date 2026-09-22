@@ -5,19 +5,25 @@ Greenville County Master-in-Equity foreclosure sale list ingest.
 Source: https://mie.greenvillejournal.com/printer-friendly-sale-list/
 Public foreclosure auction listings for Greenville County, published by the
 Greenville County Master-in-Equity Court via the Greenville Journal.
-robots.txt checked 2026-09-18: /wp-content/ is not disallowed. No bot
-protection observed on this site (plain nginx/WordPress) — uses `requests`
-directly, no headless browser needed.
+robots.txt checked 2026-09-18: /wp-content/ is not disallowed.
 
-BUG FIX 2026-09-22: this script was silently reporting "0 upcoming sale
-dates" in every production run despite the live site showing 5 real future
-dates (confirmed by hand the same day -- next is 10/05/2026). Most likely
-cause: an origin-level bot-mitigation plugin on this WordPress host
-rejecting the honest custom User-Agent this script was sending. Switched to
-a realistic browser User-Agent + Accept headers, and added diagnostic
-logging so a future failure prints what actually came back instead of
-another silent zero. NOT YET RE-CONFIRMED IN PRODUCTION as of this fix --
-check the next run's "Found N upcoming sale dates" line.
+BUG FIX 2026-09-22 (round 2 -- ROOT CAUSE CONFIRMED): the first fix in this
+file (swapping to a browser-like User-Agent on `requests`) did NOT work.
+Run #24 proved it with a real server response instead of a guess: HTTP 202,
+body is a 197-byte stub `<meta http-equiv="refresh" content="0;/.well-known
+/sgcaptcha/?r=...&y=ipc:...">`. That `/.well-known/sgcaptcha/` path is a
+JavaScript-executing bot-challenge gate (the sgcaptcha plugin) sitting in
+front of this WordPress site -- it hands out a real cookie only after a
+browser runs its JS and follows the redirect chain. No User-Agent or header
+combination can satisfy that with a plain `requests.get()`; it categorically
+requires a JS-capable client. Fixed for real this time by doing what
+tax_sale_ingest.py already does for the county's own Imperva bot-check:
+drive it with a real headless browser (Playwright + Chromium, already
+installed by nightly.yml's "Install headless browser" step) with
+playwright-stealth applied, so the challenge JS runs, the cookie gets set,
+and the real page loads. The sale-list POST endpoint is then called through
+that same browser context's request API so it carries the cookie the
+challenge issued.
 
 What this does:
 1. Reads the sale-date dropdown on the site's own list page to find every
@@ -50,37 +56,27 @@ import time
 import json
 from datetime import datetime, timezone, date
 
-import requests
 from bs4 import BeautifulSoup
 import psycopg2
+from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 BASE_URL = "https://mie.greenvillejournal.com"
 LIST_PAGE_URL = f"{BASE_URL}/printer-friendly-sale-list/"
 GENERATE_URL = f"{BASE_URL}/wp-content/plugins/master-in-equity/download-clerk-docs.php"
-HEADERS = {
-    # BUG FIX 2026-09-22: this script was reporting "0 upcoming sale dates"
-    # in every production run (confirmed wrong -- the live site's own
-    # dropdown, checked by hand the same day, shows 5 real future sale
-    # dates). Cause not 100% nailed down (this host can't be reached from
-    # the sandbox this fix was written in, to reproduce the exact GitHub
-    # Actions request), but the site runs on plain WordPress/nginx with no
-    # Cloudflare in front of it (no cf-ray header) -- consistent with an
-    # origin-level bot-mitigation plugin (Wordfence/Sucuri-style) rejecting
-    # the honest-but-obviously-a-bot "RestartHomesResearch/1.0" UA string,
-    # which is exactly the kind of pattern those plugins filter on. Switched
-    # to a realistic browser UA + matching Accept headers as the most likely
-    # fix. Paired with diagnostic logging below so if this ISN'T the real
-    # cause, the next run prints what actually came back instead of another
-    # silent "0 dates".
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
 REQUEST_DELAY_SECONDS = 1.5
 SOURCE_NAME = "foreclosure_mie"
+
+
+def new_browser_context(browser):
+    context = browser.new_context(user_agent=BROWSER_USER_AGENT)
+    page = context.new_page()
+    stealth_sync(page)
+    return context, page
 
 # Plaintiff-name patterns that mean this foreclosure is an HOA/COA
 # assessment-lien foreclosure rather than a mortgage foreclosure. Matched
@@ -94,24 +90,29 @@ HOA_PLAINTIFF_PATTERN = re.compile(
 )
 
 
-def fetch_future_sale_dates():
-    resp = requests.get(LIST_PAGE_URL, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    select = soup.find("select", attrs={"name": "closedate"})
-    if not select:
-        # Diagnostic for the 2026-09-22 "always 0" bug: surface what we
-        # actually got back (status + page title/snippet) instead of
-        # silently returning [] with no clue why.
-        title = soup.find("title")
+def fetch_future_sale_dates(page):
+    # The real page sits behind a JS bot-challenge (/.well-known/sgcaptcha/)
+    # that returns a 202 stub + meta-refresh. A real browser follows that
+    # chain automatically; we just wait for the real DOM to show up.
+    page.goto(LIST_PAGE_URL, timeout=30000)
+    try:
+        page.wait_for_selector("select[name='closedate']", timeout=20000)
+    except Exception:
+        # Diagnostic: surface what we actually got back instead of another
+        # silent "0 dates" if the challenge page changes shape again.
+        html = page.content()
+        title = page.title()
         print(
-            f"  WARNING: no <select name='closedate'> found. "
-            f"HTTP {resp.status_code}, page title: "
-            f"{title.get_text(strip=True) if title else '(none)'!r}, "
-            f"body length: {len(resp.text)}, first 300 chars: "
-            f"{resp.text[:300]!r}",
+            f"  WARNING: no <select name='closedate'> found after waiting. "
+            f"page title: {title!r}, url: {page.url!r}, "
+            f"body length: {len(html)}, first 300 chars: {html[:300]!r}",
             file=sys.stderr,
         )
+        return []
+
+    soup = BeautifulSoup(page.content(), "html.parser")
+    select = soup.find("select", attrs={"name": "closedate"})
+    if not select:
         return []
     today = date.today()
     dates = []
@@ -134,15 +135,15 @@ def fetch_future_sale_dates():
     return dates
 
 
-def fetch_sale_list(sale_date):
-    resp = requests.post(
+def fetch_sale_list(context, sale_date):
+    # Posted through the browser context's own request API so it carries
+    # the cookie the sgcaptcha challenge issued during fetch_future_sale_dates.
+    resp = context.request.post(
         GENERATE_URL,
-        headers=HEADERS,
         data={"closedate": sale_date, "target": "Generate List"},
-        timeout=30,
+        timeout=30000,
     )
-    resp.raise_for_status()
-    return resp.text
+    return resp.text()
 
 
 def parse_sale_list(html):
@@ -312,39 +313,45 @@ def main():
         sys.exit(1)
 
     print(f"[{datetime.now(timezone.utc).isoformat()}] Finding upcoming foreclosure sale dates...")
-    sale_dates = fetch_future_sale_dates()
-    print(f"Found {len(sale_dates)} upcoming sale dates: {sale_dates}")
 
-    conn = psycopg2.connect(db_url)
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        context, page = new_browser_context(browser)
+        sale_dates = fetch_future_sale_dates(page)
+        print(f"Found {len(sale_dates)} upcoming sale dates: {sale_dates}")
 
-    if not sale_dates:
-        log_run(conn, 0, 0, "no upcoming sale dates found — page structure may have changed")
+        conn = psycopg2.connect(db_url)
+
+        if not sale_dates:
+            log_run(conn, 0, 0, "no upcoming sale dates found — sgcaptcha challenge page or list page structure may have changed")
+            conn.commit()
+            conn.close()
+            browser.close()
+            return
+
+        total_found = 0
+        new_count = 0
+
+        for sale_date in sale_dates:
+            try:
+                html = fetch_sale_list(context, sale_date)
+                rows = parse_sale_list(html)
+                print(f"  {sale_date}: {len(rows)} active listings")
+                total_found += len(rows)
+                for row in rows:
+                    if upsert_lead(conn, row, sale_date):
+                        new_count += 1
+            except Exception as e:
+                print(f"  {sale_date}: error {e}", file=sys.stderr)
+
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+        rescore_all(conn)
+        log_run(conn, total_found, new_count, "ok")
         conn.commit()
         conn.close()
-        return
-
-    total_found = 0
-    new_count = 0
-
-    for sale_date in sale_dates:
-        try:
-            html = fetch_sale_list(sale_date)
-            rows = parse_sale_list(html)
-            print(f"  {sale_date}: {len(rows)} active listings")
-            total_found += len(rows)
-            for row in rows:
-                if upsert_lead(conn, row, sale_date):
-                    new_count += 1
-        except Exception as e:
-            print(f"  {sale_date}: error {e}", file=sys.stderr)
-
-        time.sleep(REQUEST_DELAY_SECONDS)
-
-    rescore_all(conn)
-    log_run(conn, total_found, new_count, "ok")
-    conn.commit()
-    conn.close()
-    print(f"Done. {new_count} properties upserted and rescored across {len(sale_dates)} sale dates.")
+        browser.close()
+        print(f"Done. {new_count} properties upserted and rescored across {len(sale_dates)} sale dates.")
 
 
 if __name__ == "__main__":
