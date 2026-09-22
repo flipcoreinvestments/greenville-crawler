@@ -111,9 +111,18 @@ def scrapfly_request(method, url, api_key, data=None):
         )
     if resp.status_code != 200:
         reject = resp.headers.get("X-Scrapfly-Reject-Code", "")
+        error_detail = payload.get("error") or {}
+        result = payload.get("result", {})
+        # Print the whole thing to the log (not just a short exception
+        # message) so a new/unexpected failure shape is debuggable from the
+        # Actions log alone -- same "no silent black box" rule as the rest
+        # of this file's diagnostics.
+        print(f"  Scrapfly full error payload: {json.dumps(payload)}", file=sys.stderr)
         raise RuntimeError(
             f"Scrapfly API call failed (http {resp.status_code}, reject={reject!r}) "
-            f"for {url}: {json.dumps(payload)[:500]}"
+            f"for {url}: message={error_detail.get('message')!r} "
+            f"target_status={result.get('status_code')!r} "
+            f"target_reason={result.get('reason')!r}"
         )
     result = payload.get("result", {})
     target_status = result.get("status_code")
