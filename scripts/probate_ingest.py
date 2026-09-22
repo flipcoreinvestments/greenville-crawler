@@ -220,6 +220,7 @@ def rescore_all(conn):
                 + (case when 'insurance_damage' = any(source_tags) then 30 else 0 end)
                 + (case when 'hoa_foreclosure' = any(source_tags) then 20 else 0 end)
                 + (case when 'high_equity' = any(source_tags) then 20 else 0 end)
+                + (case when 'code_violation' = any(source_tags) then 25 else 0 end)
             where is_sold = false
             """
         )
