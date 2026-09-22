@@ -9,6 +9,16 @@ robots.txt checked 2026-09-18: /wp-content/ is not disallowed. No bot
 protection observed on this site (plain nginx/WordPress) — uses `requests`
 directly, no headless browser needed.
 
+BUG FIX 2026-09-22: this script was silently reporting "0 upcoming sale
+dates" in every production run despite the live site showing 5 real future
+dates (confirmed by hand the same day -- next is 10/05/2026). Most likely
+cause: an origin-level bot-mitigation plugin on this WordPress host
+rejecting the honest custom User-Agent this script was sending. Switched to
+a realistic browser User-Agent + Accept headers, and added diagnostic
+logging so a future failure prints what actually came back instead of
+another silent zero. NOT YET RE-CONFIRMED IN PRODUCTION as of this fix --
+check the next run's "Found N upcoming sale dates" line.
+
 What this does:
 1. Reads the sale-date dropdown on the site's own list page to find every
    FUTURE scheduled foreclosure sale date (past dates are already sold).
@@ -48,7 +58,26 @@ BASE_URL = "https://mie.greenvillejournal.com"
 LIST_PAGE_URL = f"{BASE_URL}/printer-friendly-sale-list/"
 GENERATE_URL = f"{BASE_URL}/wp-content/plugins/master-in-equity/download-clerk-docs.php"
 HEADERS = {
-    "User-Agent": "RestartHomesResearch/1.0 (+info@restarthomes.net; one-off public-record lookup, low volume)"
+    # BUG FIX 2026-09-22: this script was reporting "0 upcoming sale dates"
+    # in every production run (confirmed wrong -- the live site's own
+    # dropdown, checked by hand the same day, shows 5 real future sale
+    # dates). Cause not 100% nailed down (this host can't be reached from
+    # the sandbox this fix was written in, to reproduce the exact GitHub
+    # Actions request), but the site runs on plain WordPress/nginx with no
+    # Cloudflare in front of it (no cf-ray header) -- consistent with an
+    # origin-level bot-mitigation plugin (Wordfence/Sucuri-style) rejecting
+    # the honest-but-obviously-a-bot "RestartHomesResearch/1.0" UA string,
+    # which is exactly the kind of pattern those plugins filter on. Switched
+    # to a realistic browser UA + matching Accept headers as the most likely
+    # fix. Paired with diagnostic logging below so if this ISN'T the real
+    # cause, the next run prints what actually came back instead of another
+    # silent "0 dates".
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 REQUEST_DELAY_SECONDS = 1.5
 SOURCE_NAME = "foreclosure_mie"
@@ -71,17 +100,37 @@ def fetch_future_sale_dates():
     soup = BeautifulSoup(resp.text, "html.parser")
     select = soup.find("select", attrs={"name": "closedate"})
     if not select:
+        # Diagnostic for the 2026-09-22 "always 0" bug: surface what we
+        # actually got back (status + page title/snippet) instead of
+        # silently returning [] with no clue why.
+        title = soup.find("title")
+        print(
+            f"  WARNING: no <select name='closedate'> found. "
+            f"HTTP {resp.status_code}, page title: "
+            f"{title.get_text(strip=True) if title else '(none)'!r}, "
+            f"body length: {len(resp.text)}, first 300 chars: "
+            f"{resp.text[:300]!r}",
+            file=sys.stderr,
+        )
         return []
     today = date.today()
     dates = []
+    skipped_unparsed = 0
     for opt in select.find_all("option"):
         value = (opt.get("value") or opt.get_text(strip=True) or "").strip()
         try:
             d = datetime.strptime(value, "%m/%d/%Y").date()
         except ValueError:
+            skipped_unparsed += 1
             continue
         if d >= today:
             dates.append(value)
+    if skipped_unparsed:
+        print(
+            f"  WARNING: {skipped_unparsed} <option> value(s) in the "
+            f"closedate select didn't parse as MM/DD/YYYY.",
+            file=sys.stderr,
+        )
     return dates
 
 
