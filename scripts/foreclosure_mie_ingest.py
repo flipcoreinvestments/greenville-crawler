@@ -7,23 +7,37 @@ Public foreclosure auction listings for Greenville County, published by the
 Greenville County Master-in-Equity Court via the Greenville Journal.
 robots.txt checked 2026-09-18: /wp-content/ is not disallowed.
 
-BUG FIX 2026-09-22 (round 2 -- ROOT CAUSE CONFIRMED): the first fix in this
-file (swapping to a browser-like User-Agent on `requests`) did NOT work.
-Run #24 proved it with a real server response instead of a guess: HTTP 202,
-body is a 197-byte stub `<meta http-equiv="refresh" content="0;/.well-known
-/sgcaptcha/?r=...&y=ipc:...">`. That `/.well-known/sgcaptcha/` path is a
-JavaScript-executing bot-challenge gate (the sgcaptcha plugin) sitting in
-front of this WordPress site -- it hands out a real cookie only after a
-browser runs its JS and follows the redirect chain. No User-Agent or header
-combination can satisfy that with a plain `requests.get()`; it categorically
-requires a JS-capable client. Fixed for real this time by doing what
-tax_sale_ingest.py already does for the county's own Imperva bot-check:
-drive it with a real headless browser (Playwright + Chromium, already
-installed by nightly.yml's "Install headless browser" step) with
-playwright-stealth applied, so the challenge JS runs, the cookie gets set,
-and the real page loads. The sale-list POST endpoint is then called through
-that same browser context's request API so it carries the cookie the
-challenge issued.
+BUG FIX 2026-09-22 (round 2): the first fix (browser-like User-Agent on
+`requests`) didn't work -- turned out to be a JS-executing bot-challenge
+(the sgcaptcha plugin) that categorically requires a JS-capable client. That
+was "fixed" by driving a real headless browser (Playwright + stealth) the
+same way tax_sale_ingest.py handles the county's own Imperva check.
+
+BUG FIX 2026-09-22 (round 3 -- TRUE ROOT CAUSE): the Playwright fix above
+still returned 0 upcoming dates in production even though it worked
+perfectly in a one-off local test. Added diagnostics, re-ran, and confirmed
+via a side-by-side test that a real residential/office-IP Chrome session
+sees 5 genuine future sale dates with zero challenge, while the exact same
+Playwright+stealth code from a GitHub Actions runner gets served a distinct,
+more severe Imperva/Incapsula "Robot Challenge Screen" that blocks the
+`<select name='closedate'>` from ever rendering. This is IP-reputation/
+behavioral scoring aimed at datacenter IPs specifically -- no amount of
+browser fingerprint stealth fixes it, because the block isn't looking at the
+browser, it's looking at the network the request came from.
+
+FIX: this script no longer runs its own browser at all. It routes both the
+list-page load and every sale-date POST through Scrapfly's Unblocker API
+(https://scrapfly.io), a paid scraping proxy built specifically to solve
+this class of wall -- it handles the anti-bot challenge on its own
+infrastructure (real non-datacenter egress) and hands back the resolved
+page. Needs a SCRAPFLY_KEY env var (T Dawg's own Scrapfly account/API key,
+set as a GitHub Actions secret -- see nightly.yml). A single `session` name
+is reused across the list-page fetch and every sale-date POST so the cookie
+Scrapfly's side obtains on the first request carries through to the rest,
+same as the old browser-context approach did. Playwright/stealth are no
+longer imported or needed by this file; the other ingest scripts (e.g.
+tax_sale_ingest.py) still use Playwright for the county's own separate,
+much milder Imperva check, which that approach does solve.
 
 What this does:
 1. Reads the sale-date dropdown on the site's own list page to find every
@@ -56,27 +70,61 @@ import time
 import json
 from datetime import datetime, timezone, date
 
+import requests
 from bs4 import BeautifulSoup
 import psycopg2
-from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 
 BASE_URL = "https://mie.greenvillejournal.com"
 LIST_PAGE_URL = f"{BASE_URL}/printer-friendly-sale-list/"
 GENERATE_URL = f"{BASE_URL}/wp-content/plugins/master-in-equity/download-clerk-docs.php"
-BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-)
 REQUEST_DELAY_SECONDS = 1.5
 SOURCE_NAME = "foreclosure_mie"
 
+SCRAPFLY_ENDPOINT = "https://api.scrapfly.io/scrape"
+# Fixed session name so every call in a single run shares Scrapfly's cookie
+# jar/egress IP -- the site's challenge cookie obtained on the list-page
+# fetch has to still be valid when we POST for each sale date.
+SCRAPFLY_SESSION = "greenville-mie"
 
-def new_browser_context(browser):
-    context = browser.new_context(user_agent=BROWSER_USER_AGENT)
-    page = context.new_page()
-    stealth_sync(page)
-    return context, page
+
+def scrapfly_request(method, url, api_key, data=None):
+    """
+    Runs one request through Scrapfly's Unblocker instead of a local
+    browser. Raises RuntimeError with the diagnostic detail on any failure
+    so a broken run fails loud in the Actions log instead of silently
+    returning empty data (see this file's docstring for why that matters --
+    a silent "0 dates" cost real debugging time last round).
+    """
+    params = {
+        "key": api_key,
+        "url": url,
+        "unblocker": "true",
+        "session": SCRAPFLY_SESSION,
+        "country": "us",
+    }
+    resp = requests.request(method, SCRAPFLY_ENDPOINT, params=params, data=data, timeout=60)
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise RuntimeError(
+            f"Scrapfly API returned non-JSON (http {resp.status_code}): {resp.text[:300]!r}"
+        )
+    if resp.status_code != 200:
+        reject = resp.headers.get("X-Scrapfly-Reject-Code", "")
+        raise RuntimeError(
+            f"Scrapfly API call failed (http {resp.status_code}, reject={reject!r}) "
+            f"for {url}: {json.dumps(payload)[:500]}"
+        )
+    result = payload.get("result", {})
+    target_status = result.get("status_code")
+    content = result.get("content", "")
+    if target_status and target_status >= 400:
+        raise RuntimeError(
+            f"Target site returned http {target_status} through Scrapfly for {url}: "
+            f"{content[:300]!r}"
+        )
+    return content
+
 
 # Plaintiff-name patterns that mean this foreclosure is an HOA/COA
 # assessment-lien foreclosure rather than a mortgage foreclosure. Matched
@@ -90,29 +138,20 @@ HOA_PLAINTIFF_PATTERN = re.compile(
 )
 
 
-def fetch_future_sale_dates(page):
-    # The real page sits behind a JS bot-challenge (/.well-known/sgcaptcha/)
-    # that returns a 202 stub + meta-refresh. A real browser follows that
-    # chain automatically; we just wait for the real DOM to show up.
-    page.goto(LIST_PAGE_URL, timeout=30000)
-    try:
-        page.wait_for_selector("select[name='closedate']", timeout=20000)
-    except Exception:
+def fetch_future_sale_dates(api_key):
+    # Scrapfly's Unblocker runs the bot-challenge gauntlet on its own
+    # (non-datacenter) egress and hands back the resolved page.
+    html = scrapfly_request("GET", LIST_PAGE_URL, api_key)
+    soup = BeautifulSoup(html, "html.parser")
+    select = soup.find("select", attrs={"name": "closedate"})
+    if not select:
         # Diagnostic: surface what we actually got back instead of another
         # silent "0 dates" if the challenge page changes shape again.
-        html = page.content()
-        title = page.title()
         print(
-            f"  WARNING: no <select name='closedate'> found after waiting. "
-            f"page title: {title!r}, url: {page.url!r}, "
+            f"  WARNING: no <select name='closedate'> found in Scrapfly's response. "
             f"body length: {len(html)}, first 300 chars: {html[:300]!r}",
             file=sys.stderr,
         )
-        return []
-
-    soup = BeautifulSoup(page.content(), "html.parser")
-    select = soup.find("select", attrs={"name": "closedate"})
-    if not select:
         return []
     today = date.today()
     dates = []
@@ -147,15 +186,15 @@ def fetch_future_sale_dates(page):
     return dates
 
 
-def fetch_sale_list(context, sale_date):
-    # Posted through the browser context's own request API so it carries
-    # the cookie the sgcaptcha challenge issued during fetch_future_sale_dates.
-    resp = context.request.post(
+def fetch_sale_list(api_key, sale_date):
+    # Same Scrapfly session as fetch_future_sale_dates, so this POST carries
+    # whatever cookie the challenge issued on the list-page fetch.
+    return scrapfly_request(
+        "POST",
         GENERATE_URL,
+        api_key,
         data={"closedate": sale_date, "target": "Generate List"},
-        timeout=30000,
     )
-    return resp.text()
 
 
 def parse_sale_list(html):
@@ -323,47 +362,54 @@ def main():
     if not db_url:
         print("DATABASE_URL is not set", file=sys.stderr)
         sys.exit(1)
+    scrapfly_key = os.environ.get("SCRAPFLY_KEY")
+    if not scrapfly_key:
+        print("SCRAPFLY_KEY is not set", file=sys.stderr)
+        sys.exit(1)
 
     print(f"[{datetime.now(timezone.utc).isoformat()}] Finding upcoming foreclosure sale dates...")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        context, page = new_browser_context(browser)
-        sale_dates = fetch_future_sale_dates(page)
-        print(f"Found {len(sale_dates)} upcoming sale dates: {sale_dates}")
+    conn = psycopg2.connect(db_url)
 
-        conn = psycopg2.connect(db_url)
-
-        if not sale_dates:
-            log_run(conn, 0, 0, "no upcoming sale dates found — sgcaptcha challenge page or list page structure may have changed")
-            conn.commit()
-            conn.close()
-            browser.close()
-            return
-
-        total_found = 0
-        new_count = 0
-
-        for sale_date in sale_dates:
-            try:
-                html = fetch_sale_list(context, sale_date)
-                rows = parse_sale_list(html)
-                print(f"  {sale_date}: {len(rows)} active listings")
-                total_found += len(rows)
-                for row in rows:
-                    if upsert_lead(conn, row, sale_date):
-                        new_count += 1
-            except Exception as e:
-                print(f"  {sale_date}: error {e}", file=sys.stderr)
-
-            time.sleep(REQUEST_DELAY_SECONDS)
-
-        rescore_all(conn)
-        log_run(conn, total_found, new_count, "ok")
+    try:
+        sale_dates = fetch_future_sale_dates(scrapfly_key)
+    except RuntimeError as e:
+        print(f"  ERROR fetching sale-date list: {e}", file=sys.stderr)
+        log_run(conn, 0, 0, f"error fetching sale-date list: {e}")
         conn.commit()
         conn.close()
-        browser.close()
-        print(f"Done. {new_count} properties upserted and rescored across {len(sale_dates)} sale dates.")
+        sys.exit(1)
+
+    print(f"Found {len(sale_dates)} upcoming sale dates: {sale_dates}")
+
+    if not sale_dates:
+        log_run(conn, 0, 0, "no upcoming sale dates found — bot-challenge page or list page structure may have changed")
+        conn.commit()
+        conn.close()
+        return
+
+    total_found = 0
+    new_count = 0
+
+    for sale_date in sale_dates:
+        try:
+            html = fetch_sale_list(scrapfly_key, sale_date)
+            rows = parse_sale_list(html)
+            print(f"  {sale_date}: {len(rows)} active listings")
+            total_found += len(rows)
+            for row in rows:
+                if upsert_lead(conn, row, sale_date):
+                    new_count += 1
+        except Exception as e:
+            print(f"  {sale_date}: error {e}", file=sys.stderr)
+
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    rescore_all(conn)
+    log_run(conn, total_found, new_count, "ok")
+    conn.commit()
+    conn.close()
+    print(f"Done. {new_count} properties upserted and rescored across {len(sale_dates)} sale dates.")
 
 
 if __name__ == "__main__":
