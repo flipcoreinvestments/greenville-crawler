@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Full-coverage land_use backfill â Greenville County leads.
+Full-coverage land_use backfill — Greenville County leads.
 
 WHY THIS EXISTS
 ----------------
