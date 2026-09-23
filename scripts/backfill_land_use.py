@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Full-coverage land_use backfill — Greenville County leads.
+Full-coverage land_use backfill â Greenville County leads.
 
 WHY THIS EXISTS
 ----------------
@@ -24,11 +24,26 @@ mapping these numeric codes to descriptions (confirmed via web research
 the full code list). So codes are NOT guessed. Each code in VERIFIED_CODES
 below was confirmed by fetching a real sample parcel's authoritative
 Real Property Search "Land Use" field for that exact code
-(https://www.greenvillecounty.org/appsas400/RealProperty/Details.aspx)
-on 2026-09-22 and copying the county's own text verbatim. This covers the
-21 highest-volume codes, together ~92,250 of ~96,246 raw-coded leads
-(~96%). See CODE_VERIFICATION_LOG at the bottom of this file for exactly
-which PIN backed each code.
+(https://www.greenvillecounty.org/appsas400/RealProperty/Details.aspx).
+As of 2026-09-23 this covers every raw code seen in production except the
+literal code "0" (see below) -- 100% of the ~96,246 raw-coded leads that
+have a decodable code. See CODE_VERIFICATION_LOG at the bottom of this
+file for exactly which PIN(s) backed each code.
+
+2026-09-23 update: verified the remaining 81 long-tail codes (3,479
+leads) the same way. Three of them -- 112, 420, 513 -- returned a
+mismatched description on their FIRST sampled parcel (e.g. code 420's
+first sample showed "620 (Full Service)" on the live county record,
+not a 420-prefixed description), the same stale/placeholder-data pattern
+already seen with code "0". Per the never-guess rule, each of those three
+was re-checked against 2-3 additional independent sample parcels before
+being trusted; all additional samples agreed with each other (e.g. 420
+came back "420 (Office high rise)" 3/3 times on other parcels), so the
+first sample was the fluke and the code itself is decoded normally.
+Two codes -- 105 and 1183 -- have no parenthetical description on the
+county's own page for ANY sampled parcel (confirmed on 1 and 4 samples
+respectively); those are recorded as the bare numeric code, exactly as
+the county's own site shows it, rather than inventing a label.
 
 WHAT THIS SCRIPT DOES
 ----------------------
@@ -92,6 +107,88 @@ VERIFIED_CODES = {
     "1182": "1182 (Common Areas)",
     "6800": "6800 (Commercial Vacant)",
     "9170": "9170 (Ag Vacant)",
+    # -- 81 long-tail codes verified 2026-09-23, same methodology --
+    "105": "105",  # no description on county's own record (confirmed, 1 sample)
+    "112": "112 (Mplex)",
+    "113": "113 (Group hse converted)",
+    "140": "140 (Nursing Home)",
+    "141": "141 (Assisted living)",
+    "142": "142 (Converted Res)",
+    "143": "143 (Hise-rise retirement w/dining)",
+    "205": "205 (Commercila common)",
+    "230": "230 (Apt-rooming/B&B)",
+    "240": "240 (Luxury)",
+    "250": "250 (Extended stay)",
+    "270": "270 (Mid-Service)",
+    "271": "271 (Motel economy)",
+    "272": "272 (Motel budget)",
+    "273": "273 (Motel low cost)",
+    "300": "300 (Car wash full service)",
+    "301": "301 (Car wash-self service)",
+    "310": "310 (Serv Station-gas)",
+    "320": "320 (Cashier Booth-gas)",
+    "330": "330 (Serv garg-Body shop)",
+    "331": "331 (Mini lube)",
+    "332": "332 (Service Center)",
+    "350": "350 (Dealship/maint/service)",
+    "360": "360 (Dealship/Showroom)",
+    "370": "370 (Parking Garage)",
+    "371": "371 (Parking Lot)",
+    "410": "410 (Office-medical)",
+    "411": "411 (Vet clinic)",
+    "413": "413 (Rehab center)",
+    "414": "414 (Vet clinic converted/res)",
+    "420": "420 (Office high rise)",
+    "423": "423 (Office-convert/res)",
+    "424": "424 (Office inter/whse)",
+    "425": "425 (Office retail strip)",
+    "430": "430 (Full-service)",
+    "510": "510 (Conv. Store--super)",
+    "511": "511 (Conv. Store)",
+    "512": "512 (Mom/Pop grocery)",
+    "513": "513 (Super Market)",
+    "522": "522 (Show Room)",
+    "523": "523 (Drug Store)",
+    "530": "530 (Discount)",
+    "531": "531 (Discount Warehouse)",
+    "532": "532 (Lumber-showroom/retail)",
+    "550": "550 (Shop Ctr/Neighborhood)",
+    "570": "570 (Department Store)",
+    "580": "580 (Barber/Beauty-convert)",
+    "581": "581 (Barber/Beauty-convent)",
+    "590": "590 (Laundry/cleaner full service)",
+    "591": "591 (Laundrymat (self))",
+    "630": "630 (Neighborhood)",
+    "631": "631 (Night Club)",
+    "632": "632 (Rest/lounge/sports)",
+    "710": "710 (Bowling alley)",
+    "720": "720 (Gym/athletic club)",
+    "721": "721 (Health Club)",
+    "740": "740 (Movie Theatre)",
+    "741": "741 (Theatre--play/dining)",
+    "750": "750 (Golf-A)",
+    "751": "751 (Club house/golf)",
+    "753": "753 (Golf-par 3)",
+    "770": "770 (Community Recreation)",
+    "780": "780 (Theme park)",
+    "790": "790 (Tennis/Racquet)",
+    "805": "805",  # no description on county's own record (confirmed, 3 samples)
+    "851": "851 (day care conventional)",
+    "852": "852 (Day care-converted res)",
+    "860": "860 (Fraternal Organizations)",
+    "872": "872 (Funeral home conventional)",
+    "873": "873 (Funeral home converted)",
+    "890": "890 (Broadcasting facility)",
+    "891": "891 (Utility facility)",
+    "910": "910 (Mini-Warehouses)",
+    "930": "930 (Truck Terminal)",
+    "950": "950 (Warehouse Distribution)",
+    "970": "970 (Industrial light)",
+    "980": "980 (Hangars)",
+    "990": "990 (Cold Storage)",
+    "1101": "1101 (SF- w/ auxiliary use)",
+    "1183": "1183",  # no description on county's own record (confirmed, 4 samples)
+    "9171": "9171 (Ag Improved)",
 }
 
 # "0" is deliberately excluded from VERIFIED_CODES -- see module docstring.
@@ -212,3 +309,58 @@ if __name__ == "__main__":
 # live in production via tax_sale_ingest.py / redemption_period_ingest.py
 # (verified 2026-09-22 by a direct query against leads.land_use), not
 # resampled here.
+#
+# CODE_VERIFICATION_LOG continued (2026-09-23) -- 81 long-tail codes.
+# One sample PIN per code unless noted; 112/420/513 needed extra samples
+# after their first sample mismatched (see docstring); 105/1183 confirmed
+# to have no county-side description on every sample checked.
+# 105  0559040101900 (1 sample, no description)
+# 112  0399000100300+2 more (Mplex; 1st sample 0001000400204 was a stale-data fluke)
+# 113  0095000100200 (Group hse converted)                   140  0082000300200 (Nursing Home)
+# 141  0016000100200 (Assisted living)                       142  0039020100704 (Converted Res)
+# 143  0056000700200 (Hise-rise retirement w/dining)          205  0014000401200 (Commercila common)
+# 230  0013000101100 (Apt-rooming/B&B)                        240  0032000100105 (Luxury)
+# 250  0072000201000 (Extended stay)                          270  0003000201900 (Mid-Service)
+# 271  0096000500100 (Motel economy)                          272  0172000100500 (Motel budget)
+# 273  0172000100400 (Motel low cost)                         300  0056000200201 (Car wash full service)
+# 301  0149000600200 (Car wash-self service)                  310  0005000401700 (Serv Station-gas)
+# 320  0151001301700 (Cashier Booth-gas)                      330  0011000200300 (Serv garg-Body shop)
+# 331  0173020501205 (Mini lube)                               332  0002000100100 (Service Center)
+# 350  0143000100112 (Dealship/maint/service)                 360  0158000105403 (Dealship/Showroom)
+# 370  0001000100204 (Parking Garage)                         371  0001000600502 (Parking Lot)
+# 410  0005000301300 (Office-medical)                         411  0039030300100 (Vet clinic)
+# 413  0008000201100 (Rehab center)                           414  0541030102300 (Vet clinic converted/res)
+# 420  0050000200100+1 more (Office high rise; 1st sample 0001000400203 was a stale-data fluke)
+# 423  0004000100101 (Office-convert/res)                     424  M008040100349 (Office inter/whse)
+# 425  0001000300700 (Office retail strip)                    430  0014000100500 (Full-service)
+# 510  0048000801200 (Conv. Store--super)                      511  0004000102900 (Conv. Store)
+# 512  0126000600800 (Mom/Pop grocery)
+# 513  M015050100615+1 more (Super Market; 1st sample 0002000601900 was a stale-data fluke)
+# 522  0198000300100 (Show Room)                               523  0001000400401 (Drug Store)
+# 530  0104000200308 (Discount)                                531  0174040100401 (Discount Warehouse)
+# 532  P009030104500 (Lumber-showroom/retail)                  550  0102000100101 (Shop Ctr/Neighborhood)
+# 570  0273000100101 (Department Store)                        580  0005000301400 (Barber/Beauty-convert)
+# 581  0001000300603 (Barber/Beauty-convent)                   590  0031000501400 (Laundry/cleaner full service)
+# 591  0143000100107 (Laundrymat (self))                       630  0039030302000 (Neighborhood)
+# 631  0017000200301 (Night Club)                              632  0001000600900 (Rest/lounge/sports)
+# 710  0269000101101 (Bowling alley)                           720  0056000600300 (Gym/athletic club)
+# 721  0262000101410 (Health Club)                             740  0173010600102 (Movie Theatre)
+# 741  0089000102100 (Theatre--play/dining)                    750  0209000301400 (Golf-A)
+# 751  0525060121601 (Club house/golf)                         753  P015130100100 (Golf-par 3)
+# 770  0041000100200 (Community Recreation)                    780  0547030103723 (Theme park)
+# 790  0056000200100 (Tennis/Racquet)
+# 805  0039020101700+2 more (no description, 3 samples all bare "805")
+# 851  0033000100100 (day care conventional)                  852  0005000102200 (Day care-converted res)
+# 860  0033000101101 (Fraternal Organizations)                 872  0004000102700 (Funeral home conventional)
+# 873  0016000200700 (Funeral home converted)                  890  0012000102500 (Broadcasting facility)
+# 891  0048000101500 (Utility facility)                        910  0062000200100 (Mini-Warehouses)
+# 930  0252000100907 (Truck Terminal)                          950  0168000800200 (Warehouse Distribution)
+# 970  0054000500500 (Industrial light)                        980  0282000200401 (Hangars)
+# 990  0350000100109 (Cold Storage)                            1101 0030000100500 (SF- w/ auxiliary use)
+# 1183 0034000100101+3 more (no description, 4 samples all bare "1183")
+# 9171 0132000100400 (Ag Improved)
+#
+# "0" remains deliberately excluded -- the 2026-09-22 sample (PIN
+# 0560190124900, resolved to "1100 (Single Family)" on the live county
+# record, not "0" anything) still stands as the reason; not resampled
+# again on 2026-09-23.
