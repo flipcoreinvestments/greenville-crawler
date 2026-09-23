@@ -1,0 +1,47 @@
+name: Weekly foreclosure (Master-in-Equity) ingest
+
+# Split out from nightly.yml on 2026-09-23 for cost control. This is the
+# only ingest source that costs real money: it routes through Scrapfly's
+# residential proxy pool to get past the county foreclosure site's bot wall,
+# at ~150 credits per run (6 requests x 25 credits). The free Scrapfly tier
+# is 1,000 credits, one-time -- nightly would burn it in under a week.
+# Foreclosure sale dates are published periodically, not daily, so weekly
+# checks lose nothing in practice while stretching the free tier to 6-7
+# weeks instead of under 1.
+
+on:
+  schedule:
+    # 10:17 UTC every Monday (~6:17 AM Eastern). Offset a few minutes past
+    # the hour on purpose -- avoids the exact-top-of-hour pile-up on
+    # GitHub's shared runners.
+    - cron: "17 10 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run foreclosure (Master-in-Equity) ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SCRAPFLY_KEY: ${{ secrets.SCRAPFLY_KEY }}
+        run: python scripts/foreclosure_mie_ingest.py
+
+      - name: Merge duplicate-address leads (one name per list)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/merge_duplicate_addresses.py
+
+      - name: Alert on leads newly stacked on 2+ lists
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/alert_stacked_leads.py
