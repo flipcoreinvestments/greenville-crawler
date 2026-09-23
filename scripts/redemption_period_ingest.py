@@ -236,7 +236,7 @@ def guess_absentee(location, mailing_address):
 
 
 def upsert_lead(conn, address, owner_name, mailing_address, is_absentee, amount_due,
-                 map_number, sale_year, sale_date, redemption_deadline):
+                 map_number, sale_year, sale_date, redemption_deadline, land_use=None):
     address = normalize_address(address)
     if not address:
         return False
@@ -248,6 +248,7 @@ def upsert_lead(conn, address, owner_name, mailing_address, is_absentee, amount_
             "sale_year": sale_year,
             "sale_date": sale_date.isoformat(),
             "redemption_deadline": redemption_deadline.isoformat(),
+            "land_use": land_use,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
     })
@@ -256,17 +257,18 @@ def upsert_lead(conn, address, owner_name, mailing_address, is_absentee, amount_
         cur.execute(
             """
             insert into leads (address, city, state, county, owner_name, mailing_address,
-                                is_absentee, source_tags, raw)
-            values (%s, 'Greenville', 'SC', 'Greenville', %s, %s, %s, ARRAY[%s]::text[], %s::jsonb)
+                                is_absentee, land_use, source_tags, raw)
+            values (%s, 'Greenville', 'SC', 'Greenville', %s, %s, %s, %s, ARRAY[%s]::text[], %s::jsonb)
             on conflict (lower(address)) do update set
                 owner_name = coalesce(excluded.owner_name, leads.owner_name),
                 mailing_address = coalesce(excluded.mailing_address, leads.mailing_address),
                 is_absentee = coalesce(excluded.is_absentee, leads.is_absentee),
+                land_use = coalesce(excluded.land_use, leads.land_use),
                 source_tags = array(select distinct unnest(leads.source_tags || excluded.source_tags)),
                 raw = leads.raw || excluded.raw,
                 updated_at = now()
             """,
-            (address, owner_name, mailing_address, is_absentee, SOURCE_NAME, raw_payload),
+            (address, owner_name, mailing_address, is_absentee, land_use, SOURCE_NAME, raw_payload),
         )
     return True
 
@@ -363,6 +365,9 @@ def main():
         return
 
     conn = psycopg2.connect(db_url)
+    with conn.cursor() as cur:
+        cur.execute("alter table leads add column if not exists land_use text")
+    conn.commit()
     new_count = 0
     error_count = 0
     consecutive_misses = 0
@@ -385,6 +390,7 @@ def main():
                     location = details.get("Location")
                     mailing = details.get("Mailing Address")
                     owner = details.get("Owner(s)") or row["owner_name"]
+                    land_use = details.get("Land Use")
                     absentee = guess_absentee(location, mailing)
 
                     if location:
@@ -400,6 +406,7 @@ def main():
                             sale_year=sale_year,
                             sale_date=sale_date,
                             redemption_deadline=redemption_deadline,
+                            land_use=land_use,
                         )
                         if inserted:
                             new_count += 1
