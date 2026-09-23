@@ -55,6 +55,11 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/absentee_owner_ingest.py
 
+      - name: Backfill land_use for every lead (property type filter coverage)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/backfill_land_use.py
+
       - name: Run probate ingest
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
