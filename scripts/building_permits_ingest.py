@@ -90,16 +90,36 @@ DAMAGE_KEYWORDS = [
 # permit -- the raw permit record is simply not written as a lead in that
 # case (no fabricated distress), rather than tagging a home that's already
 # fixed as a current lead.
-COMPLETION_KEYWORDS = [
-    "repaired", "repair complete", "repair completed", "complete",
-    "completed", "finaled", "final inspection", "like for like",
-    "restored", "rebuilt",
+# TIGHTENED: bare "complete"/"repaired" also matched "incomplete",
+# "to complete unfinished basement", "roof to be repaired" -- which would
+# silently drop REAL stalled/damage leads. Only past-tense, finished-work
+# phrases count, matched on word boundaries, and any future/intent wording
+# ("to be", "will", "need", "incomplete", "not complete") vetoes the skip.
+COMPLETION_PATTERNS = [
+    r"\bREPAIRED LIKE FOR LIKE\b",
+    r"\bLIKE FOR LIKE\b",
+    r"\bREPAIRS? (?:ARE |IS |WAS |WERE )?COMPLETED?\b",
+    r"\bWORK (?:IS |WAS )?COMPLETED?\b",
+    r"\bFINALED\b",
+    r"\bPASSED FINAL(?: INSPECTION)?\b",
+    r"\bFINAL INSPECTION (?:PASSED|APPROVED|COMPLETE[D]?)\b",
+    r"\bHAS BEEN (?:REPAIRED|RESTORED|REBUILT)\b",
+    r"\bWAS (?:REPAIRED|RESTORED|REBUILT)\b",
+    r"^\s*REPAIRED\b|[.;]\s*REPAIRED\b",
+]
+NOT_DONE_PATTERNS = [
+    r"\bINCOMPLETE\b", r"\bNOT (?:YET )?(?:COMPLETE[D]?|REPAIRED|FINALED)\b",
+    r"\bTO BE (?:REPAIRED|COMPLETED|RESTORED|REBUILT)\b",
+    r"\bTO COMPLETE\b", r"\bWILL BE\b", r"\bNEEDS?\b", r"\bPENDING\b",
+    r"\bFAILED\b",
 ]
 
 
 def looks_completed(description, comments):
-    text = f"{description or ''} {comments or ''}".upper()
-    return any(kw.upper() in text for kw in COMPLETION_KEYWORDS)
+    text = re.sub(r"\s+", " ", f"{description or ''}. {comments or ''}").upper()
+    if any(re.search(p, text) for p in NOT_DONE_PATTERNS):
+        return False
+    return any(re.search(p, text) for p in COMPLETION_PATTERNS)
 
 
 def build_damage_where_clause():
