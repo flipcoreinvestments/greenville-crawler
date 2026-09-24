@@ -199,10 +199,39 @@ def normalize_addr(strnum, locate):
     return addr.title() if addr else None
 
 
+def mailing_street_is_valid(mailing_street):
+    """
+    BUG FIX (found 2026-09-2x, T Dawg's own spot-check): the county's STREET
+    field is documented as the owner's mailing address, but for ~430 of
+    41,283 absentee-flagged parcels it actually contains a second owner's
+    NAME instead of a street address (e.g. "SMITH JOHN R") -- a data-quality
+    problem in the upstream county ArcGIS source, not a comparison bug in
+    this script. Left unguarded, is_absentee() compared that name against
+    the property address, it never matched, and the parcel got flagged
+    absentee_owner even when the real owner lives right there.
+    A genuine mailing street always starts with a house/box number. Anything
+    that doesn't is untrustworthy for the absentee comparison -- return False
+    here so is_absentee() backs off to "unknown" (None) instead of guessing.
+    """
+    if not mailing_street:
+        return False
+    s = mailing_street.strip().upper()
+    if re.match(r"^\d", s):
+        return True
+    if re.match(r"^P\.?\s*O\.?\s*BOX\b", s):
+        return True
+    return False
+
+
 def is_absentee(mailing_street, mailing_state, prop_strnum, prop_locate):
     if mailing_state and mailing_state.strip().upper() != "SC":
         return True
     if not mailing_street or not prop_strnum or not prop_locate:
+        return None
+    if not mailing_street_is_valid(mailing_street):
+        # Can't safely compare a non-address string (e.g. a person's name)
+        # against the property address -- don't guess. Caught separately by
+        # refresh_needs_review()'s invalid_mailing_address flag below.
         return None
     mail_n = re.sub(r"\s+", " ", mailing_street).strip().upper()
     prop_n = f"{prop_strnum.strip()} {prop_locate.strip()}".upper()
@@ -347,6 +376,14 @@ def refresh_needs_review(conn):
         an actual 4-character string), which produces addresses like
         "24749 None". Catches this regardless of which ingest script wrote
         the row, since this function runs a full-table pass every night.
+      - invalid_mailing_address (added 2026-09-2x, T Dawg's own spot-check):
+        mailing_address is populated but doesn't start with a house/box
+        number -- i.e. it's a name or other non-address string from the
+        county's source data, not a real mailing address. is_absentee() now
+        backs off to null in this situation rather than guessing, but the
+        bad-looking mailing_address string itself is left in place (still
+        potentially useful for skip-tracing) -- this flag is what tells
+        T Dawg to double-check it herself rather than trust it blindly.
     Runs against every non-sold lead, not just rows this script upserted,
     since this script already does a full-table pass nightly.
     """
@@ -363,7 +400,10 @@ def refresh_needs_review(conn):
                          and lower(regexp_replace(mailing_address, '[^a-zA-Z0-9]', '', 'g'))
                            = lower(regexp_replace(address, '[^a-zA-Z0-9]', '', 'g'))
                          and is_absentee = true then 'absentee_flag_but_same_address' end,
-                    case when address ~* 'none' then 'corrupted_address' end
+                    case when address ~* 'none' then 'corrupted_address' end,
+                    case when mailing_address is not null
+                         and mailing_address !~* '^\\s*(\\d|P\\.?\\s*O\\.?\\s*BOX)'
+                         then 'invalid_mailing_address' end
                 ], null)
             where is_sold = false
             """
@@ -381,6 +421,8 @@ def refresh_needs_review(conn):
                        and lower(regexp_replace(mailing_address, '[^a-zA-Z0-9]', '', 'g'))
                          = lower(regexp_replace(address, '[^a-zA-Z0-9]', '', 'g'))
                        and is_absentee = true)
+              and not (mailing_address is not null
+                       and mailing_address !~* '^\\s*(\\d|P\\.?\\s*O\\.?\\s*BOX)')
             """
         )
 

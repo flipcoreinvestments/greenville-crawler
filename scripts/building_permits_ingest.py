@@ -77,6 +77,30 @@ DAMAGE_KEYWORDS = [
     "burned", "burnt", "hurricane", "helene",
 ]
 
+# BUG FIX (found 2026-09-2x, T Dawg's own spot-check on 12 Wakefield St):
+# BP_STATUS stays 'IS' (issued, never formally closed) on some permits long
+# after the actual work is done -- a county paperwork-closeout lag, not an
+# active/abandoned project. Confirmed on permit #2400004633 (Hurricane
+# Helene porch repair): BP_STATUS was still 'IS' months later, but the
+# permit's OWN PERMIT_COMMENTS said "Repaired like for like", and T Dawg
+# separately confirmed the house is rehabbed and currently rented. Tagging
+# that permit_expired (implies stalled/abandoned) or insurance_damage
+# (implies live, unresolved damage) is actively misleading. When the
+# permit's own free text says the work is finished, skip both tags for that
+# permit -- the raw permit record is simply not written as a lead in that
+# case (no fabricated distress), rather than tagging a home that's already
+# fixed as a current lead.
+COMPLETION_KEYWORDS = [
+    "repaired", "repair complete", "repair completed", "complete",
+    "completed", "finaled", "final inspection", "like for like",
+    "restored", "rebuilt",
+]
+
+
+def looks_completed(description, comments):
+    text = f"{description or ''} {comments or ''}".upper()
+    return any(kw.upper() in text for kw in COMPLETION_KEYWORDS)
+
 
 def build_damage_where_clause():
     """
@@ -292,19 +316,29 @@ def main():
 
     conn = psycopg2.connect(db_url)
     new_count = 0
+    skipped_completed = 0
 
     for row in demo_rows:
         if upsert_lead(conn, row, "permit_demolition"):
             new_count += 1
     for row in stalled_rows:
+        if looks_completed(row.get("APPLIC_DESCRIPTION"), row.get("PERMIT_COMMENTS")):
+            skipped_completed += 1
+            continue
         if upsert_lead(conn, row, "permit_expired"):
             new_count += 1
     for row in damage_rows:
+        if looks_completed(row.get("APPLIC_DESCRIPTION"), row.get("PERMIT_COMMENTS")):
+            skipped_completed += 1
+            continue
         if upsert_lead(conn, row, "insurance_damage"):
             new_count += 1
 
+    print(f"  skipped {skipped_completed} permit(s) whose own comments say the repair is already done.")
+
     rescore_all(conn)
-    log_run(conn, len(demo_rows) + len(stalled_rows) + len(damage_rows), new_count, "ok")
+    log_run(conn, len(demo_rows) + len(stalled_rows) + len(damage_rows), new_count,
+            f"ok ({skipped_completed} skipped as already-completed repairs)")
     conn.commit()
     conn.close()
     print(f"Done. {new_count} properties upserted and rescored.")
