@@ -75,6 +75,18 @@ equity_pct is populated as a rough 0-100 estimate (1 - SLPRICE/FAIRMKTVAL)
 when both values exist; null otherwise -- treat it as directional, not exact,
 since it can't see an actual mortgage balance.
 
+HIGH_EQUITY REMOVED -> LONG_TERM_OWNER (T Dawg's call, 2026-09-24): the
+high_equity proxy hit 92.5% of all leads and could not actually show equity
+-- a 20-year owner may have pulled a cash-out refi last year, and no public
+source gives a mortgage payoff balance or an ARV. So: the 'high_equity' tag
+is gone, the equity_pct estimate is cleared (it was never a real equity
+figure), and parcels owned 15+ years (deed date from the county) are tagged
+'long_term_owner' -- a plain ownership-length fact, NOT an equity claim.
+long_term_owner adds no score points by itself (length of ownership is not
+distress). A verified 'free_and_clear' tag is only allowed from a per-
+property Register of Deeds check (every recorded mortgage has a recorded
+satisfaction), never from this bulk estimate.
+
 NEEDS-REVIEW / ASTERISK FLAG (added 2026-09-21): T Dawg's explicit ask
 after the 108 Old Augusta Rd stale-lead incident -- she doesn't want to
 spend money reverse-searching/skip-tracing a lead unless it's been cross-
@@ -104,8 +116,7 @@ SOLD_LOOKBACK_DAYS = 270
 
 OUT_FIELDS_BASE = "PIN,OWNAM1,OWNAM2,STREET,CITY,STATE,ZIP5,STRNUM,LOCATE,SLPRICE,TOTTAX,LANDUSE,TAXMKTVAL,FAIRMKTVAL"
 
-HIGH_EQUITY_YEARS = 15  # matches the manual PropStream filter T Dawg was already using
-HIGH_EQUITY_SALE_RATIO = 0.5  # last sale price <= 50% of current fair market value
+LONG_TERM_OWNER_YEARS = 15  # T Dawg's threshold for the long_term_owner tag
 
 LAYERS = [
     {
@@ -238,34 +249,35 @@ def is_absentee(mailing_street, mailing_state, prop_strnum, prop_locate):
     return not mail_n.startswith(prop_n[:8]) if prop_n else None
 
 
-def compute_equity(deed_date_str, slprice, fairmktval):
+def is_long_term_owner(deed_date_str):
     """
-    Returns (is_high_equity: bool|None, equity_pct: float|None).
-    Proxy only -- no lien-balance data exists publicly, see module docstring.
+    True if the current owner's deed is LONG_TERM_OWNER_YEARS+ old, False if
+    newer, None if the county has no usable deed date. Ownership length only
+    -- says nothing about equity (see module docstring).
     """
-    years_owned = None
-    if deed_date_str:
-        try:
-            deed_date = datetime.strptime(deed_date_str[:10], "%Y-%m-%d").date()
-            years_owned = (date.today() - deed_date).days / 365.25
-        except ValueError:
-            pass
-
-    equity_pct = None
-    sale_ratio_hit = False
+    if not deed_date_str:
+        return None
     try:
-        sp = float(slprice) if slprice not in (None, "", 0) else None
-        fmv = float(fairmktval) if fairmktval not in (None, "", 0) else None
-        if sp is not None and fmv is not None and fmv > 0:
-            equity_pct = max(0.0, min(100.0, round((1 - sp / fmv) * 100, 1)))
-            sale_ratio_hit = (sp / fmv) <= HIGH_EQUITY_SALE_RATIO
-    except (TypeError, ZeroDivisionError):
-        pass
+        deed_date = datetime.strptime(deed_date_str[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return (date.today() - deed_date).days / 365.25 >= LONG_TERM_OWNER_YEARS
 
-    years_hit = years_owned is not None and years_owned >= HIGH_EQUITY_YEARS
-    if years_owned is None and equity_pct is None:
-        return None, None
-    return (years_hit or sale_ratio_hit), equity_pct
+
+def remove_high_equity(conn):
+    """
+    One-way cleanup, safe to re-run nightly: strips the retired 'high_equity'
+    tag from every lead and clears the equity_pct estimate (coalesce() in the
+    upsert would otherwise keep the old numbers forever). Deletes no rows.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "update leads set source_tags = array_remove(source_tags, 'high_equity'), updated_at = now() "
+            "where 'high_equity' = any(source_tags)"
+        )
+        tags_removed = cur.rowcount
+        cur.execute("update leads set equity_pct = null where equity_pct is not null")
+        return tags_removed
 
 
 def upsert_leads_batch(conn, rows):
@@ -550,9 +562,7 @@ def main():
             continue
         owner_name = normalize_owner(r.get("OWNAM1"))
         absentee = is_absentee(r.get("STREET"), r.get("STATE"), r.get("STRNUM"), r.get("LOCATE"))
-        high_equity, equity_pct = compute_equity(
-            r.get("DEED_DATE_NORM"), r.get("SLPRICE"), r.get("FAIRMKTVAL")
-        )
+        long_term = is_long_term_owner(r.get("DEED_DATE_NORM"))
         processed.append({
             "pin": pin,
             "address": address,
@@ -564,8 +574,7 @@ def main():
             "sale_price": r.get("SLPRICE"),
             "total_tax": r.get("TOTTAX"),
             "landuse": r.get("LANDUSE"),
-            "high_equity": high_equity,
-            "equity_pct": equity_pct,
+            "long_term": long_term,
         })
         if owner_name:
             owner_counts[owner_name] += 1
@@ -575,17 +584,19 @@ def main():
 
     absentee_rows = [p for p in processed if p["absentee"] is True]
     tired_only_rows = [p for p in processed if p["absentee"] is not True and p["owner_name"] in tired_owners]
-    high_equity_only_rows = [
+    long_term_only_rows = [
         p for p in processed
-        if p["high_equity"] is True and p["absentee"] is not True and p["owner_name"] not in tired_owners
+        if p["long_term"] is True and p["absentee"] is not True and p["owner_name"] not in tired_owners
     ]
     print(f"Absentee-owner parcels to upsert: {len(absentee_rows)}")
     print(f"Additional tired-landlord-only parcels (owner-occupied but 3+ properties): {len(tired_only_rows)}")
-    print(f"Additional high-equity-only parcels (not absentee/tired but 15yr+ owned or low sale-to-value): {len(high_equity_only_rows)}")
+    print(f"Additional long-term-owner-only parcels (not absentee/tired, owned {LONG_TERM_OWNER_YEARS}+ yrs): {len(long_term_only_rows)}")
 
     conn = psycopg2.connect(db_url)
     ensure_status_column(conn)
     ensure_review_column(conn)
+    removed = remove_high_equity(conn)
+    print(f"Removed retired high_equity tag from {removed} lead(s).")
 
     # De-dupe by lower(address) BEFORE building the batch. LOCATE (the assessor's
     # street name) has no suffix, so two different PINs can normalize to the exact
@@ -595,12 +606,12 @@ def main():
     # (CardinalityViolation), which is exactly what killed run #2. Merge duplicates
     # into one row instead of crashing the whole batch.
     merged = {}
-    for p in absentee_rows + tired_only_rows + high_equity_only_rows:
+    for p in absentee_rows + tired_only_rows + long_term_only_rows:
         tags = {"absentee_owner"} if p["absentee"] is True else set()
         if p["owner_name"] in tired_owners:
             tags.add("tired_landlord")
-        if p["high_equity"] is True:
-            tags.add("high_equity")
+        if p["long_term"] is True:
+            tags.add("long_term_owner")
         if not tags:
             continue
         key = p["address"].lower()
@@ -619,15 +630,13 @@ def main():
                 "total_tax": p["total_tax"],
                 "landuse": p["landuse"],
                 "owner_parcel_count": owner_counts.get(p["owner_name"], 1),
-                "equity_pct": p["equity_pct"],
+                "equity_pct": None,
             }
         else:
             entry["tags"] |= tags
             entry["pins"].append(p["pin"])
             if p["absentee"] is True:
                 entry["absentee"] = True
-            if entry["equity_pct"] is None and p["equity_pct"] is not None:
-                entry["equity_pct"] = p["equity_pct"]
 
     batch_rows = []
     for entry in merged.values():
@@ -647,7 +656,7 @@ def main():
             entry["absentee"], sorted(entry["tags"]), raw_payload, entry["equity_pct"],
         ))
 
-    dupes_merged = len(absentee_rows) + len(tired_only_rows) + len(high_equity_only_rows) - len(batch_rows)
+    dupes_merged = len(absentee_rows) + len(tired_only_rows) + len(long_term_only_rows) - len(batch_rows)
     if dupes_merged > 0:
         print(f"Merged {dupes_merged} duplicate-address parcels before upsert.")
 
@@ -660,7 +669,7 @@ def main():
     refresh_needs_review(conn)
     log_run(conn, len(processed), len(batch_rows),
             f"ok: {len(absentee_rows)} absentee, {len(tired_only_rows)} tired-only, "
-            f"{len(high_equity_only_rows)} high-equity-only, "
+            f"{len(long_term_only_rows)} long-term-owner-only, "
             f"{len(tired_owners)} tired-landlord owners, {sold_count} marked sold")
     conn.commit()
     conn.close()

@@ -34,7 +34,7 @@ Matching key per source (chosen for reliability, see comments inline):
     each probate-tagged lead's own case_number is re-fetched directly and
     checked for a Closed Date.
 
-NOT touched here (by design): is_absentee, tired_landlord, high_equity.
+NOT touched here (by design): is_absentee, tired_landlord, long_term_owner.
 Those come from absentee_owner_ingest.py's full-county nightly sweep, which
 recomputes EVERY parcel from live assessor data every run (not additive --
 already continuously self-verifying). The workflow that runs this script
@@ -75,7 +75,7 @@ import code_enforcement_ingest as ce
 import probate_ingest as pb
 
 PROBATE_REQUEST_DELAY_SECONDS = 0.4
-SELF_VERIFYING_TAGS = {"absentee_owner", "tired_landlord", "high_equity"}
+SELF_VERIFYING_TAGS = {"absentee_owner", "tired_landlord", "long_term_owner"}
 
 
 def ensure_columns(conn):
