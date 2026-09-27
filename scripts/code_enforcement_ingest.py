@@ -61,6 +61,7 @@ from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
 import psycopg2
+from lead_common import ensure_schema, expire_by_raw_key, rescore_all  # noqa: E402
 
 SEARCH_URL = "https://app.greenvillecounty.org/cgi-bin/lansaweb?procfun+CE_00+CE0001+GP1+eng"
 DETAIL_URL_TMPL = (
@@ -182,45 +183,21 @@ def upsert_lead(conn, row, owner, hearing):
     with conn.cursor() as cur:
         cur.execute(
             """
-            insert into leads (address, city, state, county, owner_name, source_tags, raw)
-            values (%s, 'Greenville', 'SC', 'Greenville', %s, ARRAY[%s]::text[], %s::jsonb)
+            insert into leads (address, state, county, owner_name, source_tags, raw, pin)
+            values (%s, 'SC', 'Greenville', %s, ARRAY[%s]::text[], %s::jsonb, nullif(regexp_replace(coalesce(%s, ''), '\\D', '', 'g'), ''))
             on conflict (lower(address)) do update set
                 owner_name = coalesce(leads.owner_name, excluded.owner_name),
                 source_tags = array(select distinct unnest(leads.source_tags || excluded.source_tags)),
-                raw = leads.raw || excluded.raw,
+                raw = coalesce(leads.raw, '{}'::jsonb) || excluded.raw,
+                pin = coalesce(leads.pin, excluded.pin),
                 updated_at = now()
             """,
-            (address, owner, SOURCE_NAME, raw_payload),
+            (address, owner, SOURCE_NAME, raw_payload, row["map_number"] or None),
         )
     return True
 
 
-def rescore_all(conn):
-    """
-    Shared score formula -- kept IDENTICAL in every ingest script. Adds
-    'code_violation' at +25 alongside the existing bonuses (see
-    absentee_owner_ingest.py for the full running commentary on the rest).
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            update leads set score =
-                (list_count * 25)
-                + (case when is_absentee then 15 else 0 end)
-                + least(coalesce((raw->'tax_sale'->>'amount_due')::numeric, 0) / 50, 25)
-                + (case when 'foreclosure_mie' = any(source_tags) then 30 else 0 end)
-                + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
-                + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
-                + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
-                + (case when 'redemption_period' = any(source_tags) then 35 else 0 end)
-                + (case when 'insurance_damage' = any(source_tags) then 30 else 0 end)
-                + (case when 'hoa_foreclosure' = any(source_tags) then 20 else 0 end)
-                + (case when 'high_equity' = any(source_tags) then 20 else 0 end)
-                + (case when 'code_violation' = any(source_tags) then 25 else 0 end)
-            where is_sold = false
-            """
-        )
-
+# rescore_all now lives in lead_common.py (one shared formula for every script).
 
 def log_run(conn, records_found, records_new, notes):
     with conn.cursor() as cur:
@@ -248,11 +225,16 @@ def main():
     print(f"  {len(rows)} open unfit-structure cases found.")
 
     conn = psycopg2.connect(db_url)
+    ensure_schema(conn)
     new_count = 0
     for row in rows:
         owner, hearing = fetch_owner(session, row["case_number"])
         if upsert_lead(conn, row, owner, hearing):
             new_count += 1
+
+    # FIX 2026-09-25: cases closed by the county drop off the open list --
+    # expire their tag (skipped automatically if the fetch came back empty).
+    expire_by_raw_key(conn, SOURCE_NAME, SOURCE_NAME, "case_number", [r["case_number"] for r in rows])
 
     rescore_all(conn)
     log_run(conn, len(rows), new_count, "ok")

@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
+from lead_common import ensure_schema, rescore_all  # noqa: E402
 
 
 def ensure_columns(conn):
@@ -66,18 +67,24 @@ def find_pairs(conn):
     is what a manual re-check in the SQL editor confirmed runs instantly
     (571/571 duplicate pairs found) versus the old query's timeout.
     """
+    # FIX 2026-09-25: the old version required BOTH rows to have the same
+    # zip. Tax-sale rows had no zip at all, and absentee rows had the OWNER'S
+    # MAILING zip, so real duplicates (e.g. "1124 Wembley" / "1124 Wembley
+    # Rd") never matched. Now: same address core, zips don't conflict,
+    # parcel numbers don't conflict, and the core appears exactly twice
+    # (a core shared by 3+ rows could be the same street number in
+    # different towns -- skipped rather than guessed).
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
             with normalized as (
-                select id, address, zip,
-                    regexp_replace(
-                        regexp_replace(lower(trim(address)),
-                            '\\s+(dr|drive|st|street|ave|avenue|rd|road|ln|lane|ct|court|cir|circle|way|blvd|boulevard|pl|place|trl|trail|pkwy|parkway)\\.?$',
-                            '', 'g'),
-                        '\\s+', ' ', 'g') as core
+                select id, address, zip, pin, address_core(address) as core
                 from leads
-                where is_sold = false and is_duplicate = false and zip is not null
+                where is_sold = false and is_duplicate = false
+            ),
+            unambiguous as (
+                select core from normalized where core is not null
+                group by core having count(*) = 2
             )
             select
                 case when length(a.address) >= length(b.address) then a.id else b.id end as canonical_id,
@@ -85,11 +92,10 @@ def find_pairs(conn):
                 case when length(a.address) >= length(b.address) then b.id else a.id end as redundant_id,
                 case when length(a.address) >= length(b.address) then b.address else a.address end as redundant_address
             from normalized a
-            join normalized b
-                on a.id < b.id
-                and a.zip = b.zip
-                and a.core = b.core
-                and a.address <> b.address
+            join normalized b on a.id < b.id and a.core = b.core and a.address <> b.address
+            join unambiguous u on u.core = a.core
+            where (a.zip is null or b.zip is null or a.zip = b.zip)
+              and (a.pin is null or b.pin is null or a.pin = b.pin)
             """
         )
         return cur.fetchall()
@@ -102,14 +108,18 @@ def merge_pair(conn, canonical_id, redundant_id):
             """
             update leads c set
                 source_tags = array(select distinct unnest(c.source_tags || r.source_tags)),
-                raw = c.raw || r.raw,
+                raw = coalesce(c.raw, '{}'::jsonb) || coalesce(r.raw, '{}'::jsonb),
                 owner_name = coalesce(c.owner_name, r.owner_name),
                 mailing_address = coalesce(c.mailing_address, r.mailing_address),
                 phone = coalesce(c.phone, r.phone),
                 email = coalesce(c.email, r.email),
-                is_absentee = c.is_absentee or r.is_absentee,
+                is_absentee = coalesce(c.is_absentee, r.is_absentee),
                 is_vacant = c.is_vacant or r.is_vacant,
-                equity_pct = coalesce(c.equity_pct, r.equity_pct),
+                is_tired_landlord = coalesce(c.is_tired_landlord, r.is_tired_landlord),
+                is_long_term_owner = coalesce(c.is_long_term_owner, r.is_long_term_owner),
+                pin = coalesce(c.pin, r.pin),
+                zip = coalesce(c.zip, r.zip),
+                city = coalesce(c.city, r.city),
                 updated_at = now()
             from leads r
             where c.id = %s and r.id = %s
@@ -123,28 +133,29 @@ def merge_pair(conn, canonical_id, redundant_id):
         )
 
 
-def rescore_all(conn):
-    """Shared score formula -- kept IDENTICAL to every ingest script's copy."""
+# rescore_all now lives in lead_common.py (one shared formula for every script).
+
+
+def refold_duplicates(conn):
+    """
+    FIX 2026-09-25: every ingest upserts on lower(address), so a source that
+    uses the SHORT form of an address keeps writing new tags onto the row
+    that was already flagged is_duplicate -- and those tags never reached
+    the canonical row. Fold them over every run.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            update leads set score =
-                (list_count * 25)
-                + (case when is_absentee then 15 else 0 end)
-                + least(coalesce((raw->'tax_sale'->>'amount_due')::numeric, 0) / 50, 25)
-                + (case when 'foreclosure_mie' = any(source_tags) then 30 else 0 end)
-                + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
-                + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
-                + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
-                + (case when 'redemption_period' = any(source_tags) then 35 else 0 end)
-                + (case when 'insurance_damage' = any(source_tags) then 30 else 0 end)
-                + (case when 'hoa_foreclosure' = any(source_tags) then 20 else 0 end)
-                + (case when 'high_equity' = any(source_tags) then 20 else 0 end)
-                + (case when 'code_violation' = any(source_tags) then 25 else 0 end)
-            where is_sold = false
+            update leads c set
+                source_tags = array(select distinct unnest(c.source_tags || d.source_tags)),
+                raw = coalesce(c.raw, '{}'::jsonb) || coalesce(d.raw, '{}'::jsonb),
+                updated_at = now()
+            from leads d
+            where d.is_duplicate and d.merged_into = c.id
+              and not (d.source_tags <@ c.source_tags)
             """
         )
-
+        return cur.rowcount
 
 def main():
     db_url = os.environ.get("DATABASE_URL")
@@ -154,6 +165,11 @@ def main():
 
     conn = psycopg2.connect(db_url)
     ensure_columns(conn)
+    ensure_schema(conn)
+    conn.commit()
+
+    refolded = refold_duplicates(conn)
+    print(f"Folded late-arriving tags from duplicate rows into {refolded} canonical lead(s).")
     conn.commit()
 
     pairs = find_pairs(conn)

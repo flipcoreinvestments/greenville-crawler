@@ -38,6 +38,7 @@ import psycopg2
 import psycopg2.extras
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
+from lead_common import ensure_schema, expire_by_raw_key, mailing_is_address, remove_tag, rescore_all  # noqa: E402
 
 LIST_URL = "https://www.greenvillecounty.org/appsas400/taxsale/"
 DETAILS_URL = "https://www.greenvillecounty.org/appsas400/RealProperty/Details.aspx?TaxYear={year}&MapNumber={map_number}"
@@ -160,6 +161,10 @@ def normalize_address(addr):
 def guess_absentee(location, mailing_address):
     if not location or not mailing_address:
         return None
+    # FIX 2026-09-25: the county mailing field sometimes holds a NAME, not an
+    # address -- can't judge absentee from that, so unknown (None), not True.
+    if not mailing_is_address(mailing_address):
+        return None
     loc_zip = re.search(r"\b\d{5}\b", location)
     mail_zip = re.search(r"\b\d{5}\b", mailing_address)
     if loc_zip and mail_zip:
@@ -185,77 +190,25 @@ def upsert_lead(conn, address, owner_name, mailing_address, is_absentee, amount_
     with conn.cursor() as cur:
         cur.execute(
             """
-            insert into leads (address, city, state, county, owner_name, mailing_address,
-                                is_absentee, land_use, source_tags, raw)
-            values (%s, 'Greenville', 'SC', 'Greenville', %s, %s, %s, %s, ARRAY[%s]::text[], %s::jsonb)
+            insert into leads (address, state, county, owner_name, mailing_address,
+                                is_absentee, land_use, source_tags, raw, pin)
+            values (%s, 'SC', 'Greenville', %s, %s, %s, %s, ARRAY[%s]::text[], %s::jsonb, nullif(regexp_replace(coalesce(%s, ''), '\\D', '', 'g'), ''))
             on conflict (lower(address)) do update set
                 owner_name = coalesce(excluded.owner_name, leads.owner_name),
                 mailing_address = coalesce(excluded.mailing_address, leads.mailing_address),
                 is_absentee = coalesce(excluded.is_absentee, leads.is_absentee),
                 land_use = coalesce(excluded.land_use, leads.land_use),
                 source_tags = array(select distinct unnest(leads.source_tags || excluded.source_tags)),
-                raw = leads.raw || excluded.raw,
+                raw = coalesce(leads.raw, '{}'::jsonb) || excluded.raw,
+                pin = coalesce(leads.pin, excluded.pin),
                 updated_at = now()
             """,
-            (address, owner_name, mailing_address, is_absentee, land_use, SOURCE_NAME, raw_payload),
+            (address, owner_name, mailing_address, is_absentee, land_use, SOURCE_NAME, raw_payload, map_number),
         )
     return True
 
 
-def rescore_all(conn):
-    """
-    Shared score formula — kept IDENTICAL in every ingest script so the whole
-    table stays consistently scored no matter which script ran most recently:
-      +25 per list the property is stacked on
-      +15 if owner's mailing address differs from the property (absentee)
-      +up to 25 scaled from tax-sale amount owed (capped)
-      +30 if the property has an active foreclosure sale scheduled
-      +20 if the property has a stalled/expired building permit
-      +20 if the property has a demolition permit
-      +15 if the same owner holds 3+ properties county-wide (tired landlord)
-      +35 if the property is in an active tax-sale redemption period (owner
-          is about to permanently lose the property if they don't act)
-      +30 if a permit shows storm/fire/water/damage repair language
-          (insurance_damage -- T Dawg's "utmost importance" category)
-      +20 if the MIE foreclosure plaintiff is an HOA/COA (hoa_foreclosure)
-      +20 if the property shows 15+ years of ownership or a last sale price
-          well below current fair market value (high_equity proxy)
-
-    FIXED 2026-09-21: this copy of the formula was missing the
-    tired_landlord bonus AND the `where is_sold = false` guard that
-    absentee_owner_ingest.py already had. Without that guard, this script
-    (which runs before absentee_owner_ingest.py in nightly.yml) was
-    un-zeroing every already-sold lead's score each night, relying on
-    absentee_owner_ingest.py running later in the same workflow to zero
-    them back out. Fixed here so each script is independently correct
-    regardless of run order.
-
-    UPDATED 2026-09-21: added the redemption_period bonus alongside the new
-    redemption_period_ingest.py script.
-
-    UPDATED 2026-09-22: added insurance_damage, hoa_foreclosure, and
-    high_equity bonuses alongside this round's new tags/scripts.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            update leads set score =
-                (list_count * 25)
-                + (case when is_absentee then 15 else 0 end)
-                + least(coalesce((raw->'tax_sale'->>'amount_due')::numeric, 0) / 50, 25)
-                + (case when 'foreclosure_mie' = any(source_tags) then 30 else 0 end)
-                + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
-                + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
-                + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
-                + (case when 'redemption_period' = any(source_tags) then 35 else 0 end)
-                + (case when 'insurance_damage' = any(source_tags) then 30 else 0 end)
-                + (case when 'hoa_foreclosure' = any(source_tags) then 20 else 0 end)
-                + (case when 'high_equity' = any(source_tags) then 20 else 0 end)
-                + (case when 'code_violation' = any(source_tags) then 25 else 0 end)
-            where is_sold = false
-            """
-        )
-
+# rescore_all now lives in lead_common.py (one shared formula for every script).
 
 def log_run(conn, records_found, records_new, notes):
     with conn.cursor() as cur:
@@ -292,6 +245,7 @@ def main():
     conn = psycopg2.connect(db_url)
     with conn.cursor() as cur:
         cur.execute("alter table leads add column if not exists land_use text")
+    ensure_schema(conn)
     conn.commit()
     new_count = 0
     error_count = 0
@@ -346,6 +300,14 @@ def main():
             time.sleep(REQUEST_DELAY_SECONDS + random.uniform(0, 0.8))
 
         browser.close()
+
+    # FIX 2026-09-25: tags never expired, so parcels that PAID and dropped off
+    # the county list stayed tagged tax_sale with the old amount forever (34
+    # found at audit time). The list above was fetched in full, so anything
+    # tagged tax_sale whose map number isn't on it anymore is expired.
+    # Skipped on MAX_ROWS test runs (partial list).
+    if not max_rows:
+        expire_by_raw_key(conn, SOURCE_NAME, SOURCE_NAME, "map_number", [r["map_number"] for r in rows])
 
     rescore_all(conn)
     log_run(conn, len(rows), new_count, "ok")

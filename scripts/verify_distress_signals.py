@@ -34,7 +34,7 @@ Matching key per source (chosen for reliability, see comments inline):
     each probate-tagged lead's own case_number is re-fetched directly and
     checked for a Closed Date.
 
-NOT touched here (by design): is_absentee, tired_landlord, long_term_owner.
+NOT touched here (by design): out_of_state_land (re-derived county-wide every night).
 Those come from absentee_owner_ingest.py's full-county nightly sweep, which
 recomputes EVERY parcel from live assessor data every run (not additive --
 already continuously self-verifying). The workflow that runs this script
@@ -75,7 +75,8 @@ import code_enforcement_ingest as ce
 import probate_ingest as pb
 
 PROBATE_REQUEST_DELAY_SECONDS = 0.4
-SELF_VERIFYING_TAGS = {"absentee_owner", "tired_landlord", "long_term_owner"}
+from lead_common import address_core as ts_core  # noqa: E402
+SELF_VERIFYING_TAGS = {"out_of_state_land"}  # owner-profile facts are columns now, not tags
 
 
 def ensure_columns(conn):
@@ -121,27 +122,33 @@ def build_redemption_live_set():
             url, html = rp.find_year_page(year)
             if not url:
                 continue
-            sale_date = rp.parse_sale_date(html)
-            if not sale_date:
+            sale_date = rp.parse_sale_date(html, year)
+            if not sale_date or sale_date >= today:  # upcoming sale = nobody in redemption yet
                 continue
             redemption_deadline = sale_date + timedelta(days=rp.REDEMPTION_DAYS)
             if redemption_deadline < today:
                 continue
             any_year_resolved = True
             rows = rp.parse_list(html)
-            live.update(r["map_number"] for r in rows if r.get("map_number"))
+            live.update(re.sub(r"\D", "", r["map_number"]) for r in rows if r.get("map_number"))
         return live if any_year_resolved else set()
     except Exception as e:
         print(f"  WARNING: redemption_period live pull failed: {e}", file=sys.stderr)
         return None
 
 
-def build_foreclosure_live_set(page, context):
+def build_foreclosure_live_set(api_key):
+    # FIX 2026-09-25: the foreclosure ingest moved to Scrapfly (see its
+    # docstring); this still called the removed browser helpers and failed
+    # silently every run.
+    if not api_key:
+        print("  WARNING: SCRAPFLY_KEY not set; foreclosure tags can't be verified", file=sys.stderr)
+        return None
     try:
-        dates = fm.fetch_future_sale_dates(page)
+        dates = fm.fetch_future_sale_dates(api_key)
         live_cases = set()
         for d in dates:
-            html = fm.fetch_sale_list(context, d)
+            html = fm.fetch_sale_list(api_key, d)
             rows = fm.parse_sale_list(html)
             live_cases.update(r["case_number"] for r in rows if r.get("case_number"))
             time.sleep(fm.REQUEST_DELAY_SECONDS)
@@ -151,43 +158,19 @@ def build_foreclosure_live_set(page, context):
         return None
 
 
-def build_permits_live_sets():
-    cutoff = date.today()
-    stale_cutoff_date = date.fromordinal(cutoff.toordinal() - bp.STALE_DAYS)
-    stale_cutoff_num = int(stale_cutoff_date.strftime("%Y%m%d"))
-    result = {}
-
+def build_permits_live_sets(conn):
+    """Uses the SAME rules the nightly ingest uses (bp.classify_permits, with
+    the cached city inspection checks) so verification can't disagree with
+    ingestion. Matched on address core."""
+    from lead_common import address_core
+    import permit_inspections as pi
     try:
-        demo_rows = bp.fetch_rows("PERMIT_TYPE LIKE '%DEM%'")
-        result["permit_demolition"] = {
-            norm_addr_simple(bp.normalize_address(r.get("STREETADDRESS")))
-            for r in demo_rows if r.get("STREETADDRESS")
-        }
+        pi.ensure_table(conn)
+        classified = bp.classify_permits(bp.fetch_all_permits(), checks=pi.load_checks(conn))
     except Exception as e:
-        print(f"  WARNING: demolition live pull failed: {e}", file=sys.stderr)
-        result["permit_demolition"] = None
-
-    try:
-        stalled_rows = bp.fetch_rows(f"BP_STATUS='IS' AND APPLICDATE < {stale_cutoff_num}")
-        result["permit_expired"] = {
-            norm_addr_simple(bp.normalize_address(r.get("STREETADDRESS")))
-            for r in stalled_rows if r.get("STREETADDRESS")
-        }
-    except Exception as e:
-        print(f"  WARNING: stalled-permit live pull failed: {e}", file=sys.stderr)
-        result["permit_expired"] = None
-
-    try:
-        damage_rows = bp.fetch_rows(bp.build_damage_where_clause())
-        result["insurance_damage"] = {
-            norm_addr_simple(bp.normalize_address(r.get("STREETADDRESS")))
-            for r in damage_rows if r.get("STREETADDRESS")
-        }
-    except Exception as e:
-        print(f"  WARNING: damage-permit live pull failed: {e}", file=sys.stderr)
-        result["insurance_damage"] = None
-
-    return result
+        print(f"  WARNING: permit live pull failed: {e}", file=sys.stderr)
+        return {t: None for t in bp.TAG_PRIORITY}
+    return {t: {address_core(a) for a in addrs} for t, addrs in classified.items()}
 
 
 def build_code_violation_live_set():
@@ -240,20 +223,12 @@ def main():
     redemption_live = build_redemption_live_set()
     print(f"  -> {'FAILED' if redemption_live is None else len(redemption_live)} live redemption map numbers")
 
-    print("Pulling live foreclosure (MIE) sale list via headless browser...")
-    foreclosure_live = None
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
-            context, page = fm.new_browser_context(browser)
-            foreclosure_live = build_foreclosure_live_set(page, context)
-            browser.close()
-    except Exception as e:
-        print(f"  WARNING: foreclosure_mie browser session failed: {e}", file=sys.stderr)
+    print("Pulling live foreclosure (MIE) sale list via Scrapfly...")
+    foreclosure_live = build_foreclosure_live_set(os.environ.get("SCRAPFLY_KEY"))
     print(f"  -> {'FAILED' if foreclosure_live is None else len(foreclosure_live)} live foreclosure case numbers")
 
     print("Pulling live building permits (demolition/stalled/damage)...")
-    permits_live = build_permits_live_sets()
+    permits_live = build_permits_live_sets(conn)
     for k, v in permits_live.items():
         print(f"  -> {k}: {'FAILED' if v is None else len(v)} live addresses")
 
@@ -298,15 +273,16 @@ def main():
                 else:
                     stale_tags.append(tag)
 
-            elif tag == "redemption_period":
-                mn = (raw.get("redemption_period") or {}).get("map_number")
-                if redemption_live is None or not mn:
+            elif tag == "repeat_tax_delinquent":
+                # live only if the parcel is on BOTH the prior notice and the
+                # current county tax sale list
+                mn = re.sub(r"\D", "", (raw.get("tax_sale") or {}).get("map_number") or "")
+                if redemption_live is None or tax_sale_live is None or not mn:
                     unverifiable_tags.append(tag)
-                elif mn in redemption_live:
+                elif mn in redemption_live and mn in {re.sub(r"\D", "", m) for m in tax_sale_live}:
                     live_tags.append(tag)
                 else:
                     stale_tags.append(tag)
-
             elif tag in ("foreclosure_mie", "hoa_foreclosure"):
                 cn = (raw.get("foreclosure_mie") or {}).get("case_number")
                 if foreclosure_live is None or not cn:
@@ -320,7 +296,7 @@ def main():
                 live_set = permits_live.get(tag)
                 if live_set is None:
                     unverifiable_tags.append(tag)
-                elif addr_norm in live_set:
+                elif ts_core(lead["address"]) in live_set:
                     live_tags.append(tag)
                 else:
                     stale_tags.append(tag)

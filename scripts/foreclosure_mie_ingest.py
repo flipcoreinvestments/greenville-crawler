@@ -73,6 +73,7 @@ from datetime import datetime, timezone, date
 import requests
 from bs4 import BeautifulSoup
 import psycopg2
+from lead_common import ensure_schema, expire_by_raw_key, remove_tag, rescore_all  # noqa: E402
 
 BASE_URL = "https://mie.greenvillejournal.com"
 LIST_PAGE_URL = f"{BASE_URL}/printer-friendly-sale-list/"
@@ -148,7 +149,10 @@ def scrapfly_request(method, url, api_key, data=None):
 # positive costs nothing since it's an additive bonus tag.
 HOA_PLAINTIFF_PATTERN = re.compile(
     r"(HOMEOWNERS?\s*ASSOC|PROPERTY\s*OWNERS?\s*ASSOC|OWNERS?\s*ASSOC|"
-    r"CONDOMINIUM\s*ASSOC|COMMUNITY\s*ASSOC|\bHOA\b|\bPOA\b|\bCOA\b)",
+    r"CONDOMINIUM\s*ASSOC|COMMUNITY\s*ASSOC|\bHOA\b|\bPOA\b|\bCOA\b|"
+    # SC condos usually sue as the "Council of Co-Owners" of a "Horizontal
+    # Property Regime" (SC Code 27-31) -- added 2026-09-25 stress test.
+    r"COUNCIL\s+OF\s+CO-?\s*OWNERS|HORIZONTAL\s+PROPERTY\s+REGIME)",
     re.IGNORECASE,
 )
 
@@ -302,9 +306,11 @@ def upsert_lead(conn, row, sale_date):
             on conflict (lower(address)) do update set
                 city = coalesce(excluded.city, leads.city),
                 zip = coalesce(excluded.zip, leads.zip),
-                owner_name = coalesce(excluded.owner_name, leads.owner_name),
+                -- FIX 2026-09-25: keep the county's owner name when we have
+                -- it; the court Defendant field is often "John Doe, et al."
+                owner_name = coalesce(leads.owner_name, excluded.owner_name),
                 source_tags = array(select distinct unnest(leads.source_tags || excluded.source_tags)),
-                raw = leads.raw || excluded.raw,
+                raw = coalesce(leads.raw, '{}'::jsonb) || excluded.raw,
                 updated_at = now()
             """,
             (address, row["city"], row["state"], row["zip"], row["defendant"], tags, raw_payload),
@@ -312,57 +318,7 @@ def upsert_lead(conn, row, sale_date):
     return True
 
 
-def rescore_all(conn):
-    """
-    Shared score formula — kept IDENTICAL in every ingest script so the whole
-    table stays consistently scored no matter which script ran most recently:
-      +25 per list the property is stacked on
-      +15 if owner's mailing address differs from the property (absentee)
-      +up to 25 scaled from tax-sale amount owed (capped)
-      +30 if the property has an active foreclosure sale scheduled
-      +20 if the property has a stalled/expired building permit
-      +20 if the property has a demolition permit
-      +15 if the same owner holds 3+ properties county-wide (tired landlord)
-      +35 if the property is in an active tax-sale redemption period (owner
-          is about to permanently lose the property if they don't act)
-      +30 if a permit shows storm/fire/water/damage repair language
-          (insurance_damage -- T Dawg's "utmost importance" category)
-      +20 if the MIE foreclosure plaintiff is an HOA/COA (hoa_foreclosure)
-      +20 if the property shows 15+ years of ownership or a last sale price
-          well below current fair market value (high_equity proxy)
-
-    FIXED 2026-09-21: was missing the tired_landlord bonus AND the
-    `where is_sold = false` guard, so this script (runs before
-    absentee_owner_ingest.py in nightly.yml) was un-zeroing already-sold
-    leads' scores each night. Fixed so this script is independently
-    correct regardless of run order.
-
-    UPDATED 2026-09-21: added the redemption_period bonus alongside the new
-    redemption_period_ingest.py script.
-
-    UPDATED 2026-09-22: added insurance_damage, hoa_foreclosure, and
-    high_equity bonuses alongside this round's new tags/scripts.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            update leads set score =
-                (list_count * 25)
-                + (case when is_absentee then 15 else 0 end)
-                + least(coalesce((raw->'tax_sale'->>'amount_due')::numeric, 0) / 50, 25)
-                + (case when 'foreclosure_mie' = any(source_tags) then 30 else 0 end)
-                + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
-                + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
-                + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
-                + (case when 'redemption_period' = any(source_tags) then 35 else 0 end)
-                + (case when 'insurance_damage' = any(source_tags) then 30 else 0 end)
-                + (case when 'hoa_foreclosure' = any(source_tags) then 20 else 0 end)
-                + (case when 'high_equity' = any(source_tags) then 20 else 0 end)
-                + (case when 'code_violation' = any(source_tags) then 25 else 0 end)
-            where is_sold = false
-            """
-        )
-
+# rescore_all now lives in lead_common.py (one shared formula for every script).
 
 def log_run(conn, records_found, records_new, notes):
     with conn.cursor() as cur:
@@ -385,6 +341,17 @@ def main():
     print(f"[{datetime.now(timezone.utc).isoformat()}] Finding upcoming foreclosure sale dates...")
 
     conn = psycopg2.connect(db_url)
+    ensure_schema(conn)
+
+    # FIX 2026-09-25: once the auction date has passed the property is no
+    # longer "scheduled for foreclosure sale" -- expire the tag (a sale at
+    # auction then shows up as a new deed and is_sold via absentee script).
+    for t in ("foreclosure_mie", "hoa_foreclosure"):
+        # sale_date is stored exactly as the site's dropdown gives it: MM/DD/YYYY
+        n = remove_tag(conn, t, "(raw->'foreclosure_mie'->>'sale_date') ~ '^\\d{2}/\\d{2}/\\d{4}$' "
+                                "and to_date(raw->'foreclosure_mie'->>'sale_date', 'MM/DD/YYYY') < current_date")
+        print(f"  expired {t} from {n} lead(s) whose auction date has passed")
+    conn.commit()
 
     try:
         sale_dates = fetch_future_sale_dates(scrapfly_key)
@@ -405,6 +372,8 @@ def main():
 
     total_found = 0
     new_count = 0
+    all_dates_ok = True
+    current_cases = []
 
     for sale_date in sale_dates:
         try:
@@ -412,13 +381,23 @@ def main():
             rows = parse_sale_list(html)
             print(f"  {sale_date}: {len(rows)} active listings")
             total_found += len(rows)
+            current_cases.extend(r["case_number"] for r in rows)
             for row in rows:
                 if upsert_lead(conn, row, sale_date):
                     new_count += 1
         except Exception as e:
+            all_dates_ok = False
             print(f"  {sale_date}: error {e}", file=sys.stderr)
 
         time.sleep(REQUEST_DELAY_SECONDS)
+
+    # Withdrawn/dismissed cases drop off the published list -- expire them,
+    # but only when every sale date was fetched without error this run.
+    if all_dates_ok:
+        expire_by_raw_key(conn, "foreclosure_mie", "foreclosure_mie", "case_number", current_cases)
+        remove_tag(conn, "hoa_foreclosure", "not ('foreclosure_mie' = any(source_tags))")
+    else:
+        print("  at least one sale date failed to fetch; withdrawn-case expiry skipped")
 
     rescore_all(conn)
     log_run(conn, total_found, new_count, "ok")

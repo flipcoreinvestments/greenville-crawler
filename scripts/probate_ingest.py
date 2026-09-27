@@ -53,6 +53,7 @@ from datetime import datetime, timezone, date
 import requests
 from bs4 import BeautifulSoup
 import psycopg2
+from lead_common import ensure_schema, rescore_all  # noqa: E402
 
 BASE_URL = "https://www.greenvillecounty.org/appsas400/Probate/"
 DETAILS_URL = "https://www.greenvillecounty.org/appsas400/Probate/SearchDetails.aspx?CaseNumber={case_number}"
@@ -67,7 +68,8 @@ HEADERS = {
 
 LABELS_IN_ORDER = [
     "Name", "Party Type", "Address", "Date of Death", "Date of Birth", "Sex",
-    "Status", "Case Type", "Case SubType", "File Date", "PR Appointed Date",
+    "Status", "Case Type", "Case SubType", "File Date",
+    "Expiration of Estate Creditor Claims Period", "PR Appointed Date",
     "Closed Date", "PARTIES INVOLVED",
 ]
 
@@ -125,12 +127,34 @@ def normalize_address(addr):
     return addr or None
 
 
+# Postal cities used for Greenville County addresses. Longest first so
+# "Travelers Rest" wins over any shorter overlap.
+KNOWN_CITIES = sorted([
+    "Greenville", "Greer", "Simpsonville", "Mauldin", "Fountain Inn", "Travelers Rest",
+    "Taylors", "Piedmont", "Pelzer", "Marietta", "Landrum", "Gray Court", "Easley",
+    "Cleveland", "Slater", "Tigerville", "Duncan", "Woodruff", "Williamston", "Liberty",
+], key=len, reverse=True)
+_CITY_RE = re.compile(
+    r"^(?P<street>.+?)[,\s]+(?P<city>" + "|".join(re.escape(c) for c in KNOWN_CITIES) +
+    r")[,\s]+SC[,\s]+(?P<zip>\d{5})", re.I)
+
+
 def parse_address_parts(full_addr):
-    """Best-effort split of 'STREET CITY SC ZIP' -> (street, city, zip)."""
-    m = re.match(r"^(.*?)\s+([A-Za-z .'-]+?)\s+SC\s+(\d{5})", full_addr)
+    """
+    Split 'STREET CITY SC ZIP' -> (street, city, zip).
+    FIX 2026-09-25: the old regex was lazy on the street, so
+    "12 MAIN ST GREER SC 29651" became street "12", city "Main St Greer",
+    and unparseable addresses were hard-coded to city "Greenville". Now the
+    city must be a known county postal city; otherwise the street keeps
+    everything before "SC", city is left blank, and the zip is still kept.
+    """
+    m = _CITY_RE.match(full_addr)
     if m:
-        return m.group(1).strip(), m.group(2).strip().title(), m.group(3)
-    return full_addr, "Greenville", None
+        return m.group("street").strip(" ,"), m.group("city").title(), m.group("zip")
+    m = re.match(r"^(.*?)[,\s]+SC[,\s]+(\d{5})", full_addr, re.I)
+    if m:
+        return m.group(1).strip(" ,"), None, m.group(2)
+    return full_addr.strip(" ,"), None, None
 
 
 def parse_case_detail(html, cn):
@@ -157,12 +181,60 @@ def parse_case_detail(html, cn):
         "closed_date": fields.get("Closed Date") or None,
         "case_subtype": fields.get("Case SubType") or None,
         "parties": fields.get("PARTIES INVOLVED") or None,
+        "creditor_deadline": fields.get("Expiration of Estate Creditor Claims Period") or None,
+        **parse_pr(fields.get("PARTIES INVOLVED") or ""),
     }
+
+
+def parse_pr(parties_text):
+    """Personal Representative name/address from the PARTIES INVOLVED block
+    ("Name: BRADLEY , NICOYIA COX Party Type: Personal Representative
+    Address: 206 GREENACRE ROAD ...")."""
+    m = re.search(r"Name:?\s*(.*?)\s*Party Type:?\s*Personal Representative\s*Address:?\s*(.*?)"
+                  r"(?=\s*Name:|$)", parties_text or "", re.I)
+    if not m:
+        return {"pr_name": None, "pr_address": None}
+    return {"pr_name": re.sub(r"\s*,\s*", ", ", m.group(1)).strip(" ,"), "pr_address": m.group(2).strip()}
+
+
+def split_decedent_name(name):
+    """'MACK , CLAUDIA NANCE' -> ('MACK', 'CLAUDIA'). The court writes LAST , FIRST MIDDLE."""
+    if not name or "," not in name:
+        return None, None
+    last, rest = name.split(",", 1)
+    last = re.sub(r"[^A-Z' -]", "", last.upper()).strip()
+    first = (re.findall(r"[A-Z']+", rest.upper()) or [None])[0]
+    return (last or None), first
+
+
+def decedent_middle_initial(name):
+    """'MACK , CLAUDIA NANCE' -> 'N'; 'LEISTER , VIRGIL' -> None. JR/SR/II/III/IV are suffixes, not middles."""
+    if not name or "," not in name:
+        return None
+    toks = [t for t in re.findall(r"[A-Z']+", name.split(",", 1)[1].upper())
+            if t not in ("JR", "SR", "II", "III", "IV")]
+    return toks[1][0] if len(toks) >= 2 else None
+
+
+def street_only(addr):
+    if not addr:
+        return None
+    street = parse_address_parts(addr)[0]
+    return street or None
 
 
 def upsert_lead(conn, row):
     street, city, zip_code = parse_address_parts(row["address"])
     if not street:
+        return False
+    # Greenville County only (standing rule): a decedent who lived in
+    # Atlanta or Anderson County isn't a Greenville property lead. All
+    # Greenville County zips start 296.
+    if not (zip_code and zip_code.startswith("296")):
+        return False
+    # A PO box is a mailbox, not a property (Claudia Mack's case listed
+    # "8376 PO BOX" -- her houses are found by the owner-name match instead).
+    if re.search(r"\bP\.?\s*O\.?\s*BOX\b|\bPO BOX\b", street, re.I):
         return False
 
     raw_payload = json.dumps({
@@ -189,7 +261,7 @@ def upsert_lead(conn, row):
                 zip = coalesce(excluded.zip, leads.zip),
                 owner_name = coalesce(leads.owner_name, excluded.owner_name),
                 source_tags = array(select distinct unnest(leads.source_tags || excluded.source_tags)),
-                raw = leads.raw || excluded.raw,
+                raw = coalesce(leads.raw, '{}'::jsonb) || excluded.raw,
                 updated_at = now()
             """,
             (street, city, zip_code, row["decedent_name"], SOURCE_NAME, raw_payload),
@@ -197,34 +269,7 @@ def upsert_lead(conn, row):
     return True
 
 
-def rescore_all(conn):
-    """
-    Shared score formula -- kept IDENTICAL in every ingest script. See
-    absentee_owner_ingest.py for the full running commentary; this copy
-    adds no new bonus of its own (no dedicated 'probate' point value was
-    specified -- it contributes only the flat +25 per-list list_count bonus
-    like every other source, until T Dawg says otherwise).
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            update leads set score =
-                (list_count * 25)
-                + (case when is_absentee then 15 else 0 end)
-                + least(coalesce((raw->'tax_sale'->>'amount_due')::numeric, 0) / 50, 25)
-                + (case when 'foreclosure_mie' = any(source_tags) then 30 else 0 end)
-                + (case when 'permit_expired' = any(source_tags) then 20 else 0 end)
-                + (case when 'permit_demolition' = any(source_tags) then 20 else 0 end)
-                + (case when 'tired_landlord' = any(source_tags) then 15 else 0 end)
-                + (case when 'redemption_period' = any(source_tags) then 35 else 0 end)
-                + (case when 'insurance_damage' = any(source_tags) then 30 else 0 end)
-                + (case when 'hoa_foreclosure' = any(source_tags) then 20 else 0 end)
-                + (case when 'high_equity' = any(source_tags) then 20 else 0 end)
-                + (case when 'code_violation' = any(source_tags) then 25 else 0 end)
-            where is_sold = false
-            """
-        )
-
+# rescore_all now lives in lead_common.py (one shared formula for every script).
 
 def get_high_water_seq(conn, year):
     with conn.cursor() as cur:
@@ -232,7 +277,7 @@ def get_high_water_seq(conn, year):
             """
             select notes from source_runs
             where source_name = %s and notes like %s
-            order by id desc limit 1
+            order by run_at desc limit 1
             """,
             (SOURCE_NAME, f"%year:{year}%"),
         )
@@ -251,75 +296,164 @@ def log_run(conn, records_found, records_new, notes):
         )
 
 
-def main():
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        print("DATABASE_URL is not set", file=sys.stderr)
-        sys.exit(1)
+YEARS_BACK = 2  # estates stay open 1-3 years; Claudia Mack's (2024ES2302884) was open 22 months
 
-    max_lookups = int(os.environ.get("MAX_ROWS") or 3000)
-    year = date.today().year
 
-    conn = psycopg2.connect(db_url)
+def ensure_cases_table(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            create table if not exists probate_cases (
+                case_number text primary key,
+                decedent_name text, decedent_last text, decedent_first text,
+                date_of_death text, file_date text, closed_date text,
+                pr_name text, pr_address text, decedent_address text,
+                creditor_deadline text, fetched_at timestamptz not null default now()
+            )
+            """
+        )
+        # added 2026-09-26: middle initial + street-only addresses for matching
+        cur.execute("alter table probate_cases add column if not exists decedent_middle text")
+        cur.execute("alter table probate_cases add column if not exists decedent_street text")
+        cur.execute("alter table probate_cases add column if not exists pr_street text")
+
+
+def save_case(conn, row):
+    last, first = split_decedent_name(row["decedent_name"])
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into probate_cases
+                (case_number, decedent_name, decedent_last, decedent_first, date_of_death,
+                 file_date, closed_date, pr_name, pr_address, decedent_address,
+                 creditor_deadline, decedent_middle, decedent_street, pr_street, fetched_at)
+            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+            on conflict (case_number) do update set
+                closed_date = excluded.closed_date, pr_name = excluded.pr_name,
+                pr_address = excluded.pr_address, creditor_deadline = excluded.creditor_deadline,
+                decedent_middle = excluded.decedent_middle, decedent_street = excluded.decedent_street,
+                pr_street = excluded.pr_street, fetched_at = now()
+            """,
+            (row["case_number"], row["decedent_name"], last, first, row["date_of_death"],
+             row["file_date"], row["closed_date"], row.get("pr_name"), row.get("pr_address"),
+             row["address"], row.get("creditor_deadline"), decedent_middle_initial(row["decedent_name"]),
+             street_only(row["address"]), street_only(row.get("pr_address"))),
+        )
+
+
+def match_owners_to_estates(conn):
+    """
+    ADDED 2026-09-26. Tags an existing distress lead 'probate' when the
+    county owner of record is a decedent with an open estate -- the county
+    writes owners LAST FIRST ("Mack Claudia N", "Mack Pelzier Jr Mack
+    Claudia N") and the court writes LAST , FIRST, so the match is the
+    LAST+FIRST pair appearing together in the owner name. This is how 107
+    Beechwood Ave (plus 102 Trotter St and 5 Copeland Ct) connect to
+    Claudia Nance Mack's estate; her case only listed a PO box.
+    Only open estates (no closed date). Name matches get the
+    'probate_name_match' review flag so a common name is double-checked.
+    Never creates a lead -- only tags properties already on a distress list.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            r"""
+            update leads l set
+                source_tags = array(select distinct unnest(l.source_tags || array['probate'])),
+                raw = coalesce(l.raw, '{}'::jsonb) || jsonb_build_object('probate', jsonb_build_object(
+                    'case_number', c.case_number, 'decedent_name', c.decedent_name,
+                    'date_of_death', c.date_of_death, 'file_date', c.file_date,
+                    'pr_name', c.pr_name, 'pr_address', c.pr_address,
+                    'creditor_deadline', c.creditor_deadline,
+                    -- owner_name_and_address = the probate file's address (decedent's
+                    -- or PR's) is the property itself or the owner's mailing address.
+                    -- owner_name alone = verify by hand (common names).
+                    'match', case when exists (
+                        select 1 from unnest(array[c.decedent_street, c.pr_street]) s(st)
+                        where address_core(s.st) is not null and (
+                            address_core(s.st) = address_core(l.address)
+                            or address_core(l.mailing_address) = address_core(s.st)
+                            or address_core(l.mailing_address) like address_core(s.st) || ' %'))
+                        then 'owner_name_and_address' else 'owner_name' end)),
+                updated_at = now()
+            from probate_cases c
+            where l.list_count > 0 and l.is_sold = false and l.is_duplicate = false
+              and coalesce(c.closed_date, '') = ''
+              and c.decedent_last is not null and c.decedent_first is not null
+              and length(c.decedent_first) >= 2
+              and upper(coalesce(l.owner_name, '')) ~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\M')
+              -- middle-initial rule: if the county lists a single-letter middle
+              -- initial right after LAST FIRST, it must be the decedent's
+              -- (Leister Virgil E is not LEISTER, VIRGIL WAYNE).
+              and (c.decedent_middle is null
+                   or upper(l.owner_name) !~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\s+[A-Z]\M')
+                   or upper(l.owner_name) ~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\s+' || c.decedent_middle || '\M'))
+              and not ('probate' = any(l.source_tags) and l.raw->'probate'->>'case_number' = c.case_number)
+            """
+        )
+        return cur.rowcount
+
+
+def crawl_year(conn, session, year, budget):
     start_seq = get_high_water_seq(conn, year) + 1
-    print(f"[{datetime.now(timezone.utc).isoformat()}] Year {year}, starting at sequence {start_seq}, "
-          f"cap {max_lookups} lookups this run.")
-
-    session = new_session()
-    seq = start_seq
-    consecutive_misses = 0
-    lookups = 0
-    found = 0
-    new_count = 0
-    highest_confirmed = start_seq - 1
-    debug_logged = 0
-
-    while consecutive_misses < CONSECUTIVE_MISS_LIMIT and lookups < max_lookups:
+    seq, misses, lookups, found, new_count = start_seq, 0, 0, 0, 0
+    highest = start_seq - 1
+    while misses < CONSECUTIVE_MISS_LIMIT and lookups < budget:
         cn = case_number(year, seq)
         html = fetch_case(session, cn)
         lookups += 1
-
         if html is None:
-            consecutive_misses += 1
+            misses += 1
             seq += 1
             time.sleep(REQUEST_DELAY_SECONDS)
             continue
-
-        consecutive_misses = 0
-        highest_confirmed = seq
+        misses = 0
+        highest = seq
         found += 1
-
         try:
             parsed = parse_case_detail(html, cn)
         except Exception as e:
             parsed = None
             print(f"  {cn}: parse error: {e}", file=sys.stderr)
-
-        if parsed is None and debug_logged < 3:
-            # Log a snippet so a real layout mismatch can be diagnosed and
-            # fixed from actual GitHub Actions output rather than guessed at.
-            soup = BeautifulSoup(html, "html.parser")
-            snippet = re.sub(r"\s+", " ", soup.get_text(" "))[:800]
-            print(f"  {cn}: could not extract address/estate fields, raw text snippet: {snippet}", file=sys.stderr)
-            debug_logged += 1
-
         if parsed:
+            save_case(conn, parsed)
             if upsert_lead(conn, parsed):
                 new_count += 1
-
+        if found % 100 == 0:
+            conn.commit()
         seq += 1
         time.sleep(REQUEST_DELAY_SECONDS)
+    log_run(conn, found, new_count,
+            f"ok: year:{year} high_water_seq:{highest} lookups:{lookups} found_cases:{found} "
+            f"estate_leads:{new_count} stopped_after_misses:{misses}")
+    conn.commit()
+    print(f"  {year}: {lookups} lookups, {found} cases, {new_count} address leads, high-water {highest}")
+    return lookups
 
+
+def main():
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        print("DATABASE_URL is not set", file=sys.stderr)
+        sys.exit(1)
+    budget = int(os.environ.get("MAX_ROWS") or 3000)
+    conn = psycopg2.connect(db_url)
+    ensure_schema(conn)
+    ensure_cases_table(conn)
+    conn.commit()
+    session = new_session()
+    this_year = date.today().year
+    # Older years first: they're finite and get finished; the current year
+    # keeps growing and is picked up every night after the backfill.
+    for year in range(this_year - YEARS_BACK, this_year + 1):
+        if budget <= 0:
+            break
+        budget -= crawl_year(conn, session, year, budget)
+    n = match_owners_to_estates(conn)
+    print(f"  owner-name matches to open estates: {n} lead(s) tagged probate")
     rescore_all(conn)
-    log_run(
-        conn, found, new_count,
-        f"ok: year:{year} high_water_seq:{highest_confirmed} lookups:{lookups} "
-        f"found_cases:{found} estate_leads:{new_count} stopped_after_misses:{consecutive_misses}"
-    )
     conn.commit()
     conn.close()
-    print(f"Done. Checked {lookups} case numbers ({found} real cases found), "
-          f"{new_count} estate/probate leads upserted. High-water mark now {highest_confirmed}.")
+    print("Done.")
 
 
 if __name__ == "__main__":
