@@ -1,0 +1,87 @@
+name: Nightly Greenville lead ingest
+
+# NOTE: foreclosure_mie ingest moved to its own weekly workflow
+# (weekly_foreclosure.yml) on 2026-09-23. It's the only source that costs
+# real money (Scrapfly residential-proxy credits, ~150/run) and foreclosure
+# sale dates don't change daily, so running it nightly just burns the free
+# 1,000-credit tier in about a week for no benefit. Weekly stretches that to
+# 6-7 weeks. Every other source below is free regardless of frequency.
+
+on:
+  schedule:
+    # 10:00 UTC ≈ 6:00 AM Eastern (5:00 AM during EST). Runs every night.
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+    inputs:
+      max_rows:
+        description: "Optional: limit how many parcels to process (leave blank for all)"
+        required: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install headless browser
+        run: playwright install --with-deps chromium
+
+      - name: Run tax sale ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MAX_ROWS: ${{ github.event.inputs.max_rows }}
+        run: python scripts/tax_sale_ingest.py
+
+      - name: Run tax sale redemption period ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MAX_ROWS: ${{ github.event.inputs.max_rows }}
+        run: python scripts/redemption_period_ingest.py
+
+      - name: Run building permits (expired/demolition) ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/building_permits_ingest.py
+
+      - name: Run absentee owner + tired landlord ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/absentee_owner_ingest.py
+
+      - name: Backfill land_use for every lead (property type filter coverage)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/backfill_land_use.py
+
+      - name: Run probate ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MAX_ROWS: ${{ github.event.inputs.max_rows }}
+        run: python scripts/probate_ingest.py
+
+      - name: Run code enforcement (unfit structures) ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/code_enforcement_ingest.py
+
+      - name: Import PropStream exports (propstream_exports/ folder)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/propstream_import.py
+
+      - name: Merge duplicate-address leads (one name per list)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/merge_duplicate_addresses.py
+
+      - name: Alert on leads newly stacked on 2+ lists
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/alert_stacked_leads.py

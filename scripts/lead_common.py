@@ -39,6 +39,11 @@ DISTRESS_TAGS = [
     "code_violation",
     "probate",
     "out_of_state_land",
+    # PropStream exports (propstream_import.py, added 2026-09-27)
+    "pre_probate",
+    "pre_foreclosure",
+    "involuntary_lien",
+    "failed_listing",
 ]
 
 # Retired as tags. The first three move to boolean columns; high_equity is
@@ -295,6 +300,10 @@ def rescore_all(conn):
       +30 storm/fire/water damage repair permit
       +20 HOA/COA is the foreclosing plaintiff
       +25 code violation (condemned / unfit structure)
+      +30 pre-foreclosure (PropStream: default recorded, last 6 months)
+      +20 deceased owner (probate court estate OR PropStream pre-probate)
+      +20 USPS vacant (PropStream) -- only counts on a lead already on a list
+      +10 involuntary lien (HOA / mechanic's / utility / child support)
     Leads with no distress list score 0, and so do COMMERCIAL properties
     (known land use outside RESIDENTIAL_LAND_USE). high_equity is gone.
     Only rows whose score actually changes are written (the old formula
@@ -320,6 +329,10 @@ def rescore_all(conn):
                         + (case when 'insurance_damage' = any(source_tags) then 30 else 0 end)
                         + (case when 'hoa_foreclosure' = any(source_tags) then 20 else 0 end)
                         + (case when 'code_violation' = any(source_tags) then 25 else 0 end)
+                        + (case when 'pre_foreclosure' = any(source_tags) then 30 else 0 end)
+                        + (case when source_tags && array['probate', 'pre_probate'] then 20 else 0 end)
+                        + (case when is_vacant is true then 20 else 0 end)
+                        + (case when 'involuntary_lien' = any(source_tags) then 10 else 0 end)
                     end as new_score
                 from leads
                 where is_sold = false
