@@ -71,9 +71,10 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/code_enforcement_ingest.py
 
-      - name: Import PropStream exports (propstream_exports/ folder)
+      - name: Import PropStream exports (private Supabase bucket)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python scripts/propstream_import.py
 
       - name: Merge duplicate-address leads (one name per list)
