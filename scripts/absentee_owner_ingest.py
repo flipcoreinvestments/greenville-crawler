@@ -571,55 +571,28 @@ def enrich_existing_leads(conn, parcels, owner_counts, tired_owners):
     return n
 
 
-def upsert_out_of_state_land(conn, parcels):
+def flag_out_of_state_land(conn, parcels, full_fetch):
     """
-    The one list this script still CREATES leads for: out-of-state owners of
-    vacant land (verified county codes 1180/6800/9170, see VACANT_LAND_CODES).
-    zip/city are left blank -- the parcel feed only has the owner's MAILING
-    zip, which is exactly the bug the 2026-09-25 audit fixed.
+    CHANGED 2026-09-28 (T Dawg's call): out-of-state owners of vacant land
+    used to be a distress LIST that created ~1,300 leads on its own. Being
+    out of state proves nothing is wrong with the property -- it's an owner
+    fact like absentee. Now it's the is_out_of_state_land column: set on
+    parcels already in the table (matched by PIN), never creates a lead,
+    never counts as a list. Cleared for parcels that no longer qualify, but
+    only after a full county fetch.
     """
-    merged = {}
-    for p in parcels:
-        if not p["out_of_state_land"]:
-            continue
-        key = p["address"].lower()
-        if key in merged:
-            merged[key]["pins"].append(p["pin"])
-            continue
-        merged[key] = {**p, "pins": [p["pin"]]}
-    rows = []
-    for m in merged.values():
-        extra = {
-            "pin": m["pins"][0] if len(m["pins"]) == 1 else m["pins"],
-            "deed_date": m["deed_date"], "sale_price": m["sale_price"],
-            "total_tax": m["total_tax"], "landuse": m["landuse"],
-            "mailing_state": m["mailing_state"], "mailing_zip": m["mailing_zip"],
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-        }
-        rows.append((
-            m["address"], m["owner_name"], m["mailing_address"], True,
-            ["out_of_state_land"], json.dumps({SOURCE_NAME: extra}), m["pins"][0],
-        ))
-    sql = """
-        insert into leads (address, city, zip, county, owner_name, mailing_address,
-                           is_absentee, source_tags, raw, pin)
-        values %s
-        on conflict (lower(address)) do update set
-            owner_name = coalesce(excluded.owner_name, leads.owner_name),
-            mailing_address = coalesce(excluded.mailing_address, leads.mailing_address),
-            is_absentee = coalesce(excluded.is_absentee, leads.is_absentee),
-            source_tags = array(select distinct unnest(leads.source_tags || excluded.source_tags)),
-            raw = coalesce(leads.raw, '{}'::jsonb) || excluded.raw,
-            pin = coalesce(leads.pin, excluded.pin),
-            updated_at = now()
-    """
-    template = "(%s, null, null, 'Greenville', %s, %s, %s, %s::text[], %s::jsonb, %s)"
+    pins = sorted({p["pin"] for p in parcels if p["out_of_state_land"] and p.get("pin")})
     with conn.cursor() as cur:
-        for i in range(0, len(rows), UPSERT_BATCH_SIZE):
-            execute_values(cur, sql, rows[i:i + UPSERT_BATCH_SIZE], template=template,
-                           page_size=UPSERT_BATCH_SIZE)
-    print(f"  out_of_state_land: {len(rows)} lead(s) upserted")
-    return [m["pins"] for m in merged.values()]
+        cur.execute("update leads set is_out_of_state_land = true "
+                    "where pin = any(%s::text[]) and is_out_of_state_land is not true", (pins,))
+        n = cur.rowcount
+        cleared = 0
+        if full_fetch:
+            cur.execute("update leads set is_out_of_state_land = null where is_out_of_state_land is true "
+                        "and coalesce(pin, '') <> all(%s::text[])", (pins or ["__none__"],))
+            cleared = cur.rowcount
+    print(f"  out-of-state vacant land: {len(pins)} parcels, {n} newly flagged, {cleared} cleared")
+    return pins
 
 
 def log_run(conn, records_found, records_new, notes):
@@ -689,15 +662,9 @@ def main():
     conn.commit()
     run_migrations(conn)
 
-    upserted_pins = upsert_out_of_state_land(conn, processed)
-    # Expire out_of_state_land only after a sane full-county fetch (a failed
-    # layer silently returns a partial list -- see fetch_all).
-    if len(all_parcels) >= MIN_SANE_PARCELS:
-        current = [p for pins in upserted_pins for p in pins]
-        remove_tag(conn, "out_of_state_land", "coalesce(pin, '') <> all(%(cur)s::text[])",
-                   {"cur": current or ["__none__"]})
-    else:
-        print(f"  only {len(all_parcels)} parcels fetched (< {MIN_SANE_PARCELS}); skipping expiry")
+    oosl_pins = flag_out_of_state_land(conn, processed, len(all_parcels) >= MIN_SANE_PARCELS)
+    if len(all_parcels) < MIN_SANE_PARCELS:
+        print(f"  only {len(all_parcels)} parcels fetched (< {MIN_SANE_PARCELS}); skipped clearing flags")
 
     # A partial county fetch would under-count parcels per owner and wrongly
     # clear is_tired_landlord -- only enrich from a full fetch.
@@ -713,8 +680,8 @@ def main():
 
     rescore_all(conn)
     refresh_needs_review(conn)
-    log_run(conn, len(processed), len(upserted_pins),
-            f"ok: enriched {enriched} leads, {len(upserted_pins)} out_of_state_land, "
+    log_run(conn, len(processed), 0,
+            f"ok: enriched {enriched} leads, {len(oosl_pins)} out-of-state land parcels flagged, "
             f"{len(tired_owners)} tired-landlord owners, {sold_count} marked sold")
     conn.commit()
     conn.close()

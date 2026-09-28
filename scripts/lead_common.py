@@ -38,7 +38,7 @@ DISTRESS_TAGS = [
     "insurance_damage",
     "code_violation",
     "probate",
-    "out_of_state_land",
+    # "out_of_state_land" moved to the is_out_of_state_land column 2026-09-28
     # PropStream exports (propstream_import.py, added 2026-09-27)
     "pre_probate",
     "pre_foreclosure",
@@ -49,6 +49,8 @@ DISTRESS_TAGS = [
 # Retired as tags. The first three move to boolean columns; high_equity is
 # dropped entirely (no public source can show a mortgage payoff).
 RETIRED_TAGS = ["high_equity", "absentee_owner", "tired_landlord", "long_term_owner"]
+# retired 2026-09-28 by its own migration (below) -- owner fact, not distress
+RETIRED_TAGS_2 = ["out_of_state_land"]
 
 # Same street-type list merge_duplicate_addresses.py has always used.
 # "av" added 2026-09-25: the city permit feed writes "805 CRESCENT AV".
@@ -97,6 +99,9 @@ _ENTITY_RE = re.compile(r"\b(" + ENTITY_WORDS + r")\b", re.I)
 # label) is NOT residential. No code on file yet = unknown, flagged '*'.
 RESIDENTIAL_LAND_USE = ("1100", "1101", "110", "112", "1170", "1171", "1180", "9170", "9171")
 LAND_CODE_SQL = "nullif(substring(coalesce(land_use, '') from '^\\s*(\\d+)'), '')"
+# T Dawg 2026-09-28: land gets its own list; houses + multi-family on another.
+LAND_ONLY_CODES = ("1180", "9170")   # Residential Vacant, Ag Vacant
+IS_LAND_SQL = f"({LAND_CODE_SQL} in ({', '.join(repr(c) for c in LAND_ONLY_CODES)}))"
 IS_RESIDENTIAL_SQL = f"({LAND_CODE_SQL} is null or {LAND_CODE_SQL} in ({', '.join(repr(c) for c in RESIDENTIAL_LAND_USE)}))"
 
 
@@ -135,6 +140,7 @@ def ensure_schema(conn):
         cur.execute("alter table leads add column if not exists is_long_term_owner boolean")
         cur.execute("alter table leads add column if not exists owner_parcel_count integer")
         cur.execute("alter table leads add column if not exists pin text")
+        cur.execute("alter table leads add column if not exists is_out_of_state_land boolean")
         cur.execute("create index if not exists idx_leads_pin on leads(pin)")
         body = (
             "select nullif(trim(regexp_replace(regexp_replace(lower(trim(coalesce(a, ''))), "
@@ -176,6 +182,8 @@ def ensure_schema(conn):
         # out in the Supabase SQL editor. The expression must match mail_key.
         cur.execute("create index if not exists idx_leads_mail_key on leads "
                     "((lower(regexp_replace(coalesce(mailing_address, ''), '[^a-zA-Z0-9]', '', 'g'))))")
+        cur.execute("drop view if exists house_leads")
+        cur.execute("drop view if exists land_leads")
         cur.execute("drop view if exists active_leads")
         cur.execute("drop view if exists business_owned_leads")
         cur.execute(
@@ -194,6 +202,14 @@ def ensure_schema(conn):
               and {entity} and {IS_RESIDENTIAL_SQL.replace('land_use', 'l.land_use')}
             """
         )
+        # The two lists T Dawg works from (person-owned, residential):
+        #   house_leads = single family, duplex/multiplex, mobile homes,
+        #                 ag improved, and unknown land use (flagged '*')
+        #   land_leads  = residential vacant lots + ag vacant land
+        cur.execute(f"create view land_leads as select * from active_leads a "
+                    f"where {IS_LAND_SQL.replace('land_use', 'a.land_use')}")
+        cur.execute(f"create view house_leads as select * from active_leads a "
+                    f"where not coalesce({IS_LAND_SQL.replace('land_use', 'a.land_use')}, false)")
 
 
 def _batched_update(cur, set_sql, where_sql, batch_size, label):
@@ -285,6 +301,16 @@ def run_migrations(conn, batch_size=5000):
                     "or jsonb_typeof(raw->'absentee_owner'->'pin') = 'string')",
                     batch_size, "parcel number filled")
                 cur.execute("insert into pipeline_migrations (name) values ('2026_09_25_backfill_pin')")
+            if not _migration_done(cur, "2026_09_28_out_of_state_land_to_column"):
+                cur.execute("alter table leads add column if not exists is_out_of_state_land boolean")
+                cur.execute("update leads set is_out_of_state_land = true "
+                            "where 'out_of_state_land' = any(source_tags)")
+                _batched_update(
+                    cur, "source_tags = array_remove(source_tags, 'out_of_state_land')",
+                    "'out_of_state_land' = any(source_tags)", batch_size, "out_of_state_land tag -> column")
+                cur.execute("update leads set last_alerted_list_count = list_count "
+                            "where last_alerted_list_count > list_count")
+                cur.execute("insert into pipeline_migrations (name) values ('2026_09_28_out_of_state_land_to_column')")
     finally:
         conn.autocommit = old_autocommit
 
