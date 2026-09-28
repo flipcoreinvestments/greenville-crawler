@@ -60,6 +60,13 @@ from lead_common import (address_core, ensure_schema, expire_by_raw_key,  # noqa
                          is_residential, remove_tag, rescore_all)
 
 EXPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "propstream_exports")
+# WHERE THE EXPORTS LIVE (changed 2026-09-28): the GitHub repo is PUBLIC, so
+# PropStream exports (owner names, mailing addresses, deceased-owner flags)
+# must never be committed to it. T Dawg uploads them to the PRIVATE Supabase
+# Storage bucket below; this script downloads them at run time. Needs the
+# GitHub secret SUPABASE_SERVICE_KEY. The local folder still works for tests.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://izxqrskybwtqzbbbzlux.supabase.co")
+BUCKET = "propstream-exports"
 STALE_DAYS = 60
 SOLD_WINDOW_DAYS = 365
 
@@ -338,14 +345,50 @@ def run(conn, export_dir=EXPORT_DIR, today=None):
     conn.commit()
 
 
+def download_exports(dest, key=None, url=SUPABASE_URL, session=None):
+    """Copy every .xlsx/.csv in the private bucket into `dest`. Returns count."""
+    import requests
+    key = key or os.environ.get("SUPABASE_SERVICE_KEY")
+    if not key:
+        print("  SUPABASE_SERVICE_KEY is not set -- can't read the PropStream bucket")
+        return 0
+    s = session or requests.Session()
+    h = {"Authorization": f"Bearer {key}", "apikey": key}
+    r = s.post(f"{url}/storage/v1/object/list/{BUCKET}", headers=h,
+               json={"prefix": "", "limit": 1000, "sortBy": {"column": "name", "order": "asc"}}, timeout=60)
+    r.raise_for_status()
+    n = 0
+    for obj in r.json():
+        name = obj.get("name") or ""
+        if not name.lower().endswith((".xlsx", ".csv")) or "/" in name:
+            continue
+        f = s.get(f"{url}/storage/v1/object/{BUCKET}/{name}", headers=h, timeout=120)
+        f.raise_for_status()
+        with open(os.path.join(dest, os.path.basename(name)), "wb") as out:
+            out.write(f.content)
+        n += 1
+    print(f"  downloaded {n} export file(s) from the private '{BUCKET}' bucket")
+    return n
+
+
 def main():
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
         print("DATABASE_URL is not set", file=sys.stderr)
         sys.exit(1)
     conn = psycopg2.connect(db_url)
-    print(f"[{datetime.now(timezone.utc).isoformat()}] Importing PropStream exports from {EXPORT_DIR}")
-    run(conn)
+    import tempfile
+    export_dir = EXPORT_DIR
+    tmp = tempfile.mkdtemp()
+    try:
+        if download_exports(tmp):
+            export_dir = tmp
+    except Exception as e:  # bucket unreachable -> keep existing tags, don't expire anything
+        print(f"  WARNING: couldn't read the PropStream bucket ({e}); skipping import tonight")
+        conn.close()
+        return
+    print(f"[{datetime.now(timezone.utc).isoformat()}] Importing PropStream exports from {export_dir}")
+    run(conn, export_dir=export_dir)
     conn.close()
     print("Done.")
 
