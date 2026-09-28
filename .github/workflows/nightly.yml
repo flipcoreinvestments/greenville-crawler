@@ -71,6 +71,11 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/code_enforcement_ingest.py
 
+      - name: Import PropStream exports (propstream_exports/ folder)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/propstream_import.py
+
       - name: Merge duplicate-address leads (one name per list)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
