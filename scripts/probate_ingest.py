@@ -60,7 +60,14 @@ DETAILS_URL = "https://www.greenvillecounty.org/appsas400/Probate/SearchDetails.
 COUNTY_CODE = "23"
 SEQ_WIDTH = 5
 CONSECUTIVE_MISS_LIMIT = 25
-REQUEST_DELAY_SECONDS = 0.4
+REQUEST_DELAY_SECONDS = 1.5   # was 0.4: the county started answering 403 after 15 cases (run #32, 2026-09-27)
+BLOCK_BACKOFF_SECONDS = (30, 90, 240)
+NIGHTLY_LOOKUP_BUDGET = 900    # ~25 min at 1.5s; the 2024-2026 backfill finishes over ~2 weeks of nights
+
+
+class Blocked(Exception):
+    """The county site is refusing us (403/429). Stop for the night --
+    never count these as 'case doesn't exist' misses."""
 SOURCE_NAME = "probate"
 HEADERS = {
     "User-Agent": "RestartHomesResearch/1.0 (+info@restarthomes.net; one-off public-record lookup, low volume)"
@@ -98,6 +105,21 @@ def fetch_case(session, cn):
             time.sleep(2)
     if resp.status_code == 404:
         return None
+    if resp.status_code in (403, 429):
+        for wait in BLOCK_BACKOFF_SECONDS:
+            print(f"  {cn}: county site answered {resp.status_code}; waiting {wait}s and retrying", file=sys.stderr)
+            time.sleep(wait)
+            try:
+                session.get(BASE_URL, timeout=30)  # fresh cookie
+                resp = session.get(url, timeout=30)
+            except requests.RequestException:
+                continue
+            if resp.status_code not in (403, 429):
+                break
+        else:
+            raise Blocked(f"{cn}: still {resp.status_code} after backoff")
+        if resp.status_code == 404:
+            return None
     if resp.status_code != 200:
         print(f"  {cn}: unexpected status {resp.status_code}", file=sys.stderr)
         return None
@@ -399,7 +421,14 @@ def crawl_year(conn, session, year, budget):
     highest = start_seq - 1
     while misses < CONSECUTIVE_MISS_LIMIT and lookups < budget:
         cn = case_number(year, seq)
-        html = fetch_case(session, cn)
+        try:
+            html = fetch_case(session, cn)
+        except Blocked as e:
+            print(f"  STOPPED for tonight -- {e}. Resumes from {cn} next run.", file=sys.stderr)
+            log_run(conn, found, new_count,
+                    f"blocked: year:{year} high_water_seq:{highest} lookups:{lookups} found_cases:{found}")
+            conn.commit()
+            raise
         lookups += 1
         if html is None:
             misses += 1
@@ -435,7 +464,7 @@ def main():
     if not db_url:
         print("DATABASE_URL is not set", file=sys.stderr)
         sys.exit(1)
-    budget = int(os.environ.get("MAX_ROWS") or 3000)
+    budget = int(os.environ.get("MAX_ROWS") or NIGHTLY_LOOKUP_BUDGET)
     conn = psycopg2.connect(db_url)
     ensure_schema(conn)
     ensure_cases_table(conn)
@@ -447,7 +476,10 @@ def main():
     for year in range(this_year - YEARS_BACK, this_year + 1):
         if budget <= 0:
             break
-        budget -= crawl_year(conn, session, year, budget)
+        try:
+            budget -= crawl_year(conn, session, year, budget)
+        except Blocked:
+            break  # still match owners against the cases already saved
     n = match_owners_to_estates(conn)
     print(f"  owner-name matches to open estates: {n} lead(s) tagged probate")
     rescore_all(conn)

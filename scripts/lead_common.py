@@ -171,6 +171,11 @@ def ensure_schema(conn):
             f"and {mail_key.format(t='b')} = {mail_key.format(t='l')} "
             f"and coalesce(b.owner_name, '') ~* '{ENTITY_SQL}'))"
         )
+        # FIX 2026-09-27: without this index the shared-mailing check scans
+        # all ~99k rows once per lead -- the views took 5+ minutes and timed
+        # out in the Supabase SQL editor. The expression must match mail_key.
+        cur.execute("create index if not exists idx_leads_mail_key on leads "
+                    "((lower(regexp_replace(coalesce(mailing_address, ''), '[^a-zA-Z0-9]', '', 'g'))))")
         cur.execute("drop view if exists active_leads")
         cur.execute("drop view if exists business_owned_leads")
         cur.execute(

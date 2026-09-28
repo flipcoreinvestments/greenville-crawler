@@ -146,7 +146,12 @@ def parse_sale_date(html, year=None):
         except ValueError:
             continue
         before = text[max(0, m.start() - 80):m.start()].lower()
-        stamp = re.search(r"(posted|updated|published|modified|last edited)\W*(on\W*)?$", before)
+        # FIX 2026-09-27: the site's "Latest Issue September 25, 2026" masthead
+        # sits right after the "Tax Sales" menu link, so it passed as a sale
+        # date and the CURRENT 2026 list was treated as last year's sale --
+        # every tax-sale lead got repeat_tax_delinquent (1,222 of 1,222).
+        stamp = re.search(r"(posted|updated|published|modified|last edited|latest issue|issue|edition)"
+                          r"\W*(on\W*)?$", before)
         ctx = bool(re.search(r"\b(sell|sale|auction)\b", before)) and not stamp
         found.append((d, ctx))
     if not found:
@@ -318,6 +323,18 @@ REPEAT_TAG = "repeat_tax_delinquent"
 PRIOR_SALE_MAX_AGE_DAYS = 400
 
 
+def looks_like_current_list(conn, pins, threshold=0.95):
+    """Backstop for a mis-read sale date: last year's notice can't contain
+    95%+ of this year's delinquent parcels (only repeat offenders carry over)."""
+    with conn.cursor() as cur:
+        cur.execute("select regexp_replace(coalesce(raw->'tax_sale'->>'map_number', ''), '\\D', '', 'g') "
+                    "from leads where 'tax_sale' = any(source_tags) and is_sold = false")
+        current = {r[0] for r in cur.fetchall()} - {""}
+    if len(current) < 50 or not pins:
+        return False
+    return len(current & pins) / len(current) >= threshold
+
+
 def apply_repeat_tag(conn, prior):
     """prior = {digits-only map number: info} from the prior sale's notice.
     Tags leads already on the CURRENT tax sale list; expires the rest."""
@@ -398,6 +415,11 @@ def main():
             print(f"  {url}: {year} sale was {sale_date}, too old to count as 'last year', skipping")
             continue
         rows = parse_list(html)
+        pins = {re.sub(r"\D", "", r.get("map_number") or "") for r in rows} - {""}
+        if looks_like_current_list(conn, pins):
+            print(f"  {url}: its parcels match the CURRENT tax sale list almost exactly -- "
+                  f"this is this year's notice, not last year's; skipping")
+            continue
         print(f"  {url}: prior sale {sale_date}, {len(rows)} parcels advertised")
         for r in rows:
             digits = re.sub(r"\D", "", r.get("map_number") or "")
