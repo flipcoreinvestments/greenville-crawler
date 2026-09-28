@@ -210,8 +210,8 @@ def parse_case_detail(html, cn):
 
 def parse_pr(parties_text):
     """Personal Representative name/address from the PARTIES INVOLVED block
-    ("Name: BRADLEY , NICOYIA COX Party Type: Personal Representative
-    Address: 206 GREENACRE ROAD ...")."""
+    ("Name: DOE , JANE Q Party Type: Personal Representative
+    Address: 123 MAIN ST ...")."""
     m = re.search(r"Name:?\s*(.*?)\s*Party Type:?\s*Personal Representative\s*Address:?\s*(.*?)"
                   r"(?=\s*Name:|$)", parties_text or "", re.I)
     if not m:
@@ -220,7 +220,7 @@ def parse_pr(parties_text):
 
 
 def split_decedent_name(name):
-    """'MACK , CLAUDIA NANCE' -> ('MACK', 'CLAUDIA'). The court writes LAST , FIRST MIDDLE."""
+    """'DOE , JANE QUINN' -> ('DOE', 'JANE'). The court writes LAST , FIRST MIDDLE."""
     if not name or "," not in name:
         return None, None
     last, rest = name.split(",", 1)
@@ -230,7 +230,7 @@ def split_decedent_name(name):
 
 
 def decedent_middle_initial(name):
-    """'MACK , CLAUDIA NANCE' -> 'N'; 'LEISTER , VIRGIL' -> None. JR/SR/II/III/IV are suffixes, not middles."""
+    """'DOE , JANE QUINN' -> 'Q'; 'DOE , JOHN' -> None. JR/SR/II/III/IV are suffixes, not middles."""
     if not name or "," not in name:
         return None
     toks = [t for t in re.findall(r"[A-Z']+", name.split(",", 1)[1].upper())
@@ -254,8 +254,8 @@ def upsert_lead(conn, row):
     # Greenville County zips start 296.
     if not (zip_code and zip_code.startswith("296")):
         return False
-    # A PO box is a mailbox, not a property (Claudia Mack's case listed
-    # "8376 PO BOX" -- her houses are found by the owner-name match instead).
+    # A PO box is a mailbox, not a property (one real case listed
+    # a PO box -- those houses are found by the owner-name match instead).
     if re.search(r"\bP\.?\s*O\.?\s*BOX\b|\bPO BOX\b", street, re.I):
         return False
 
@@ -318,7 +318,7 @@ def log_run(conn, records_found, records_new, notes):
         )
 
 
-YEARS_BACK = 2  # estates stay open 1-3 years; Claudia Mack's (2024ES2302884) was open 22 months
+YEARS_BACK = 2  # estates stay open 1-3 years; one real 2024 estate was still open after 22 months
 
 
 def ensure_cases_table(conn):
@@ -367,11 +367,10 @@ def match_owners_to_estates(conn):
     """
     ADDED 2026-09-26. Tags an existing distress lead 'probate' when the
     county owner of record is a decedent with an open estate -- the county
-    writes owners LAST FIRST ("Mack Claudia N", "Mack Pelzier Jr Mack
-    Claudia N") and the court writes LAST , FIRST, so the match is the
-    LAST+FIRST pair appearing together in the owner name. This is how 107
-    Beechwood Ave (plus 102 Trotter St and 5 Copeland Ct) connect to
-    Claudia Nance Mack's estate; her case only listed a PO box.
+    writes owners LAST FIRST ("Doe Jane Q", "Doe John Jr Doe
+    Jane Q") and the court writes LAST , FIRST, so the match is the
+    LAST+FIRST pair appearing together in the owner name. This catches
+    estates whose court file lists only a PO box, not the house.
     Only open estates (no closed date). Name matches get the
     'probate_name_match' review flag so a common name is double-checked.
     Never creates a lead -- only tags properties already on a distress list.
@@ -405,7 +404,7 @@ def match_owners_to_estates(conn):
               and upper(coalesce(l.owner_name, '')) ~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\M')
               -- middle-initial rule: if the county lists a single-letter middle
               -- initial right after LAST FIRST, it must be the decedent's
-              -- (Leister Virgil E is not LEISTER, VIRGIL WAYNE).
+              -- (Doe John E is not DOE, JOHN WAYNE).
               and (c.decedent_middle is null
                    or upper(l.owner_name) !~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\s+[A-Z]\M')
                    or upper(l.owner_name) ~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\s+' || c.decedent_middle || '\M'))
