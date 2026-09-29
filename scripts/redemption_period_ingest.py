@@ -109,16 +109,27 @@ SALE_DATE_RE = re.compile(
 )
 
 
-def find_year_page(year):
-    """Return (url, html) for the first slug candidate that resolves, else (None, None)."""
+def find_year_page(year, attempts=3, backoff=(20, 60)):
+    """Return (url, html) for the first slug candidate that resolves, else (None, None).
+    FIX 2026-09-28: run #34 got nothing back from the Journal for BOTH years
+    (it answered fine the night before) and the old code silently reported
+    "no notice page found". Now each fetch is retried with a pause, and the
+    real status/error is printed so a block can't pass as a missing page."""
     for slug_tpl in YEAR_SLUG_CANDIDATES:
         url = f"https://greenvillejournal.com/{slug_tpl.format(year=year)}/"
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=30)
-            if resp.status_code == 200 and "tax sale" in resp.text.lower():
-                return url, resp.text
-        except requests.RequestException:
-            continue
+        for attempt in range(attempts):
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=30)
+            except requests.RequestException as e:
+                print(f"  {url}: request failed ({e.__class__.__name__}), attempt {attempt + 1}/{attempts}")
+            else:
+                if resp.status_code == 200 and "tax sale" in resp.text.lower():
+                    return url, resp.text
+                if resp.status_code == 404:
+                    break  # this slug really doesn't exist -- try the next one
+                print(f"  {url}: HTTP {resp.status_code}, attempt {attempt + 1}/{attempts}")
+            if attempt < attempts - 1:
+                time.sleep(backoff[min(attempt, len(backoff) - 1)])
     return None, None
 
 
@@ -395,6 +406,13 @@ def main():
             n = remove_tag(conn, SOURCE_NAME, "true")
             print(f"  migration: removed {n} unprovable redemption_period tag(s)")
             cur.execute("insert into pipeline_migrations (name) values ('2026_09_25_redemption_unprovable')")
+        # 2026-09-28: tags made when the CURRENT 2026 notice was misread as
+        # "last year's sale" all carry sale_year 2026 -- they prove nothing.
+        cur.execute("select 1 from pipeline_migrations where name = '2026_09_28_bad_repeat_tags'")
+        if cur.fetchone() is None:
+            n = remove_tag(conn, REPEAT_TAG, "raw->%(k)s->>'sale_year' = %(y)s", {"k": REPEAT_TAG, "y": "2026"})
+            print(f"  migration: removed {n} repeat_tax_delinquent tag(s) built from the misread 2026 notice")
+            cur.execute("insert into pipeline_migrations (name) values ('2026_09_28_bad_repeat_tags')")
     conn.commit()
 
     today = date.today()

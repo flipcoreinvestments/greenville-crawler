@@ -414,6 +414,45 @@ def match_owners_to_estates(conn):
         return cur.rowcount
 
 
+def prune_address_probate(conn):
+    """
+    ADDED 2026-09-28. The address match tags whatever property the court
+    file lists as the decedent's address. Run #34 backfilled 2024 and that
+    produced 872 probate leads, 591 of them on company-owned property --
+    the decedent RENTED there (apartments, nursing homes). Rules now:
+      - the estate must still be open (closed estate = already settled);
+      - if the county owner is known, it must contain the decedent's last
+        name (the decedent or family owns it). Unknown owner stays, flagged.
+    Owner-name matches (raw.probate.match) are checked in
+    match_owners_to_estates and are left alone here.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            update leads l set source_tags = array_remove(l.source_tags, 'probate'), updated_at = now()
+            from probate_cases c
+            where 'probate' = any(l.source_tags) and l.raw->'probate'->>'match' is null
+              and c.case_number = l.raw->'probate'->>'case_number'
+              and coalesce(c.closed_date, '') <> ''
+            """
+        )
+        closed = cur.rowcount
+        cur.execute(
+            r"""
+            update leads l set source_tags = array_remove(l.source_tags, 'probate'), updated_at = now()
+            from probate_cases c
+            where 'probate' = any(l.source_tags) and l.raw->'probate'->>'match' is null
+              and c.case_number = l.raw->'probate'->>'case_number'
+              and c.decedent_last is not null
+              and coalesce(l.owner_name, '') <> ''
+              and upper(l.owner_name) <> upper(coalesce(c.decedent_name, ''))
+              and upper(l.owner_name) !~ ('\m' || c.decedent_last || '\M')
+            """
+        )
+        tenant = cur.rowcount
+    return closed, tenant
+
+
 def crawl_year(conn, session, year, budget):
     start_seq = get_high_water_seq(conn, year) + 1
     seq, misses, lookups, found, new_count = start_seq, 0, 0, 0, 0
@@ -481,6 +520,8 @@ def main():
             break  # still match owners against the cases already saved
     n = match_owners_to_estates(conn)
     print(f"  owner-name matches to open estates: {n} lead(s) tagged probate")
+    closed, tenant = prune_address_probate(conn)
+    print(f"  probate tags removed: {closed} closed estate(s), {tenant} where the owner isn't the decedent's family")
     rescore_all(conn)
     conn.commit()
     conn.close()
