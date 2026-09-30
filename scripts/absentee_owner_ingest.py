@@ -381,7 +381,9 @@ def refresh_needs_review(conn):
     """
     Flags a lead for T Dawg to double-check before spending money on it.
     Any ONE of these triggers the '*':
-      - single_source: on only one distress list (never cross-confirmed)
+      - single_source: RECORDED only, no '*' (changed 2026-09-30: 81% of the
+        house list is on one list, so the '*' stopped meaning "check this
+        address/owner" -- which is what T Dawg's '*' rule is for)
       - missing_owner: no owner name on file
       - incomplete_address: no city or zip -- RECORDED in review_reasons but
         does NOT by itself set the '*' (it's EXPECTED for most leads since the
@@ -431,12 +433,12 @@ def refresh_needs_review(conn):
             )
             update leads l set
                 review_reasons = r.reasons,
-                needs_review = cardinality(array_remove(r.reasons, 'incomplete_address')) > 0
+                needs_review = cardinality(array_remove(array_remove(r.reasons, 'incomplete_address'), 'single_source')) > 0
             from r
             where l.id = r.id
               and (l.review_reasons is distinct from r.reasons
                    or l.needs_review is distinct from
-                      (cardinality(array_remove(r.reasons, 'incomplete_address')) > 0))
+                      (cardinality(array_remove(array_remove(r.reasons, 'incomplete_address'), 'single_source')) > 0))
             """
         )
         cur.execute(

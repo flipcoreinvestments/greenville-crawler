@@ -129,17 +129,32 @@ def fetch_case(session, cn):
 
 
 def extract_labeled_fields(text):
+    """FIX 2026-09-30: labels are matched case-insensitively. The page says
+    "Parties Involved ( 4 )", not "PARTIES INVOLVED", so the old exact match
+    missed it and "Closed Date" swallowed the whole parties block -- every
+    case looked CLOSED (3,166 of 3,166), which silently disabled all probate
+    matching, and no Personal Representative was ever parsed."""
     pattern = "|".join(re.escape(l) for l in LABELS_IN_ORDER)
-    matches = list(re.finditer(pattern, text))
+    matches = list(re.finditer(pattern, text, re.I))
+    canon = {l.lower(): l for l in LABELS_IN_ORDER}
     result = {}
     for i, m in enumerate(matches):
-        label = m.group(0)
+        label = canon[m.group(0).lower()]
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         value = text[start:end].strip(" :\n\t\r")
         if label not in result:
             result[label] = value
     return result
+
+
+_DATE_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b")
+
+
+def only_date(value):
+    """'1/2/2026 Parties Involved ( 4 )' -> '1/2/2026'; '' or junk -> None."""
+    m = _DATE_RE.search(value or "")
+    return m.group(0) if m else None
 
 
 def normalize_address(addr):
@@ -183,7 +198,12 @@ def parse_case_detail(html, cn):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ")
     text = re.sub(r"\s+", " ", text)
-    fields = extract_labeled_fields(text)
+    # everything after "Parties Involved" is the parties block (it repeats
+    # the Name/Party Type/Address labels, so it can't go through the
+    # label splitter)
+    pm = re.search(r"Parties Involved", text, re.I)
+    parties_text = text[pm.end():] if pm else ""
+    fields = extract_labeled_fields(text[:pm.start()] if pm else text)
 
     if (fields.get("Case Type") or "").strip().lower() != "estate":
         return None
@@ -197,14 +217,14 @@ def parse_case_detail(html, cn):
         "case_number": cn,
         "decedent_name": decedent_name,
         "address": address,
-        "date_of_death": fields.get("Date of Death") or None,
-        "file_date": fields.get("File Date") or None,
-        "pr_appointed_date": fields.get("PR Appointed Date") or None,
-        "closed_date": fields.get("Closed Date") or None,
+        "date_of_death": only_date(fields.get("Date of Death")),
+        "file_date": only_date(fields.get("File Date")),
+        "pr_appointed_date": only_date(fields.get("PR Appointed Date")),
+        "closed_date": only_date(fields.get("Closed Date")),
         "case_subtype": fields.get("Case SubType") or None,
-        "parties": fields.get("PARTIES INVOLVED") or None,
-        "creditor_deadline": fields.get("Expiration of Estate Creditor Claims Period") or None,
-        **parse_pr(fields.get("PARTIES INVOLVED") or ""),
+        "parties": parties_text.strip() or None,
+        "creditor_deadline": only_date(fields.get("Expiration of Estate Creditor Claims Period")),
+        **parse_pr(parties_text),
     }
 
 
@@ -338,6 +358,11 @@ def ensure_cases_table(conn):
         cur.execute("alter table probate_cases add column if not exists decedent_middle text")
         cur.execute("alter table probate_cases add column if not exists decedent_street text")
         cur.execute("alter table probate_cases add column if not exists pr_street text")
+        # 2026-09-30 repair: date columns held trailing page text (see
+        # extract_labeled_fields) -- keep only the date, blank -> NULL.
+        for col in ("closed_date", "creditor_deadline", "file_date", "date_of_death"):
+            cur.execute(f"update probate_cases set {col} = substring({col} from '\\d{{1,2}}/\\d{{1,2}}/\\d{{4}}') "
+                        f"where {col} is not null and {col} !~ '^\\d{{1,2}}/\\d{{1,2}}/\\d{{4}}$'")
 
 
 def save_case(conn, row):
@@ -427,6 +452,19 @@ def prune_address_probate(conn):
     match_owners_to_estates and are left alone here.
     """
     with conn.cursor() as cur:
+        # restore: tags wrongly pruned while every case parsed as "closed"
+        cur.execute(
+            r"""
+            update leads l set source_tags = array(select distinct unnest(l.source_tags || array['probate'])),
+                   updated_at = now()
+            from probate_cases c
+            where not ('probate' = any(l.source_tags)) and l.raw->'probate'->>'match' is null
+              and c.case_number = l.raw->'probate'->>'case_number'
+              and coalesce(c.closed_date, '') = '' and l.is_sold = false and l.is_duplicate = false
+              and (coalesce(l.owner_name, '') = '' or upper(l.owner_name) = upper(coalesce(c.decedent_name, ''))
+                   or upper(l.owner_name) ~ ('\m' || c.decedent_last || '\M'))
+            """
+        )
         cur.execute(
             """
             update leads l set source_tags = array_remove(l.source_tags, 'probate'), updated_at = now()
@@ -497,6 +535,50 @@ def crawl_year(conn, session, year, budget):
     return lookups
 
 
+def backfill_pr(conn, session, limit=60):
+    """ADDED 2026-09-30. Cases saved before the parties-block fix have no
+    Personal Representative. The PR is who you call on a probate lead, so
+    re-fetch open cases that touch a distress lead (by case number or by
+    owner name), a few dozen a night."""
+    with conn.cursor() as cur:
+        cur.execute(
+            r"""
+            select distinct c.case_number from probate_cases c
+            join leads l on l.list_count > 0 and l.is_sold = false and l.is_duplicate = false
+             and (l.raw->'probate'->>'case_number' = c.case_number
+                  or upper(coalesce(l.owner_name, '')) ~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\M'))
+            where c.pr_name is null and coalesce(c.closed_date, '') = ''
+              and c.decedent_last is not null and c.decedent_first is not null
+            limit %s
+            """, (limit,))
+        todo = [r[0] for r in cur.fetchall()]
+    done = 0
+    for cn in todo:
+        try:
+            html = fetch_case(session, cn)
+        except Blocked:
+            break
+        if html:
+            parsed = parse_case_detail(html, cn)
+            if parsed:
+                save_case(conn, parsed)
+                done += 1
+        time.sleep(REQUEST_DELAY_SECONDS)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            update leads l set raw = jsonb_set(jsonb_set(l.raw, '{probate,pr_name}', to_jsonb(c.pr_name)),
+                                               '{probate,pr_address}', to_jsonb(coalesce(c.pr_address, '')))
+            from probate_cases c
+            where c.case_number = l.raw->'probate'->>'case_number' and c.pr_name is not null
+              and coalesce(l.raw->'probate'->>'pr_name', '') = ''
+            """
+        )
+    conn.commit()
+    print(f"  personal representative filled for {done} of {len(todo)} open case(s)")
+    return done
+
+
 def main():
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
@@ -520,6 +602,7 @@ def main():
             break  # still match owners against the cases already saved
     n = match_owners_to_estates(conn)
     print(f"  owner-name matches to open estates: {n} lead(s) tagged probate")
+    backfill_pr(conn, session)
     closed, tenant = prune_address_probate(conn)
     print(f"  probate tags removed: {closed} closed estate(s), {tenant} where the owner isn't the decedent's family")
     rescore_all(conn)

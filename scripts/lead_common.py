@@ -301,6 +301,11 @@ def run_migrations(conn, batch_size=5000):
                     "or jsonb_typeof(raw->'absentee_owner'->'pin') = 'string')",
                     batch_size, "parcel number filled")
                 cur.execute("insert into pipeline_migrations (name) values ('2026_09_25_backfill_pin')")
+            if not _migration_done(cur, "2026_09_30_drop_legacy_foreclosure_tag"):
+                # one row still carried the pre-2026-09-23 'foreclosure' tag
+                cur.execute("update leads set source_tags = array_remove(source_tags, 'foreclosure') "
+                            "where 'foreclosure' = any(source_tags)")
+                cur.execute("insert into pipeline_migrations (name) values ('2026_09_30_drop_legacy_foreclosure_tag')")
             if not _migration_done(cur, "2026_09_28_out_of_state_land_to_column"):
                 cur.execute("alter table leads add column if not exists is_out_of_state_land boolean")
                 cur.execute("update leads set is_out_of_state_land = true "
