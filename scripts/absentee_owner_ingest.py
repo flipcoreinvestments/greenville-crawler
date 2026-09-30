@@ -414,7 +414,9 @@ def refresh_needs_review(conn):
                          and lower(regexp_replace(mailing_address, '[^a-zA-Z0-9]', '', 'g'))
                            = lower(regexp_replace(address, '[^a-zA-Z0-9]', '', 'g'))
                          and is_absentee = true then 'absentee_flag_but_same_address' end,
-                    case when address ~* '\mnone\M' then 'corrupted_address' end,
+                    -- 2026-09-30: also no real street name ("9 A" from a PropStream row)
+                    case when address ~* '\mnone\M' or address !~* '^\s*\d+\S*\s+.*[a-z]{2,}'
+                         then 'corrupted_address' end,
                     case when mailing_address is not null
                          and mailing_address !~* '^\s*(\d|p\.?\s*o\.?\s*box\M)'
                          then 'invalid_mailing_address' end,

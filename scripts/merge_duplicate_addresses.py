@@ -35,12 +35,13 @@ scans (as either side of a pair), so re-running this never reprocesses or
 re-merges anything.
 """
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
-from lead_common import ensure_schema, rescore_all  # noqa: E402
+from lead_common import SUFFIXES, ensure_schema, rescore_all  # noqa: E402
 
 
 def ensure_columns(conn):
@@ -99,6 +100,62 @@ def find_pairs(conn):
             """
         )
         return cur.fetchall()
+
+
+def find_pin_pairs(conn):
+    """
+    ADDED 2026-09-30: two rows with the SAME parcel number whose addresses
+    differ only by a direction/street type the core match can't see --
+    "218 S Moore Rd" / "218 Moore", "209 W Park Ave" / "209 Park" (76 such
+    parcels live on 2026-09-30). Different house numbers on one parcel
+    ("192 Lightning Ln" / "186 Lightening Ln") are NOT merged -- see
+    same_street().
+    Canonical = the row updated most recently (the address the source uses
+    today). Only parcels with exactly two active rows; 3+ is left alone.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            with a as (
+                select id, address, pin, updated_at, list_count,
+                       count(*) over (partition by pin) as n,
+                       row_number() over (partition by pin order by updated_at desc nulls last,
+                                          length(address) desc, id) as rk
+                from leads
+                where is_sold = false and is_duplicate = false and pin is not null and pin <> ''
+            )
+            select c.id as canonical_id, c.address as canonical_address,
+                   r.id as redundant_id, r.address as redundant_address
+            from a c join a r on r.pin = c.pin and c.rk = 1 and r.rk = 2
+            where c.n = 2 and (c.list_count > 0 or r.list_count > 0)
+            """
+        )
+        return [p for p in cur.fetchall() if same_street(p["canonical_address"], p["redundant_address"])]
+
+
+_DIRS = {"n", "s", "e", "w", "north", "south", "east", "west"}
+_SUFFIX_WORDS = set(SUFFIXES.split("|"))
+
+
+def same_street(a, b):
+    """Same house number (00003 == 3) and the shorter address's street words
+    are all in the longer one, ignoring N/S/E/W and Rd/St/Ave...
+    '209 Park' ~ '209 W Park Ave' yes; '9 Alex' ~ '517 Hampton Townes' no;
+    '192 Lightning Ln' ~ '186 Lightening Ln' no (left for a human)."""
+    def parts(x, drop_dirs):
+        toks = re.findall(r"[a-z0-9]+", (x or "").lower())
+        if not toks or not toks[0].isdigit():
+            return None, set()
+        drop = _SUFFIX_WORDS | (_DIRS if drop_dirs else set())
+        return int(toks[0]), {t for t in toks[1:] if t not in drop}
+    for drop_dirs in (True, False):   # "1820 North" -- the street IS a direction word
+        na, ta = parts(a, drop_dirs)
+        nb, tb = parts(b, drop_dirs)
+        if na is None or na != nb:
+            return False
+        if ta and tb:
+            return ta <= tb or tb <= ta
+    return False
 
 
 def merge_pair(conn, canonical_id, redundant_id):
@@ -173,6 +230,8 @@ def main():
     conn.commit()
 
     pairs = find_pairs(conn)
+    seen = {p["redundant_id"] for p in pairs} | {p["canonical_id"] for p in pairs}
+    pairs += [p for p in find_pin_pairs(conn) if p["redundant_id"] not in seen and p["canonical_id"] not in seen]
     print(f"[{datetime.now(timezone.utc).isoformat()}] Found {len(pairs)} duplicate-address pair(s) to merge.")
 
     merged_ids = []

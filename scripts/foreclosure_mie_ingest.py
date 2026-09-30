@@ -328,6 +328,30 @@ def log_run(conn, records_found, records_new, notes):
         )
 
 
+CREDITS_PER_RUN = 150  # 1 list page + ~5 sale dates, 25 credits each (residential pool)
+
+
+def scrapfly_credits(conn, api_key):
+    """Remaining Scrapfly credits (None if the account endpoint fails).
+    Endpoint per https://scrapfly.io/docs/account: subscription.usage.scrape."""
+    try:
+        r = requests.get("https://api.scrapfly.io/account", params={"key": api_key}, timeout=30)
+        r.raise_for_status()
+        sub = r.json().get("subscription") or {}
+        use = (sub.get("usage") or {}).get("scrape") or {}
+        remaining = int(use.get("remaining"))
+        note = (f"remaining={remaining} of limit={use.get('limit')} plan={sub.get('plan_name')} "
+                f"period_end={(sub.get('period') or {}).get('end')}")
+    except Exception as e:
+        print(f"  could not read Scrapfly balance: {e}")
+        return None
+    print(f"  Scrapfly credits: {note}")
+    with conn.cursor() as cur:
+        cur.execute("insert into source_runs (source_name, records_found, records_new, notes) "
+                    "values ('scrapfly_credits', %s, 0, %s)", (remaining, note))
+    return remaining
+
+
 def main():
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
@@ -342,6 +366,20 @@ def main():
 
     conn = psycopg2.connect(db_url)
     ensure_schema(conn)
+
+    # ADDED 2026-09-30: record the Scrapfly balance every run (the nightly
+    # system_health.txt reads it) and don't start a run that can't finish.
+    # The free tier is 1,000 credits ONE TIME -- they never refill.
+    remaining = scrapfly_credits(conn, scrapfly_key)
+    conn.commit()
+    if remaining is not None and remaining < CREDITS_PER_RUN:
+        print(f"  ERROR: only {remaining} Scrapfly credits left, a run needs ~{CREDITS_PER_RUN}. "
+              "Add credits or upgrade the Scrapfly plan; foreclosure data is frozen until then.",
+              file=sys.stderr)
+        log_run(conn, 0, 0, f"skipped: scrapfly credits {remaining} < {CREDITS_PER_RUN}")
+        conn.commit()
+        conn.close()
+        sys.exit(1)
 
     # FIX 2026-09-25: once the auction date has passed the property is no
     # longer "scheduled for foreclosure sale" -- expire the tag (a sale at

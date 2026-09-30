@@ -210,6 +210,22 @@ def upsert_lead(conn, address, owner_name, mailing_address, is_absentee, amount_
 
 # rescore_all now lives in lead_common.py (one shared formula for every script).
 
+
+REDEMPTION_WINDOW = "13 months"  # SC Code 12-51-90: 12 months to redeem, +1 month slack
+
+
+def expire_post_sale(conn):
+    """ADDED 2026-09-30. After the sale the county takes the list down, so
+    the 'no longer on the list' expiry below can't run (an empty list is
+    treated as a failed fetch). Without this, tax_sale tags would never
+    expire. A lead is dropped once it hasn't been on a county list for 13
+    months -- past the 12-month redemption period."""
+    n = remove_tag(conn, SOURCE_NAME,
+                   "(raw->'tax_sale'->>'fetched_at') is not null "
+                   f"and (raw->'tax_sale'->>'fetched_at')::timestamptz < now() - interval '{REDEMPTION_WINDOW}'")
+    print(f"  expired tax_sale from {n} lead(s) last on a county list over {REDEMPTION_WINDOW} ago")
+    return n
+
 def log_run(conn, records_found, records_new, notes):
     with conn.cursor() as cur:
         cur.execute(
@@ -235,9 +251,15 @@ def main():
         print(f"MAX_ROWS set — processing only the first {len(rows)}.")
 
     if not rows:
-        print("No rows parsed — the county likely changed the page layout. Check the HTML structure.")
+        print("No rows parsed. Either the sale has been held and the county took the list down "
+              "(normal after the October sale), or the page layout changed.")
+        print("  Keeping every tax_sale lead as-is: an owner whose parcel sold has 12 months to redeem "
+              "and is still the owner of record. Tags expire 13 months after they were last on the list.")
         conn = psycopg2.connect(db_url)
-        log_run(conn, 0, 0, "parse_list returned 0 rows — page layout may have changed")
+        ensure_schema(conn)
+        if expire_post_sale(conn):
+            rescore_all(conn)
+        log_run(conn, 0, 0, "parse_list returned 0 rows — post-sale (list taken down) or layout change")
         conn.commit()
         conn.close()
         return
@@ -308,6 +330,7 @@ def main():
     # Skipped on MAX_ROWS test runs (partial list).
     if not max_rows:
         expire_by_raw_key(conn, SOURCE_NAME, SOURCE_NAME, "map_number", [r["map_number"] for r in rows])
+    expire_post_sale(conn)
 
     rescore_all(conn)
     log_run(conn, len(rows), new_count, "ok")
