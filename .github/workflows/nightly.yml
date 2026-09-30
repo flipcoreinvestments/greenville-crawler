@@ -17,6 +17,9 @@ on:
         description: "Optional: limit how many parcels to process (leave blank for all)"
         required: false
 
+# 2026-09-30: every source step has `if: !cancelled()` -- if one county
+# site is down, the other sources, the merge and the call-list export still
+# run. The run still shows red so the failure is visible.
 jobs:
   ingest:
     runs-on: ubuntu-latest
@@ -34,55 +37,78 @@ jobs:
         run: playwright install --with-deps chromium
 
       - name: Run tax sale ingest
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MAX_ROWS: ${{ github.event.inputs.max_rows }}
         run: python scripts/tax_sale_ingest.py
 
       - name: Run tax sale redemption period ingest
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MAX_ROWS: ${{ github.event.inputs.max_rows }}
         run: python scripts/redemption_period_ingest.py
 
       - name: Run building permits (expired/demolition) ingest
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/building_permits_ingest.py
 
       - name: Run absentee owner + tired landlord ingest
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/absentee_owner_ingest.py
 
       - name: Backfill land_use for every lead (property type filter coverage)
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/backfill_land_use.py
 
       - name: Run probate ingest
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MAX_ROWS: ${{ github.event.inputs.max_rows }}
         run: python scripts/probate_ingest.py
 
       - name: Run code enforcement (unfit structures) ingest
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/code_enforcement_ingest.py
 
       - name: Import PropStream exports (private Supabase bucket)
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python scripts/propstream_import.py
 
+      - name: Fill property city/zip (U.S. Census geocoder, for skip tracing)
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/fill_city_zip.py
+
       - name: Merge duplicate-address leads (one name per list)
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/merge_duplicate_addresses.py
 
       - name: Alert on leads newly stacked on 2+ lists
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/alert_stacked_leads.py
+
+      - name: Write call lists + system health (private Supabase bucket lead-exports)
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/export_call_lists.py
