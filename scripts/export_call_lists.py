@@ -67,7 +67,31 @@ REVIEW_LABELS = {
     "probate_name_match": "probate matched by owner name -- confirm it's the same person",
 }
 
+# GHL (added 2026-10-01). Column names match T Dawg's GHL custom fields in
+# the "Lead Intel" folder EXACTLY, and the dropdown values match the options
+# she created, so the GHL import maps them with no manual work.
+GHL_LIST_OPTIONS = {
+    "tax_sale": "Tax Sale",
+    "repeat_tax_delinquent": "Tax Sale 2+ Years",
+    "foreclosure_mie": "Foreclosure Auction",
+    "hoa_foreclosure": "HOA Foreclosure",
+    "pre_foreclosure": "Pre-Foreclosure",
+    "probate": "Probate",
+    "pre_probate": "Pre-Probate",
+    "permit_expired": "Expired Permit",
+    "permit_demolition": "Demolition Permit",
+    "insurance_damage": "Damage Permit",
+    "code_violation": "Code Violation",
+    "involuntary_lien": "Involuntary Lien",
+    "failed_listing": "Failed Listing",
+}
+# order the Call Brief mentions lists in: most urgent first
+BRIEF_ORDER = ["foreclosure_mie", "hoa_foreclosure", "pre_foreclosure", "probate", "pre_probate",
+               "tax_sale", "repeat_tax_delinquent", "code_violation", "permit_demolition",
+               "insurance_damage", "permit_expired", "involuntary_lien", "failed_listing"]
+
 COLUMNS = [
+    "Call Brief", "Distress List", "Owner Situation", "Decision Maker", "Tags",
     "Rank", "Flag", "Score", "Property Address", "Property City", "Property State", "Property Zip",
     "Owner Name", "Mailing Address", "Mailing State", "Mailing Zip",
     "Lists", "List Count", "Tax Owed", "Years on Tax Sale List", "Tax Sale Status", "Foreclosure Auction Date",
@@ -116,6 +140,96 @@ def tax_sale_years(raw, tags):
     return f"{len(years)} ({', '.join(str(y) for y in years)})"
 
 
+def money(v):
+    return f"${float(v):,.0f}" if re.match(r"^\d+(\.\d+)?$", str(v or "")) else ""
+
+
+def owner_situation(r, mail_state):
+    out = []
+    if r.get("is_vacant") is True:
+        out.append("Vacant")
+    if r.get("is_absentee") is True:
+        out.append("Absentee")
+    if r.get("is_tired_landlord") is True:
+        out.append("Tired Landlord")
+    if r.get("is_out_of_state_land") is True or (mail_state and mail_state != "SC"):
+        out.append("Out-of-State")
+    if r.get("has_assumable_loan") is True:
+        out.append("Assumable Loan")
+    return out
+
+
+def call_brief(r, tags, raw, mail_state, reasons):
+    """2-4 plain sentences, most urgent first, built only from what the
+    lists say. Never guesses."""
+    t = set(tags)
+    parts = []
+    for tag in BRIEF_ORDER:
+        if tag not in t:
+            continue
+        if tag == "foreclosure_mie":
+            d = (raw.get("foreclosure_mie") or {}).get("sale_date")
+            parts.append(f"FORECLOSURE AUCTION {d}." if d else "FORECLOSURE AUCTION scheduled.")
+        elif tag == "hoa_foreclosure":
+            parts.append("The HOA is the one foreclosing.")
+        elif tag == "pre_foreclosure":
+            parts.append("PRE-FORECLOSURE: lender filed a default.")
+        elif tag == "probate":
+            pb = raw.get("probate") or {}
+            s = "PROBATE: owner died" + (f" {pb['date_of_death']}." if pb.get("date_of_death") else ".")
+            if pb.get("pr_name"):
+                s += f" Call the personal representative, {pb['pr_name']}" + \
+                     (f", {pb['pr_address']}." if pb.get("pr_address") else ".")
+            else:
+                s += " Estate is open; personal representative not on file yet."
+            parts.append(s)
+        elif tag == "pre_probate" and "probate" not in t:
+            parts.append("Owner on title is deceased (no estate opened yet).")
+        elif tag == "tax_sale":
+            amt = money((raw.get("tax_sale") or {}).get("amount_due"))
+            yrs = sorted({int(y) for y in raw.get("tax_sale_years") or []})
+            s = "TAX SALE" + (f": owes {amt} in back taxes" if amt else "")
+            if len(yrs) > 1:
+                s += f", on the county tax sale list {len(yrs)} years ({yrs[0]}-{yrs[-1]})"
+            s += "."
+            status = tax_sale_status(raw, tags)
+            if status.startswith("Sale held"):
+                s += " " + status.replace(" -- ", ": ") + "."
+            parts.append(s)
+        elif tag == "repeat_tax_delinquent" and not raw.get("tax_sale_years"):
+            parts.append("Also on last year's tax sale list.")
+        elif tag == "code_violation":
+            parts.append("Code violation: county/city found the house unfit to live in.")
+        elif tag == "permit_demolition":
+            parts.append("Demolition permit filed.")
+        elif tag == "insurance_damage":
+            parts.append("Repair permit for storm, fire or water damage.")
+        elif tag == "permit_expired":
+            parts.append("Building permit expired or stalled (unfinished work).")
+        elif tag == "involuntary_lien":
+            parts.append("Involuntary lien recorded (HOA, contractor, utility or child support).")
+        elif tag == "failed_listing":
+            parts.append("Listed on the MLS and didn't sell.")
+    extra = []
+    if r.get("is_vacant") is True:
+        extra.append("House shows vacant (USPS)")
+    if mail_state and mail_state != "SC":
+        extra.append(f"owner lives out of state ({mail_state})")
+    elif r.get("is_absentee") is True:
+        extra.append("owner doesn't live there")
+    if r.get("is_tired_landlord") is True:
+        n = r.get("owner_parcel_count")
+        extra.append(f"owner holds {n} properties" if n else "owner holds 3+ properties")
+    if r.get("has_assumable_loan") is True:
+        extra.append("assumable FHA/VA/USDA loan")
+    if extra:
+        e = "; ".join(extra)
+        parts.append(e[0].upper() + e[1:] + ".")
+    if reasons:
+        parts.append("CHECK FIRST: " + "; ".join(reasons) + ".")
+    return " ".join(parts)
+
+
 def lead_rows(conn, view):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
@@ -143,7 +257,16 @@ def to_csv(rows, today):
         reasons = [REVIEW_LABELS.get(x, x.replace("_", " ")) for x in (r.get("review_reasons") or [])
                    if x not in ("single_source", "incomplete_address")]
         flag = "***" if r.get("triple") else ("*" if r.get("needs_review") else "")
+        ordered = [x for x in BRIEF_ORDER if x in tags]
+        decision = ""
+        if "probate" in tags and probate.get("pr_name"):
+            decision = probate["pr_name"] + (f", {probate['pr_address']}" if probate.get("pr_address") else "")
         w.writerow([
+            call_brief(r, tags, raw, mst, reasons),
+            ", ".join(GHL_LIST_OPTIONS[x] for x in ordered),
+            ", ".join(owner_situation(r, mst)),
+            decision,
+            ", ".join("list-" + re.sub(r"[^a-z0-9]+", "-", GHL_LIST_OPTIONS[x].lower()).strip("-") for x in ordered),
             i, flag, int(r.get("score") or 0), r["address"], (r.get("city") or "").title(),
             r.get("state") or "SC", r.get("zip") or "",
             r.get("owner_name") or "", r.get("mailing_address") or "", mst, mzip,
