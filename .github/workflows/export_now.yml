@@ -1,0 +1,30 @@
+name: Export call lists now (on demand)
+
+# Rebuilds house_leads.csv / land_leads.csv / system_health.txt in the
+# private Supabase bucket lead-exports from what's already in the database,
+# in about a minute -- no 3-hour county pull. Added 2026-10-01.
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: leads-database
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary requests
+
+      - name: Write call lists + system health
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/export_call_lists.py
