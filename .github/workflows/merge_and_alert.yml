@@ -3,6 +3,13 @@ name: Merge duplicates & alert on stacked leads (on demand)
 on:
   workflow_dispatch: {}
 
+# Only one workflow touches the database at a time (added 2026-10-01): the
+# Sep 28 weekly foreclosure run started while the nightly run held the leads
+# table and died on a statement timeout. A second run now waits its turn.
+concurrency:
+  group: leads-database
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest

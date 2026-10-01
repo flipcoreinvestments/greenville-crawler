@@ -11,11 +11,18 @@ name: Weekly foreclosure (Master-in-Equity) ingest
 
 on:
   schedule:
-    # 10:17 UTC every Monday (~6:17 AM Eastern). Offset a few minutes past
-    # the hour on purpose -- avoids the exact-top-of-hour pile-up on
-    # GitHub's shared runners.
-    - cron: "17 10 * * 1"
+    # 14:17 UTC every Monday (~10:17 AM Eastern) -- moved 2026-10-01 from
+    # 10:17 UTC, which collided with the nightly run (10:00 UTC, ~3 hours).
+    # Offset past the hour to avoid GitHub's top-of-hour pile-up.
+    - cron: "17 14 * * 1"
   workflow_dispatch: {}
+
+# Only one workflow touches the database at a time (added 2026-10-01): the
+# Sep 28 weekly foreclosure run started while the nightly run held the leads
+# table and died on a statement timeout. A second run now waits its turn.
+concurrency:
+  group: leads-database
+  cancel-in-progress: false
 
 jobs:
   ingest:
