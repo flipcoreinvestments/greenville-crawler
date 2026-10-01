@@ -94,7 +94,7 @@ COLUMNS = [
     "Call Brief", "Distress List", "Owner Situation", "Decision Maker", "Tags",
     "Rank", "Flag", "Score", "Property Address", "Property City", "Property State", "Property Zip",
     "Owner Name", "Mailing Address", "Mailing State", "Mailing Zip",
-    "Lists", "List Count", "Tax Owed", "Years on Tax Sale List", "Tax Sale Status", "Foreclosure Auction Date",
+    "List Count", "Tax Owed", "Years on Tax Sale List", "Tax Sale Status", "Foreclosure Auction Date",
     "Personal Representative", "PR Address", "Date of Death",
     "Vacant (USPS)", "Absentee Owner", "Tired Landlord", "Out-of-State Owner", "Assumable Loan",
     "Land Use", "Parcel #", "Check Before Calling", "Exported",
@@ -296,7 +296,7 @@ def to_csv(rows, today):
             i, flag, int(r.get("score") or 0), r["address"], (r.get("city") or "").title(),
             r.get("state") or "SC", r.get("zip") or "",
             r.get("owner_name") or "", r.get("mailing_address") or "", mst, mzip,
-            "; ".join(LIST_LABELS.get(t, t) for t in tags), r.get("list_count") or 0,
+            r.get("list_count") or 0,  # "Lists" column removed 2026-10-01: duplicated Distress List
             f"${float(amount):,.2f}" if re.match(r"^\d+(\.\d+)?$", str(amount)) else "",
             tax_sale_years(raw, tags),
             tax_sale_status(raw, tags),
