@@ -70,7 +70,7 @@ REVIEW_LABELS = {
 COLUMNS = [
     "Rank", "Flag", "Score", "Property Address", "Property City", "Property State", "Property Zip",
     "Owner Name", "Mailing Address", "Mailing State", "Mailing Zip",
-    "Lists", "List Count", "Tax Owed", "Tax Sale Status", "Foreclosure Auction Date",
+    "Lists", "List Count", "Tax Owed", "Years on Tax Sale List", "Tax Sale Status", "Foreclosure Auction Date",
     "Personal Representative", "PR Address", "Date of Death",
     "Vacant (USPS)", "Absentee Owner", "Tired Landlord", "Out-of-State Owner", "Assumable Loan",
     "Land Use", "Parcel #", "Check Before Calling", "Exported",
@@ -103,6 +103,17 @@ def tax_sale_status(raw, tags):
         return "On county tax sale list"
     return (f"Sale held -- last on county list {seen:%m/%d/%Y}; owner has 12 months "
             f"from the sale to redeem")
+
+
+def tax_sale_years(raw, tags):
+    """'3 (2024, 2025, 2026)'. Published notices only go back to 2024, so
+    3 means 'at least 3'."""
+    if "tax_sale" not in tags:
+        return ""
+    years = sorted({int(y) for y in (raw or {}).get("tax_sale_years") or []})
+    if not years:
+        return ""
+    return f"{len(years)} ({', '.join(str(y) for y in years)})"
 
 
 def lead_rows(conn, view):
@@ -138,6 +149,7 @@ def to_csv(rows, today):
             r.get("owner_name") or "", r.get("mailing_address") or "", mst, mzip,
             "; ".join(LIST_LABELS.get(t, t) for t in tags), r.get("list_count") or 0,
             f"${float(amount):,.2f}" if re.match(r"^\d+(\.\d+)?$", str(amount)) else "",
+            tax_sale_years(raw, tags),
             tax_sale_status(raw, tags),
             ((raw.get("foreclosure_mie") or {}).get("sale_date") or "") if "foreclosure_mie" in tags else "",
             (probate.get("pr_name") or "") if "probate" in tags else "",

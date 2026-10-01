@@ -374,6 +374,47 @@ def apply_repeat_tag(conn, prior):
     return added, n
 
 
+HISTORY_FIRST_YEAR = 2024  # the Journal's 2022/2023 notice pages carry no table (checked 2026-10-01)
+
+
+def pin13(map_number):
+    """Digits only, left-padded to 13: the 2024 notice drops leading zeros
+    ('153000700200' is county map 0153000700200)."""
+    d = re.sub(r"\D", "", map_number or "")
+    return d.zfill(13) if d and len(d) <= 13 else d
+
+
+def apply_tax_sale_years(conn, history):
+    """ADDED 2026-10-01 (T Dawg: "we want to know how long they've been on
+    the tax sale list"). history = {13-digit pin: {years seen on a published
+    notice}}. Writes raw.tax_sale_years = every notice year the parcel was on,
+    plus the year it was last seen on the county's current list. Only leads
+    tagged tax_sale. Info only -- no tag, no score change."""
+    with conn.cursor() as cur:
+        cur.execute("create temporary table notice_years (pin text primary key, years int[]) on commit drop")
+        execute_values(cur, "insert into notice_years values %s",
+                       [(k, sorted(v)) for k, v in history.items()])
+        cur.execute(
+            r"""
+            with t as (
+                select l.id,
+                       array(select distinct y from unnest(
+                           coalesce(n.years, '{}'::int[])
+                           || array[extract(year from coalesce((l.raw->'tax_sale'->>'fetched_at')::timestamptz, now()))::int]
+                       ) y order by y) as years
+                from leads l
+                left join notice_years n
+                  on n.pin = lpad(regexp_replace(coalesce(l.raw->'tax_sale'->>'map_number', ''), '\D', '', 'g'), 13, '0')
+                where 'tax_sale' = any(l.source_tags)
+            )
+            update leads l set raw = jsonb_set(coalesce(l.raw, '{}'::jsonb), '{tax_sale_years}', to_jsonb(t.years))
+            from t
+            where l.id = t.id and (l.raw->'tax_sale_years') is distinct from to_jsonb(t.years)
+            """
+        )
+        return cur.rowcount
+
+
 def main():
     """
     REWRITE 2026-09-25 -- "redemption_period" retired, "repeat_tax_delinquent"
@@ -443,6 +484,28 @@ def main():
             digits = re.sub(r"\D", "", r.get("map_number") or "")
             if digits:
                 prior[digits] = {"sale_year": year, "sale_date": sale_date.isoformat(), "amount": r.get("amount_due")}
+
+    # Older notices, for "how many years on the tax sale list" (info only).
+    history = {}
+    for k, v in prior.items():
+        history.setdefault(pin13(k), set()).add(v["sale_year"])
+    for year in range(HISTORY_FIRST_YEAR, today.year - 1):
+        url, html = find_year_page(year)
+        rows = parse_list(html) if url else []
+        pins = {pin13(r.get("map_number")) for r in rows} - {""}
+        if not pins:
+            print(f"  {year} notice: no parcel table found, not counted")
+            continue
+        if looks_like_current_list(conn, pins):
+            print(f"  {year} notice matches the current list almost exactly -- skipped")
+            continue
+        print(f"  {year} notice: {len(pins)} parcels (history only)")
+        for pn in pins:
+            history.setdefault(pn, set()).add(year)
+    if history:
+        n_years = apply_tax_sale_years(conn, history)
+        print(f"  tax_sale_years written on {n_years} lead(s)")
+        conn.commit()
 
     if not prior:
         print("  no prior-year notice available this run; repeat_tax_delinquent left unchanged")
