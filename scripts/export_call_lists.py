@@ -98,6 +98,7 @@ COLUMNS = [
     "Personal Representative", "PR Address", "Date of Death",
     "Vacant (USPS)", "Absentee Owner", "Tired Landlord", "Out-of-State Owner", "Assumable Loan",
     "Land Use", "Parcel #", "Check Before Calling", "Exported",
+    "Last Sale Amount", "Last Recorded Sale Date",
 ]
 
 MAIL_TAIL = re.compile(r",?\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?\s*$", re.I)
@@ -138,6 +139,31 @@ def tax_sale_years(raw, tags):
     if not years:
         return ""
     return f"{len(years)} ({', '.join(str(y) for y in years)})"
+
+
+def last_sale(raw):
+    """(amount, date) of the last recorded deed, from the county parcel
+    record (raw.absentee_owner). Under $1,000 is a family/quitclaim transfer,
+    not a purchase price, and is labeled so. 1970 dates are the old parse bug
+    (fixed 2026-10-01) and are left blank until the next nightly refresh."""
+    a = (raw or {}).get("absentee_owner") or {}
+    price, d = a.get("sale_price"), str(a.get("deed_date") or "")[:10]
+    if d.startswith("1970"):
+        d = ""
+    if d:
+        try:
+            d = datetime.strptime(d, "%Y-%m-%d").strftime("%m/%d/%Y")
+        except ValueError:
+            d = ""
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return "", d
+    if p <= 0:
+        return "$0 (no sale price recorded)", d
+    if p < 1000:
+        return f"${p:,.0f} (family/quitclaim transfer, not a sale)", d
+    return f"${p:,.0f}", d
 
 
 def money(v):
@@ -281,6 +307,7 @@ def to_csv(rows, today):
             yn(r.get("is_vacant")), yn(r.get("is_absentee")), yn(r.get("is_tired_landlord")),
             yn(r.get("is_out_of_state_land")), yn(r.get("has_assumable_loan")),
             r.get("land_use") or "", r.get("pin") or "", "; ".join(reasons), today.isoformat(),
+            *last_sale(raw),
         ])
     return buf.getvalue()
 

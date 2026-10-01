@@ -182,7 +182,15 @@ def normalize_deed_date(v):
     if v is None or v == "":
         return None
     try:
+        # FIX 2026-10-01: the CITY layer's DEEDTE is an integer YYYYMMDD
+        # (20210521), not epoch ms -- read as ms it became 1970-01-01 for
+        # every city parcel, so "sold recently" never fired there and every
+        # city owner looked like a 50-year owner.
+        if isinstance(v, (int, float)) and 18000101 <= v <= 21001231:
+            return datetime.strptime(str(int(v)), "%Y%m%d").date().isoformat()
         if isinstance(v, (int, float)):
+            if v <= 0:
+                return None
             return datetime.fromtimestamp(v / 1000, tz=timezone.utc).date().isoformat()
         if isinstance(v, str):
             return v.strip()[:10] or None
