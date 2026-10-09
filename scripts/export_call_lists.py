@@ -33,6 +33,7 @@ import psycopg2
 import psycopg2.extras
 
 from lead_common import ensure_schema
+from skiptrace_prep import compute_skiptrace_identity
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://izxqrskybwtqzbbbzlux.supabase.co")
 BUCKET = "lead-exports"
@@ -94,10 +95,24 @@ COLUMNS = [
     "Call Brief", "Distress List", "Owner Situation", "Decision Maker", "Tags",
     "Rank", "Flag", "Score", "Property Address", "Property City", "Property State", "Property Zip",
     "Owner Name", "Mailing Address", "Mailing State", "Mailing Zip",
+    # Added 2026-10-09 (T Dawg's ask): the address/name to upload into the
+    # skip-trace/dialer platform -- swapped to the Personal Representative
+    # (probate) or the owner's own mailing address (land with no house
+    # number) so skip trace doesn't search the dead owner or an unmailable
+    # address. See skiptrace_prep.py. Property Address/Owner Name above are
+    # never touched -- those stay accurate for calling.
+    "Skiptrace First Name", "Skiptrace Last Name", "Skiptrace Address", "Skiptrace State", "Skiptrace Zip",
     "List Count", "Tax Owed", "Years on Tax Sale List", "Tax Sale Status", "Foreclosure Auction Date",
     "Personal Representative", "PR Address", "Date of Death",
     "Vacant (USPS)", "Absentee Owner", "Tired Landlord", "Out-of-State Owner", "Assumable Loan",
     "Land Use", "Parcel #", "Check Before Calling", "Exported",
+    # Added 2026-10-09 (T Dawg's ask): show whether a lead was already
+    # skip-traced so the same address is never paid for twice. Read from
+    # leads.skiptrace_status / skiptrace_date (set when a trace batch is
+    # marked, e.g. her 10.7.26 batch: 199 traced, 201 failed). NOT stamped
+    # by this export -- the nightly run exports every lead every night, so
+    # an export stamp would mark everything "pulled" after one night.
+    "Skip-Traced", "Last Skip-Traced",
     "Last Sale Amount", "Last Recorded Sale Date",
 ]
 
@@ -252,7 +267,15 @@ def call_brief(r, tags, raw, mail_state, reasons):
         e = "; ".join(extra)
         parts.append(e[0].upper() + e[1:] + ".")
     if reasons:
-        parts.append("CHECK FIRST: " + "; ".join(reasons) + ".")
+        # CONVENTION CHANGE (2026-10-09, T Dawg's explicit ask): any lead we
+        # couldn't verify accurately gets the literal phrase "NEED TO VERIFY
+        # LEAD" worked into the Call Brief text, instead of a leading
+        # asterisk on the address -- so whoever is calling sees it right in
+        # the brief with no separate legend to remember. The triple-asterisk
+        # Flag ('***' = confirmed vacant + tax-delinquent) is unchanged --
+        # that's a separate positive-confirmation signal, not an uncertainty
+        # warning.
+        parts.append("NEED TO VERIFY LEAD -- " + "; ".join(reasons) + ".")
     return " ".join(parts)
 
 
@@ -282,11 +305,37 @@ def to_csv(rows, today):
         amount = (raw.get("tax_sale") or {}).get("amount_due") or ""
         reasons = [REVIEW_LABELS.get(x, x.replace("_", " ")) for x in (r.get("review_reasons") or [])
                    if x not in ("single_source", "incomplete_address")]
-        flag = "***" if r.get("triple") else ("*" if r.get("needs_review") else "")
+        # Skip-trace identity swap (2026-10-09): trace the Personal
+        # Representative (probate) or the owner's own mailing address (land
+        # with no house number) instead of the deceased owner / an
+        # unmailable address. See skiptrace_prep.py. A note comes back when
+        # a lead can't get the normal treatment -- folds into the same
+        # "NEED TO VERIFY LEAD" text every other review reason uses.
+        st_first, st_last, st_address, st_note = compute_skiptrace_identity(r, tags)
+        st_state, st_zip = split_mailing(st_address)
+        if st_address == r["address"]:
+            # Tracing the property itself: its street carries no state/zip,
+            # so use the property's own (filled by fill_city_zip.py).
+            st_state, st_zip = r.get("state") or "SC", r.get("zip") or ""
+        if st_note:
+            reasons = reasons + [st_note]
+        # FLAG: '***' (confirmed vacant + tax-delinquent) is the only flag
+        # left here -- the single-'*' "needs review" signal moved into the
+        # Call Brief text itself (see call_brief()'s "NEED TO VERIFY LEAD").
+        flag = "***" if r.get("triple") else ""
         ordered = [x for x in BRIEF_ORDER if x in tags]
         decision = ""
         if "probate" in tags and probate.get("pr_name"):
             decision = probate["pr_name"] + (f", {probate['pr_address']}" if probate.get("pr_address") else "")
+        # Skip-trace status (2026-10-09): Traced / Failed / No.
+        st_status = (r.get("skiptrace_status") or "").strip().lower()
+        st_label = {"traced": "Traced", "failed": "Failed"}.get(st_status, "No")
+        st_when = r.get("skiptrace_date")
+        if isinstance(st_when, str):
+            try:
+                st_when = datetime.fromisoformat(st_when[:10])
+            except ValueError:
+                pass
         w.writerow([
             call_brief(r, tags, raw, mst, reasons),
             ", ".join(GHL_LIST_OPTIONS[x] for x in ordered),
@@ -296,6 +345,7 @@ def to_csv(rows, today):
             i, flag, int(r.get("score") or 0), r["address"], (r.get("city") or "").title(),
             r.get("state") or "SC", r.get("zip") or "",
             r.get("owner_name") or "", r.get("mailing_address") or "", mst, mzip,
+            st_first, st_last, st_address, st_state, st_zip,
             r.get("list_count") or 0,  # "Lists" column removed 2026-10-01: duplicated Distress List
             f"${float(amount):,.2f}" if re.match(r"^\d+(\.\d+)?$", str(amount)) else "",
             tax_sale_years(raw, tags),
@@ -307,6 +357,8 @@ def to_csv(rows, today):
             yn(r.get("is_vacant")), yn(r.get("is_absentee")), yn(r.get("is_tired_landlord")),
             yn(r.get("is_out_of_state_land")), yn(r.get("has_assumable_loan")),
             r.get("land_use") or "", r.get("pin") or "", "; ".join(reasons), today.isoformat(),
+            st_label,
+            st_when.strftime("%m/%d/%Y") if hasattr(st_when, "strftime") else (str(st_when) if st_when else ""),
             *last_sale(raw),
         ])
     return buf.getvalue()
@@ -416,6 +468,12 @@ def main():
         print("DATABASE_URL and SUPABASE_SERVICE_KEY must be set", file=sys.stderr)
         sys.exit(1)
     conn = psycopg2.connect(db_url)
+    with conn.cursor() as cur:
+        # Skip-trace status columns (already added live 2026-10-07 via
+        # skiptrace_status_migration.sql; no-op if present). Added BEFORE
+        # ensure_schema() so the rebuilt views include them.
+        cur.execute("alter table leads add column if not exists skiptrace_status text")
+        cur.execute("alter table leads add column if not exists skiptrace_date timestamptz")
     ensure_schema(conn)
     conn.commit()
     files, warn = build(conn)
