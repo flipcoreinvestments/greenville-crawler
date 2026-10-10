@@ -240,7 +240,11 @@ def parse_pr(parties_text):
     """Personal Representative name/address from the PARTIES INVOLVED block
     ("Name: DOE , JANE Q Party Type: Personal Representative
     Address: 123 MAIN ST ...")."""
-    m = re.search(r"Name:?\s*(.*?)\s*Party Type:?\s*Personal Representative\s*Address:?\s*(.*?)"
+    # FIX 2026-10-10: the name group may not cross another "Name:" -- the old
+    # lazy match started at the FIRST party (an attorney or creditor) and ran
+    # up to the PR, so pr_name came out as "CARDEW, BENJAMIN S Party Type:
+    # Attorney ... Name: WILLIAMS, JOHN DAVID" (found in the 10.1/10.7 audit).
+    m = re.search(r"Name:?\s*((?:(?!Name:).)*?)\s*Party Type:?\s*Personal Representative\s*Address:?\s*(.*?)"
                   r"(?=\s*Name:|$)", parties_text or "", re.I)
     if not m:
         return {"pr_name": None, "pr_address": None}
@@ -644,6 +648,15 @@ def main():
             budget -= crawl_year(conn, session, year, budget)
         except Blocked:
             break  # still match owners against the cases already saved
+    # 2026-10-10: clean PR names saved by the old parser (see parse_pr).
+    # Keeps only the text after the last "Name:". Idempotent.
+    with conn.cursor() as cur:
+        cur.execute(r"""update probate_cases set pr_name = trim(both ' ,' from regexp_replace(pr_name, '^.*Name:\s*', ''))
+                        where pr_name like '%%Party Type%%'""")
+        cur.execute(r"""update leads set raw = jsonb_set(raw, '{probate,pr_name}',
+                            to_jsonb(trim(both ' ,' from regexp_replace(raw->'probate'->>'pr_name', '^.*Name:\s*', ''))))
+                        where raw->'probate'->>'pr_name' like '%%Party Type%%'""")
+    conn.commit()
     n = match_owners_to_estates(conn)
     print(f"  owner-name matches to open estates: {n} lead(s) tagged probate")
     backfill_pr(conn, session)
