@@ -35,6 +35,7 @@ import psycopg2.extras
 from lead_common import ensure_schema
 from skiptrace_prep import compute_skiptrace_identity
 
+PROBATE_CASE_URL = "https://www.greenvillecounty.org/appsas400/Probate/SearchDetails.aspx?CaseNumber={case_number}"
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://izxqrskybwtqzbbbzlux.supabase.co")
 BUCKET = "lead-exports"
 DB_LIMIT_MB = 500          # Supabase free plan
@@ -104,6 +105,9 @@ COLUMNS = [
     "Skiptrace First Name", "Skiptrace Last Name", "Skiptrace Address", "Skiptrace State", "Skiptrace Zip",
     "List Count", "Tax Owed", "Years on Tax Sale List", "Tax Sale Status", "Foreclosure Auction Date",
     "Personal Representative", "PR Address", "Date of Death",
+    # 2026-10-10 (T Dawg's ask): case # + the county's case page, so she can
+    # look the estate up herself and reverse-search the family.
+    "Probate Case #", "Probate Case Link",
     "Vacant (USPS)", "Absentee Owner", "Tired Landlord", "Out-of-State Owner", "Assumable Loan",
     "Land Use", "Parcel #", "Check Before Calling", "Exported",
     # Added 2026-10-09 (T Dawg's ask): show whether a lead was already
@@ -354,6 +358,8 @@ def to_csv(rows, today):
             (probate.get("pr_name") or "") if "probate" in tags else "",
             (probate.get("pr_address") or "") if "probate" in tags else "",
             (probate.get("date_of_death") or "") if "probate" in tags else "",
+            probate.get("case_number") or "",
+            (PROBATE_CASE_URL.format(case_number=probate["case_number"]) if probate.get("case_number") else ""),
             yn(r.get("is_vacant")), yn(r.get("is_absentee")), yn(r.get("is_tired_landlord")),
             yn(r.get("is_out_of_state_land")), yn(r.get("has_assumable_loan")),
             r.get("land_use") or "", r.get("pin") or "", "; ".join(reasons), today.isoformat(),

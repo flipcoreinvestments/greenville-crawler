@@ -43,6 +43,8 @@ from lead_common import owner_is_entity
 NO_PR_NOTE = ("no personal representative on file yet -- any phone/email found belongs to the "
               "deceased owner, not a reachable person")
 PR_NO_ADDRESS_NOTE = "no address on file for the personal representative -- trace may come back empty"
+PRE_PROBATE_NOTE = ("owner on title reported deceased and no estate filed yet -- any phone found may be the "
+                     "deceased's; look for the heirs/family before calling")
 LAND_NO_MAILING_NOTE = "no mailing address on file -- this lead cannot be skip-traced at all until one is found"
 
 
@@ -112,6 +114,14 @@ def compute_skiptrace_identity(r, tags):
             return first, last, property_address, PR_NO_ADDRESS_NOTE
         first, last = split_name(owner_name)
         return first, last, property_address, NO_PR_NOTE
+
+    if "pre_probate" in tags:
+        # 2026-10-10: PropStream says the owner died but no Greenville probate
+        # case exists yet, so there's no Personal Representative to trace.
+        # Trace the owner of record as before, but warn in the Call Brief.
+        first, last = split_name(owner_name)
+        addr = property_address if not is_untraceable_address(property_address) else mailing_address
+        return first, last, addr, PRE_PROBATE_NOTE
 
     if is_untraceable_address(property_address):
         first, last = split_name(owner_name)

@@ -189,7 +189,7 @@ def parse_list(html):
 
         trs = table.find_all("tr")
         for tr in trs:
-            cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
             if len(cells) < 3:
                 continue
             map_cell = next((c for c in cells if re.fullmatch(r"\d{8,}", c.replace("-", ""))), None)
@@ -249,15 +249,26 @@ def fetch_details_html(page, url):
 LABELS = ["Owner(s)", "Mailing Address", "Location", "Land Use", "Fair Market Value", "Taxable Market Value"]
 
 
+def cell_lines(td):
+    """FIX 2026-10-10: get_text(strip=True) glued line breaks together, so two
+    owners came out as one garbled name ("...EscudeBoyles Rosaline...",
+    "Christopher ABowen Reginald") and skip-trace searched nonsense. Keep the
+    lines separate; callers join them."""
+    return [x for x in td.get_text("\n", strip=True).split("\n") if x.strip()]
+
+
 def parse_details(html):
     soup = BeautifulSoup(html, "html.parser")
     values = {}
     for tr in soup.find_all("tr"):
-        cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+        line_cells = [cell_lines(td) for td in tr.find_all(["td", "th"])]
+        cells = [" ".join(x) for x in line_cells]
         for i, cell in enumerate(cells):
             for label in LABELS:
                 if cell.strip().lower().startswith(label.lower()) and i + 1 < len(cells):
-                    values[label] = cells[i + 1]
+                    # several owners = one per line on the county page
+                    joiner = " & " if label == "Owner(s)" else " "
+                    values[label] = joiner.join(line_cells[i + 1])
     return values
 
 

@@ -254,6 +254,19 @@ def normalize_addr(strnum, locate):
     return addr.title() if addr else None
 
 
+def full_mailing(r):
+    street = re.sub(r"\s+", " ", (r.get("STREET") or "")).strip()
+    if not street:
+        return None
+    city = re.sub(r"\s+", " ", (r.get("CITY") or "")).strip()
+    state = (r.get("STATE") or "").strip().upper()
+    zip5 = (r.get("ZIP5") or "").strip()
+    tail = " ".join(x for x in [state, zip5] if x)
+    if city and tail:
+        return f"{street} {city}, {tail}"
+    return " ".join(x for x in [street, city, tail] if x)
+
+
 def mailing_street_is_valid(mailing_street):
     """
     BUG FIX (found 2026-09-2x, T Dawg's own spot-check): the county's STREET
@@ -420,7 +433,7 @@ def refresh_needs_review(conn):
                     case when city is null or city = '' or zip is null or zip = '' then 'incomplete_address' end,
                     case when mailing_address is not null
                          and lower(regexp_replace(mailing_address, '[^a-zA-Z0-9]', '', 'g'))
-                           = lower(regexp_replace(address, '[^a-zA-Z0-9]', '', 'g'))
+                           like lower(regexp_replace(address, '[^a-zA-Z0-9]', '', 'g')) || '%%'
                          and is_absentee = true then 'absentee_flag_but_same_address' end,
                     -- 2026-09-30: also no real street name ("9 A" from a PropStream row)
                     case when address ~* '\mnone\M' or address !~* '^\s*\d+\S*\s+.*[a-z]{2,}'
@@ -482,17 +495,35 @@ def mark_sold_by_recent_deed(conn, all_parcels):
     with conn.cursor() as cur:
         cur.execute("create temporary table pin_deed (pin text, deed_date date) on commit drop")
         execute_values(cur, "insert into pin_deed (pin, deed_date) values %s", recent_sales)
+        # FIX 2026-10-10: the old single UPDATE OR-ed three pin matches, which
+        # Postgres can only run as (every lead x every recent deed) -- it hit
+        # the statement timeout every night from Oct 2, so the rest of this
+        # script (rescore + review-flag refresh) never ran. Now each lead's
+        # pins are listed once (column, scalar/array absentee pin, tax-sale
+        # map number) and hash-joined to the deeds. Same matches, linear time.
         cur.execute(
-            """
-            update leads set is_sold = true, sold_at = pd.deed_date, score = 0, updated_at = now()
-            from pin_deed pd
-            where pd.deed_date >= %s
-              and (
-                    leads.pin = pd.pin
-                 or leads.raw->'absentee_owner'->'pin' @> to_jsonb(pd.pin)
-                 or regexp_replace(coalesce(leads.raw->'tax_sale'->>'map_number', ''), '\\D', '', 'g') = pd.pin
-              )
-              and leads.is_sold is distinct from true
+            r"""
+            with lp as (
+                select l.id, p.pin
+                from leads l
+                cross join lateral (
+                    select l.pin
+                    union select l.raw->'absentee_owner'->>'pin'
+                          where jsonb_typeof(l.raw->'absentee_owner'->'pin') = 'string'
+                    union select jsonb_array_elements_text(l.raw->'absentee_owner'->'pin')
+                          where jsonb_typeof(l.raw->'absentee_owner'->'pin') = 'array'
+                    union select nullif(regexp_replace(coalesce(l.raw->'tax_sale'->>'map_number', ''), '\D', '', 'g'), '')
+                ) p(pin)
+                where l.is_sold is distinct from true and p.pin is not null
+            ),
+            m as (
+                select lp.id, max(pd.deed_date) as deed_date
+                from lp join pin_deed pd on pd.pin = lp.pin
+                where pd.deed_date >= %s
+                group by lp.id
+            )
+            update leads set is_sold = true, sold_at = m.deed_date, score = 0, updated_at = now()
+            from m where leads.id = m.id
             """,
             (cutoff,),
         )
@@ -641,7 +672,11 @@ def main():
         if not address:
             continue
         owner_name = normalize_owner(r.get("OWNAM1"))
-        mailing = (r.get("STREET") or "").strip() or None
+        # FIX 2026-10-10: the mailing address used to be STREET only, so the
+        # owner's city/state/zip (CITY/STATE/ZIP5, which this feed has) never
+        # reached the lead and skip-trace got a bare street. Same shape as the
+        # tax-sale pages: "107 Kingsley Dr Greenville, SC 29605".
+        mailing = full_mailing(r)
         processed.append({
             "pin": pin,
             "address": address,
@@ -668,6 +703,10 @@ def main():
     print(f"Owners with {TIRED_LANDLORD_THRESHOLD}+ parcels: {len(tired_owners)}")
 
     conn = psycopg2.connect(db_url)
+    with conn.cursor() as cur:
+        # 2026-10-10: room for the big nightly matches (default timeout
+        # cancelled this step every night from Oct 2).
+        cur.execute("set statement_timeout = '20min'")
     ensure_status_column(conn)
     ensure_review_column(conn)
     ensure_schema(conn)
@@ -687,7 +726,15 @@ def main():
         print("  enrichment skipped: partial county fetch")
     conn.commit()
 
-    sold_count = mark_sold_by_recent_deed(conn, all_parcels)
+    try:
+        sold_count = mark_sold_by_recent_deed(conn, all_parcels)
+        conn.commit()
+    except psycopg2.Error as e:
+        # 2026-10-10: a failure here used to kill the whole step, so the
+        # review flags (e.g. stale "incomplete address") never refreshed.
+        conn.rollback()
+        sold_count = 0
+        print(f"::warning::mark_sold_by_recent_deed failed, continuing: {e}")
     print(f"Marked {sold_count} leads as sold (deed recorded in last {SOLD_LOOKBACK_DAYS} days).")
 
     rescore_all(conn)

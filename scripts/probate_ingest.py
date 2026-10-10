@@ -543,12 +543,31 @@ def backfill_pr(conn, session, limit=60):
     with conn.cursor() as cur:
         cur.execute(
             r"""
-            select distinct c.case_number from probate_cases c
-            join leads l on l.list_count > 0 and l.is_sold = false and l.is_duplicate = false
-             and (l.raw->'probate'->>'case_number' = c.case_number
-                  or upper(coalesce(l.owner_name, '')) ~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\M'))
-            where c.pr_name is null and coalesce(c.closed_date, '') = ''
-              and c.decedent_last is not null and c.decedent_first is not null
+            -- FIX 2026-10-10: the old join ran a regex for every (case x lead)
+            -- pair and hit the statement timeout. Same match, done as hash
+            -- joins: by case number, or by each consecutive LAST FIRST word
+            -- pair in the owner name (what the old \mLAST\s+FIRST\M matched).
+            with open_cases as (
+                select case_number, upper(decedent_last) as dl, upper(decedent_first) as df
+                from probate_cases
+                where pr_name is null and coalesce(closed_date, '') = ''
+                  and decedent_last is not null and decedent_first is not null
+            ),
+            live as (
+                select id, raw, upper(coalesce(owner_name, '')) as own from leads
+                where list_count > 0 and is_sold = false and is_duplicate = false
+            ),
+            pairs as (
+                select w.word as w1, lead(w.word) over (partition by l.id order by w.n) as w2
+                from live l
+                cross join lateral regexp_split_to_table(l.own, '[^A-Z0-9]+') with ordinality as w(word, n)
+                where w.word <> ''
+            )
+            select distinct c.case_number from open_cases c
+            join live l on l.raw->'probate'->>'case_number' = c.case_number
+            union
+            select distinct c.case_number from open_cases c
+            join pairs p on p.w1 = c.dl and p.w2 = c.df
             limit %s
             """, (limit,))
         todo = [r[0] for r in cur.fetchall()]
@@ -586,6 +605,10 @@ def main():
         sys.exit(1)
     budget = int(os.environ.get("MAX_ROWS") or NIGHTLY_LOOKUP_BUDGET)
     conn = psycopg2.connect(db_url)
+    with conn.cursor() as cur:
+        # 2026-10-10: room for the big nightly matches (default timeout
+        # cancelled this step every night from Oct 2).
+        cur.execute("set statement_timeout = '20min'")
     ensure_schema(conn)
     ensure_cases_table(conn)
     conn.commit()
