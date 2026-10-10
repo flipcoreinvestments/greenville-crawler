@@ -382,6 +382,9 @@ def ensure_cases_table(conn):
         cur.execute("alter table probate_cases add column if not exists decedent_middle text")
         cur.execute("alter table probate_cases add column if not exists decedent_street text")
         cur.execute("alter table probate_cases add column if not exists pr_street text")
+        # 2026-10-10: the whole "Parties Involved" block, so the probate PR
+        # list can name the family on the case file (heirs column).
+        cur.execute("alter table probate_cases add column if not exists parties text")
         # 2026-09-30 repair: date columns held trailing page text (see
         # extract_labeled_fields) -- keep only the date, blank -> NULL.
         for col in ("closed_date", "creditor_deadline", "file_date", "date_of_death"):
@@ -397,18 +400,19 @@ def save_case(conn, row):
             insert into probate_cases
                 (case_number, decedent_name, decedent_last, decedent_first, date_of_death,
                  file_date, closed_date, pr_name, pr_address, decedent_address,
-                 creditor_deadline, decedent_middle, decedent_street, pr_street, fetched_at)
-            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+                 creditor_deadline, decedent_middle, decedent_street, pr_street, parties, fetched_at)
+            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
             on conflict (case_number) do update set
                 closed_date = excluded.closed_date, pr_name = excluded.pr_name,
                 pr_address = excluded.pr_address, creditor_deadline = excluded.creditor_deadline,
                 decedent_middle = excluded.decedent_middle, decedent_street = excluded.decedent_street,
-                pr_street = excluded.pr_street, fetched_at = now()
+                pr_street = excluded.pr_street,
+                parties = coalesce(excluded.parties, probate_cases.parties), fetched_at = now()
             """,
             (row["case_number"], row["decedent_name"], last, first, row["date_of_death"],
              row["file_date"], row["closed_date"], row.get("pr_name"), row.get("pr_address"),
              row["address"], row.get("creditor_deadline"), decedent_middle_initial(row["decedent_name"]),
-             street_only(row["address"]), street_only(row.get("pr_address"))),
+             street_only(row["address"]), street_only(row.get("pr_address")), row.get("parties")),
         )
 
 
@@ -433,7 +437,7 @@ def match_owners_to_estates(conn):
                     'case_number', c.case_number, 'decedent_name', c.decedent_name,
                     'date_of_death', c.date_of_death, 'file_date', c.file_date,
                     'pr_name', c.pr_name, 'pr_address', c.pr_address,
-                    'creditor_deadline', c.creditor_deadline,
+                    'creditor_deadline', c.creditor_deadline, 'parties', c.parties,
                     -- owner_name_and_address = the probate file's address (decedent's
                     -- or PR's) is the property itself or the owner's mailing address.
                     -- owner_name alone = verify by hand (common names).
@@ -559,7 +563,7 @@ def crawl_year(conn, session, year, budget):
     return lookups
 
 
-def backfill_pr(conn, session, limit=60):
+def backfill_pr(conn, session, limit=120):
     """ADDED 2026-09-30. Cases saved before the parties-block fix have no
     Personal Representative. The PR is who you call on a probate lead, so
     re-fetch open cases that touch a distress lead (by case number or by
@@ -571,11 +575,16 @@ def backfill_pr(conn, session, limit=60):
             -- pair and hit the statement timeout. Same match, done as hash
             -- joins: by case number, or by each consecutive LAST FIRST word
             -- pair in the owner name (what the old \mLAST\s+FIRST\M matched).
+            -- 2026-10-10: also re-fetch open cases saved before the parties
+            -- block was stored (needed for the probate PR list's heirs column),
+            -- and cases still waiting on a PR are re-checked so a lead moves
+            -- from deceased_owner_hold to probate_pr_leads once one is named.
             with open_cases as (
                 select case_number, upper(decedent_last) as dl, upper(decedent_first) as df
                 from probate_cases
-                where pr_name is null and coalesce(closed_date, '') = ''
+                where (pr_name is null or parties is null) and coalesce(closed_date, '') = ''
                   and decedent_last is not null and decedent_first is not null
+                  and (parties is null or fetched_at < now() - interval '6 days')
             ),
             live as (
                 select id, raw, upper(coalesce(owner_name, '')) as own from leads
@@ -615,6 +624,15 @@ def backfill_pr(conn, session, limit=60):
             from probate_cases c
             where c.case_number = l.raw->'probate'->>'case_number' and c.pr_name is not null
               and coalesce(l.raw->'probate'->>'pr_name', '') = ''
+            """
+        )
+        # 2026-10-10: copy the parties block onto the lead (heirs column).
+        cur.execute(
+            """
+            update leads l set raw = jsonb_set(l.raw, '{probate,parties}', to_jsonb(c.parties))
+            from probate_cases c
+            where c.case_number = l.raw->'probate'->>'case_number' and c.parties is not null
+              and l.raw->'probate'->>'parties' is distinct from c.parties
             """
         )
     conn.commit()

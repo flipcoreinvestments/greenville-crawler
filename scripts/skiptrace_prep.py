@@ -85,6 +85,100 @@ def split_name(name):
     return toks[1].title(), toks[0].title()
 
 
+# --------------------------------------------------------------------------
+# PROBATE CONTACT + HEIRS (added 2026-10-10, T Dawg's ask: "make the PR the
+# contact name so I skip trace the right person, keep the deceased's name in
+# its own column, and list the heirs").
+#
+# The county case page's "Parties Involved" block is the only public list of
+# people on an estate. Party types seen across all 181 live probate leads:
+# Personal Representative, Creditor of the estate, Attorney, Affiant,
+# Applicant, Respondent, Petitioner, Also Known As, Special Administrator,
+# Payor of court fees, Agent, Bondsmen, Successor Personal Representative,
+# Other, Demandant. The county site has NO "Heir" party type -- the full
+# heir list is inside the filed papers (application / small-estate
+# affidavit), not online. So "Heirs" here = the family-side people the case
+# file names (co-PRs, affiants, applicants, petitioners, respondents...),
+# each with their role. Attorneys, creditors, bond companies, agents and
+# fee payors are never listed -- they aren't family and calling them wastes
+# a trace.
+# --------------------------------------------------------------------------
+_PARTY_RE = re.compile(
+    r"Name:?\s*((?:(?!Name:|Party Type).)*?)\s*Party Type:?\s*((?:(?!Address|Name:).)*?)\s*"
+    r"(?:Address:?\s*((?:(?!Name:).)*?))?\s*(?=Name:|$)", re.I)
+
+# who to call, best first. Successor PR replaced the original PR.
+CONTACT_ROLES = ["successor personal representative", "personal representative",
+                 "special administrator", "affiant", "applicant", "petitioner"]
+# family-side roles worth listing as heirs (everything in CONTACT_ROLES too)
+FAMILY_ROLES = set(CONTACT_ROLES) | {"respondent", "other", "demandant"}
+ROLE_LABELS = {
+    "successor personal representative": "Successor Personal Representative",
+    "personal representative": "Personal Representative",
+    "special administrator": "Special Administrator",
+    "affiant": "Affiant (small-estate filer)",
+    "applicant": "Applicant",
+    "petitioner": "Petitioner",
+    "respondent": "Respondent",
+    "other": "Other party",
+    "demandant": "Demandant",
+}
+
+
+def _clean_person(name):
+    return re.sub(r"\s+", " ", re.sub(r"\s*,\s*", ", ", name or "")).strip(" ,")
+
+
+def parse_parties(parties_text):
+    """'( 3 ) Name: DOE , JANE Party Type: Personal Representative Address: 1 MAIN ST ...'
+    -> [{'name': 'DOE, JANE', 'role': 'personal representative', 'address': '1 MAIN ST ...'}, ...]"""
+    out = []
+    for m in _PARTY_RE.finditer(parties_text or ""):
+        name = _clean_person(m.group(1))
+        role = re.sub(r"\s+", " ", (m.group(2) or "")).strip().lower()
+        if not name or not role:
+            continue
+        out.append({"name": name, "role": role, "address": re.sub(r"\s+", " ", m.group(3) or "").strip()})
+    return out
+
+
+def probate_contact(probate):
+    """The person to skip trace on a probate lead: (name, role_label, address)
+    or (None, None, None). Uses the parsed PR first (raw.probate.pr_name), then
+    the parties block for a successor PR / special administrator / affiant /
+    applicant / petitioner."""
+    probate = probate or {}
+    parties = parse_parties(probate.get("parties"))
+    for role in CONTACT_ROLES:
+        for p in parties:
+            if p["role"] == role and not owner_is_entity(p["name"]):
+                if role == "personal representative" and probate.get("pr_name"):
+                    # the parsed PR (same person; keeps one spelling everywhere)
+                    return (_clean_person(probate["pr_name"]), ROLE_LABELS[role],
+                            probate.get("pr_address") or p["address"])
+                return p["name"], ROLE_LABELS[role], p["address"]
+    if probate.get("pr_name"):
+        return _clean_person(probate["pr_name"]), ROLE_LABELS["personal representative"], probate.get("pr_address") or ""
+    return None, None, None
+
+
+def probate_heirs(probate, exclude_name=None, decedent_name=None):
+    """'DOE, JOHN (Applicant); DOE, MARY (Respondent)' -- every family-side
+    person on the case file except the contact already in its own column and
+    the decedent. Blank when the file names nobody else."""
+    skip = {_clean_person(exclude_name).upper(), _clean_person(decedent_name).upper()} - {""}
+    seen, out = set(), []
+    for p in parse_parties((probate or {}).get("parties")):
+        if p["role"] not in FAMILY_ROLES or owner_is_entity(p["name"]):
+            continue
+        key = p["name"].upper()
+        if key in skip or key in seen:
+            continue
+        seen.add(key)
+        out.append(f"{p['name']} ({ROLE_LABELS.get(p['role'], p['role'].title())})")
+    return "; ".join(out)
+
+
 def compute_skiptrace_identity(r, tags):
     """
     r: one row dict from house_leads/land_leads (needs owner_name, address,
@@ -105,10 +199,12 @@ def compute_skiptrace_identity(r, tags):
     probate = raw.get("probate") or {}
 
     if "probate" in tags:
-        pr_name = probate.get("pr_name")
+        # 2026-10-10: PR, or a successor PR / special administrator / affiant /
+        # applicant from the case file when no PR is named (probate_contact).
+        pr_name, _role, pr_address = probate_contact(probate)
         if pr_name:
             first, last = split_name(pr_name)
-            pr_address = probate.get("pr_address") or ""
+            pr_address = pr_address or ""
             if pr_address:
                 return first, last, pr_address, None
             return first, last, property_address, PR_NO_ADDRESS_NOTE

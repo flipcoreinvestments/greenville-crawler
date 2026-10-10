@@ -19,6 +19,7 @@ hundred a night; a miss is not retried for 30 days.
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -135,6 +136,42 @@ def todo(conn, limit):
         return cur.fetchall()
 
 
+# 2026-10-10 (lead re-check audit): 52 live leads still had no city/zip
+# after the geocoder -- rural addresses the Census can't place. When the
+# owner's mailing address IS the property (same house number + street),
+# the mailing city/zip is the property's. Greenville County zips are 296xx.
+TOWNS = sorted(["Greenville", "Greer", "Simpsonville", "Mauldin", "Fountain Inn", "Travelers Rest",
+                "Taylors", "Piedmont", "Pelzer", "Marietta", "Landrum", "Gray Court", "Easley",
+                "Cleveland", "Slater", "Tigerville", "Duncan", "Belton", "Honea Path"], key=len, reverse=True)
+_MAIL_RE = re.compile(r"^(?P<street>.*?),?\s*SC\s+(?P<zip>296\d\d)(?:-\d{4})?\s*$", re.I)
+
+
+def mailing_fallback(conn):
+    with conn.cursor() as cur:
+        cur.execute("""select id, address, mailing_address from leads
+                       where list_count > 0 and is_sold = false and is_duplicate = false
+                         and coalesce(zip, '') = '' and coalesce(mailing_address, '') <> ''""")
+        rows = cur.fetchall()
+        filled = 0
+        for lead_id, address, mailing in rows:
+            m = _MAIL_RE.match((mailing or "").strip())
+            if not m:
+                continue
+            body = m.group("street").strip(" ,")
+            town = next((t for t in TOWNS if body.upper().endswith(" " + t.upper())), None)
+            p, q = (address or "").upper().split(), body.upper().split()
+            if not town or len(p) < 2 or len(q) < 2 or p[0] != q[0] or p[1][:4] != q[1][:4]:
+                continue
+            cur.execute("update leads set city = %s, zip = %s, raw = coalesce(raw, '{}'::jsonb) || %s::jsonb "
+                        "where id = %s",
+                        (town, m.group("zip"), json.dumps({"geocode": {"source": "owner_mailing_same_address",
+                                                                        "tried_at": datetime.now(timezone.utc).isoformat(),
+                                                                        "v": GEOCODE_VERSION}}), lead_id))
+            filled += 1
+    conn.commit()
+    print(f"  city/zip filled from the owner's same-address mailing for {filled} lead(s)")
+
+
 def main():
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
@@ -176,6 +213,9 @@ def main():
     conn.commit()
     conn.close()
     print(f"Done. city/zip filled for {filled}, no single Greenville County match for {missed}, errors {errors}.")
+    conn = psycopg2.connect(db_url)
+    mailing_fallback(conn)
+    conn.close()
 
 
 if __name__ == "__main__":

@@ -10,6 +10,9 @@ these hold owner names and addresses):
   house_leads.csv   houses, duplex/multiplex, mobile homes, ag improved,
                     unknown land use -- person-owned, residential
   land_leads.csv    residential vacant lots + ag vacant land
+  probate_pr_leads.csv     deceased owner + a Personal Representative/family
+                           contact to skip trace (2026-10-10, see below)
+  deceased_owner_hold.csv  deceased owner, nobody to call yet -- don't trace
   system_health.txt one-page status: when it last ran, list sizes, database
                     space left, Scrapfly credits left, PropStream list ages
 
@@ -33,7 +36,7 @@ import psycopg2
 import psycopg2.extras
 
 from lead_common import ensure_schema
-from skiptrace_prep import compute_skiptrace_identity
+from skiptrace_prep import compute_skiptrace_identity, probate_contact, probate_heirs, split_name
 
 PROBATE_CASE_URL = "https://www.greenvillecounty.org/appsas400/Probate/SearchDetails.aspx?CaseNumber={case_number}"
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://izxqrskybwtqzbbbzlux.supabase.co")
@@ -222,11 +225,11 @@ def call_brief(r, tags, raw, mail_state, reasons):
         elif tag == "probate":
             pb = raw.get("probate") or {}
             s = "PROBATE: owner died" + (f" {pb['date_of_death']}." if pb.get("date_of_death") else ".")
-            if pb.get("pr_name"):
-                s += f" Call the personal representative, {pb['pr_name']}" + \
-                     (f", {pb['pr_address']}." if pb.get("pr_address") else ".")
+            c_name, c_role, c_addr = probate_contact(pb)
+            if c_name:
+                s += f" Call the {c_role.split(' (')[0].lower()}, {c_name}" + (f", {c_addr}." if c_addr else ".")
             else:
-                s += " Estate is open; personal representative not on file yet."
+                s += " Estate is open; personal representative not on file yet -- don't skip trace yet."
             parts.append(s)
         elif tag == "pre_probate" and "probate" not in t:
             parts.append("Owner on title is deceased (no estate opened yet).")
@@ -329,8 +332,10 @@ def to_csv(rows, today):
         flag = "***" if r.get("triple") else ""
         ordered = [x for x in BRIEF_ORDER if x in tags]
         decision = ""
-        if "probate" in tags and probate.get("pr_name"):
-            decision = probate["pr_name"] + (f", {probate['pr_address']}" if probate.get("pr_address") else "")
+        if "probate" in tags:
+            c_name, c_role, c_addr = probate_contact(probate)
+            if c_name:
+                decision = c_name + (f", {c_addr}" if c_addr else "")
         # Skip-trace status (2026-10-09): Traced / Failed / No.
         st_status = (r.get("skiptrace_status") or "").strip().lower()
         st_label = {"traced": "Traced", "failed": "Failed"}.get(st_status, "No")
@@ -366,6 +371,112 @@ def to_csv(rows, today):
             st_label,
             st_when.strftime("%m/%d/%Y") if hasattr(st_when, "strftime") else (str(st_when) if st_when else ""),
             *last_sale(raw),
+        ])
+    return buf.getvalue()
+
+
+# ------------------------------------------------------------ probate lists
+# 2026-10-10 (T Dawg's ask): segment the deceased-owner leads so skip-trace
+# money only goes to a living, reachable person.
+#   probate_pr_leads.csv     open estate with a Personal Representative (or a
+#                            successor PR / special administrator / affiant /
+#                            applicant on the case file). Contact = that
+#                            person; the deceased owner and the family named
+#                            on the case file get their own columns.
+#   deceased_owner_hold.csv  owner died but nobody to call yet (estate open
+#                            with no PR named, or pre-probate with no estate
+#                            filed). DON'T skip trace -- it only finds the
+#                            dead person's old number. Mail/door-knock only;
+#                            the nightly probate backfill moves a lead to the
+#                            PR list the night a PR shows up on the case.
+# house_leads.csv / land_leads.csv no longer include either group, so the
+# same lead is never in two upload files.
+PROBATE_COLUMNS = [
+    "Contact First Name", "Contact Last Name", "Contact Full Name", "Contact Role",
+    "Contact Street", "Contact City", "Contact State", "Contact Zip",
+    "Deceased Person's Name", "Heirs", "Date of Death", "Probate Case #", "Probate Case Link",
+    "Property Address", "Property City", "Property State", "Property Zip", "Owner on Title",
+    "Distress List", "Tags", "Call Brief", "Flag", "Score", "Vacant (USPS)", "Tax Owed",
+    "Land Use", "Parcel #", "Check Before Calling", "Skip-Traced", "Last Skip-Traced", "Exported",
+]
+
+_KNOWN_TOWNS = sorted([
+    "Greenville", "Greer", "Simpsonville", "Mauldin", "Fountain Inn", "Travelers Rest", "Taylors",
+    "Piedmont", "Pelzer", "Marietta", "Landrum", "Gray Court", "Easley", "Cleveland", "Slater",
+    "Tigerville", "Duncan", "Woodruff", "Williamston", "Liberty", "Anderson", "Spartanburg",
+    "Pickens", "Central", "Clemson", "Seneca", "Laurens", "Columbia", "Charlotte", "Belton",
+    "Honea Path", "Boiling Springs", "Rock Hill", "Fort Mill", "Summerville", "Myrtle Beach", "Inman", "Lyman", "Wellford", "Moore", "Roebuck",
+], key=len, reverse=True)
+_ADDR_TAIL = re.compile(r"^(?P<rest>.*?)[,\s]+(?P<st>[A-Z]{2})[,\s]+(?P<zip>\d{5})(?:-\d{4})?\s*$", re.I)
+
+
+def split_contact_address(addr):
+    """'123 MAIN ST GREER SC 29651' -> ('123 MAIN ST', 'Greer', 'SC', '29651').
+    The court writes no comma before the city, so the city is only split off
+    when it's a known town; otherwise it stays on the street (skip-trace
+    tools still match on name + state + zip)."""
+    a = re.sub(r"\s+", " ", addr or "").strip()
+    m = _ADDR_TAIL.match(a)
+    if not m:
+        return a, "", "", ""
+    rest, st, z = m.group("rest").strip(" ,"), m.group("st").upper(), m.group("zip")
+    for town in _KNOWN_TOWNS:
+        if rest.upper().endswith(" " + town.upper()):
+            return rest[: -len(town)].strip(" ,"), town, st, z
+    return rest, "", st, z
+
+
+def segment(row):
+    """'probate_pr' | 'deceased_hold' | 'main' for one house/land lead."""
+    tags = set(row.get("source_tags") or [])
+    if "probate" in tags:
+        name, _, _ = probate_contact((row.get("raw") or {}).get("probate"))
+        return "probate_pr" if name else "deceased_hold"
+    if "pre_probate" in tags:
+        return "deceased_hold"
+    return "main"
+
+
+def probate_csv(rows, today):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(PROBATE_COLUMNS)
+    for r in rows:
+        raw = r.get("raw") or {}
+        tags = list(r.get("source_tags") or [])
+        pb = raw.get("probate") or {}
+        name, role, addr = probate_contact(pb)
+        first, last = split_name(name)
+        street, city, st, z = split_contact_address(addr)
+        if not street:
+            # PR with no address on the case: trace them at the property
+            street, city, st, z = r["address"], (r.get("city") or "").title(), r.get("state") or "SC", r.get("zip") or ""
+        mst, _ = split_mailing(r.get("mailing_address"))
+        reasons = [REVIEW_LABELS.get(x, x.replace("_", " ")) for x in (r.get("review_reasons") or [])
+                   if x not in ("single_source", "incomplete_address")]
+        if not addr:
+            reasons.append("no address on the case file for the contact -- traced at the property address")
+        ordered = [x for x in BRIEF_ORDER if x in tags]
+        amount = (raw.get("tax_sale") or {}).get("amount_due") or ""
+        st_status = (r.get("skiptrace_status") or "").strip().lower()
+        st_when = r.get("skiptrace_date")
+        w.writerow([
+            first, last, name, role, street, city, st, z,
+            re.sub(r"\s*,\s*", ", ", pb.get("decedent_name") or "").strip(" ,") or r.get("owner_name") or "",
+            probate_heirs(pb, exclude_name=name, decedent_name=pb.get("decedent_name")),
+            pb.get("date_of_death") or "", pb.get("case_number") or "",
+            PROBATE_CASE_URL.format(case_number=pb["case_number"]) if pb.get("case_number") else "",
+            r["address"], (r.get("city") or "").title(), r.get("state") or "SC", r.get("zip") or "",
+            r.get("owner_name") or "",
+            ", ".join(GHL_LIST_OPTIONS[x] for x in ordered),
+            ", ".join("list-" + re.sub(r"[^a-z0-9]+", "-", GHL_LIST_OPTIONS[x].lower()).strip("-") for x in ordered),
+            call_brief(r, tags, raw, mst, reasons),
+            "***" if r.get("triple") else "", int(r.get("score") or 0), yn(r.get("is_vacant")),
+            f"${float(amount):,.2f}" if re.match(r"^\d+(\.\d+)?$", str(amount)) else "",
+            r.get("land_use") or "", r.get("pin") or "", "; ".join(reasons),
+            {"traced": "Traced", "failed": "Failed"}.get(st_status, "No"),
+            st_when.strftime("%m/%d/%Y") if hasattr(st_when, "strftime") else (str(st_when)[:10] if st_when else ""),
+            today.isoformat(),
         ])
     return buf.getvalue()
 
@@ -459,10 +570,19 @@ def upload(files, key, url=SUPABASE_URL, session=None):
 def build(conn, today=None):
     today = today or date.today()
     out, counts = [], {}
+    probate_pr, hold = [], []
     for view in ("house_leads", "land_leads"):
         rows = lead_rows(conn, view)
-        counts[view] = len(rows)
-        out.append((f"{view}.csv", to_csv(rows, today), "text/csv"))
+        main_rows = []
+        for r in rows:
+            seg = segment(r)
+            (probate_pr if seg == "probate_pr" else hold if seg == "deceased_hold" else main_rows).append(r)
+        counts[view] = len(main_rows)
+        out.append((f"{view}.csv", to_csv(main_rows, today), "text/csv"))
+    counts["probate_pr_leads"] = len(probate_pr)
+    counts["deceased_owner_hold"] = len(hold)
+    out.append(("probate_pr_leads.csv", probate_csv(probate_pr, today), "text/csv"))
+    out.append(("deceased_owner_hold.csv", to_csv(hold, today), "text/csv"))
     report, warn = health_report(conn, counts, today)
     out.append(("system_health.txt", report, "text/plain"))
     return out, warn
