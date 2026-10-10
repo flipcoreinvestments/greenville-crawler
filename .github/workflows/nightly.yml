@@ -119,3 +119,11 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python scripts/export_call_lists.py
+
+      # 2026-10-10: fails the run (red X + GitHub failure email/push) if any
+      # source didn't finish, probate is stuck, or the call lists are stale.
+      - name: Health gate (alerts if anything is broken or stuck)
+        if: ${{ always() }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/health_gate.py
