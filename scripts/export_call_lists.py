@@ -27,7 +27,7 @@ import io
 import os
 import re
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import psycopg2
 import psycopg2.extras
@@ -429,10 +429,11 @@ def health_report(conn, counts, today):
                 lines.append(f"  {label:<18}not uploaded")
                 continue
             age = (today - date.fromisoformat(d[:10])).days
-            lines.append(f"  {label:<18}exported {d[:10]}  ({age} days old)")
+            drops = date.fromisoformat(d[:10]) + timedelta(days=PROPSTREAM_STALE_DAYS)
+            lines.append(f"  {label:<18}exported {d[:10]}  ({age} days old, drops off {drops:%m/%d/%Y})")
             if age >= PROPSTREAM_WARN_DAYS:
-                warn.append(f"PropStream {label} export is {age} days old -- re-pull it before day "
-                            f"{PROPSTREAM_STALE_DAYS} or it drops off every lead.")
+                warn.append(f"PropStream {label} export drops off every lead on {drops:%m/%d/%Y} "
+                            f"({PROPSTREAM_STALE_DAYS - age} days) -- re-export it from PropStream and upload it.")
     head = ["ACTION NEEDED:"] + [f"  - {w}" for w in warn] if warn else ["ACTION NEEDED: nothing"]
     return "\n".join(lines[:2] + head + [""] + lines[2:]) + "\n", warn
 
