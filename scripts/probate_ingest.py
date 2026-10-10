@@ -125,6 +125,14 @@ def fetch_case(session, cn):
         return None
     if "Page Not Found" in resp.text[:3000]:
         return None
+    # FIX 2026-10-10: a case number that doesn't exist yet comes back 200 as
+    # an empty shell ("CASE DETAILS (2024ES2312000) PARTIES INVOLVED ()",
+    # verified in a browser). That counted as a found case, so the crawl
+    # never hit its miss limit: from Oct 1 it walked 2024 numbers 4,530 ->
+    # 12,630 finding nothing and never reached 2025/2026. A real case
+    # always has a Case Type line.
+    if not re.search(r"Case\s*Type", resp.text, re.I):
+        return None
     return resp.text
 
 
@@ -324,10 +332,22 @@ def get_high_water_seq(conn, year):
             (SOURCE_NAME, f"%year:{year}%"),
         )
         row = cur.fetchone()
-    if not row or not row[0]:
-        return 0
-    m = re.search(r"high_water_seq:(\d+)", row[0])
-    return int(m.group(1)) if m else 0
+    noted = 0
+    if row and row[0]:
+        m = re.search(r"high_water_seq:(\d+)", row[0])
+        noted = int(m.group(1)) if m else 0
+    # FIX 2026-10-10: the run log's high-water mark was inflated by empty
+    # pages (see fetch_case). Never resume past the highest case actually
+    # SAVED for that year -- it re-checks a few non-estate numbers at most.
+    with conn.cursor() as cur:
+        cur.execute(
+            "select max(substring(case_number from %s)::int) from probate_cases where case_number like %s",
+            (f"^{year}ES{COUNTY_CODE}(\\d+)$", f"{year}ES{COUNTY_CODE}%"),
+        )
+        saved = (cur.fetchone() or [None])[0]
+    if saved is None:
+        return 0  # nothing saved for this year yet: start at the beginning
+    return min(noted, saved) if noted else saved
 
 
 def log_run(conn, records_found, records_new, notes):
@@ -614,9 +634,10 @@ def main():
     conn.commit()
     session = new_session()
     this_year = date.today().year
-    # Older years first: they're finite and get finished; the current year
-    # keeps growing and is picked up every night after the backfill.
-    for year in range(this_year - YEARS_BACK, this_year + 1):
+    # 2026-10-10: NEWEST year first -- fresh estates are the hottest leads.
+    # Each year stops after CONSECUTIVE_MISS_LIMIT empty numbers (caught up),
+    # and whatever budget is left goes to the older years' backfill.
+    for year in range(this_year, this_year - YEARS_BACK - 1, -1):
         if budget <= 0:
             break
         try:
