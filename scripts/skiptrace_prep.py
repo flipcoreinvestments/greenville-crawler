@@ -239,7 +239,15 @@ def owner_trace_names(owner_name):
         out.update(last=re.sub(r"\s+", " ", raw),
                    kind="Trust" if re.search(r"\bTRUST", raw, re.I) else "Company")
         return out
+    # probate-court style "OLIVER , STEPHEN LEE" (LAST , FIRST): one person
+    m = re.match(r"^\s*([A-Za-z'\-]+)\s*,\s*([A-Za-z].*)$", raw)
+    if m and "&" not in raw and "," not in m.group(2):
+        f, _ = _person_from_county("X " + m.group(2))
+        out.update(first=f, last=m.group(1).title(), kind="Person")
+        return out
     name = _TAG_RE.sub(" ", raw)
+    # leftovers of a hand-deleted "(JTWROS)" tag: "os)", "OS"
+    name = re.sub(r"\b(?:os|OS)\)|\s(?:os|OS)\b|\)", " ", name)
     # county mashed two owner lines together ("Frisbee Betty DFrisbee Robert F")
     name = re.sub(r"([a-z])([A-Z][a-z])", r"\1 & \2", name)
     chunks = [c.strip() for c in re.split(r"\s*[&,]\s*", name) if c.strip()]
