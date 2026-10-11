@@ -29,6 +29,7 @@ NIGHTLY_SOURCES = {
     "absentee_owner": "Owner details (absentee, mailing address, sold)",
     "probate": "Probate",
     "code_violation": "Code violations",
+    "qa_check": "Nightly QA check (dead / wrong information)",
 }
 WEEKLY_SOURCES = {"foreclosure_mie": "Foreclosure auctions"}
 

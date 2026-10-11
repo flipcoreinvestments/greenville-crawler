@@ -121,6 +121,12 @@ COLUMNS = [
     # an export stamp would mark everything "pulled" after one night.
     "Skip-Traced", "Last Skip-Traced",
     "Last Sale Amount", "Last Recorded Sale Date",
+    # 2026-10-11: the owner's mailing address split into the separate fields
+    # BatchData/PropStream's skip-trace upload has for it (street / city /
+    # state / zip). Upload BOTH the property address and these -- BatchData
+    # says the mailing address improves the match because owners often live
+    # somewhere else. Added at the end so saved GHL import mappings still line up.
+    "Mailing Street", "Mailing City",
 ]
 
 MAIL_TAIL = re.compile(r",?\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?\s*$", re.I)
@@ -371,6 +377,7 @@ def to_csv(rows, today):
             st_label,
             st_when.strftime("%m/%d/%Y") if hasattr(st_when, "strftime") else (str(st_when) if st_when else ""),
             *last_sale(raw),
+            *split_contact_address(r.get("mailing_address"))[:2],
         ])
     return buf.getvalue()
 
@@ -423,11 +430,42 @@ def split_contact_address(addr):
     for town in _KNOWN_TOWNS:
         if rest.upper().endswith(" " + town.upper()):
             return rest[: -len(town)].strip(" ,"), town, st, z
+    # Not a known town: the city is whatever follows the last street-type
+    # word (or apartment/unit number) -- "4353 DON TOMASO DR # 9 LOS ANGELES".
+    toks = rest.split()
+    cut = None
+    pm = re.match(r"^(P\.?\s*O\.?\s*BOX|BOX)\s+\S+\s+(.+)$", rest, re.I)
+    if pm:
+        return rest[: len(rest) - len(pm.group(2))].strip(" ,"), pm.group(2).strip(" ,").title(), st, z
+    for i, t in enumerate(toks):
+        u = t.upper().strip(".,")
+        if i > 0 and u in _STREET_WORDS:
+            cut = i + 1
+            if cut < len(toks) and toks[cut].upper().strip(".,") in _UNIT_WORDS:
+                cut += 2  # "APT 1H", "# 9", "STE 200"
+        elif u in _UNIT_WORDS and cut is not None and i == cut:
+            cut = i + 2
+    if cut is not None and cut < len(toks):
+        return " ".join(toks[:cut]).strip(" ,"), " ".join(toks[cut:]).strip(" ,").title(), st, z
     return rest, "", st, z
 
 
+_STREET_WORDS = {
+    "ST", "STREET", "RD", "ROAD", "DR", "DRIVE", "AVE", "AVENUE", "AV", "LN", "LANE", "CT", "COURT",
+    "WAY", "BLVD", "CIR", "CIRCLE", "HWY", "HIGHWAY", "TRL", "TRAIL", "PL", "PLACE", "PKWY", "TER",
+    "TERRACE", "LOOP", "RUN", "PT", "POINTE", "XING", "PIKE", "ROW", "SQ", "EXT", "N", "S", "E", "W",
+}
+_UNIT_WORDS = {"APT", "UNIT", "STE", "SUITE", "#", "LOT", "BLDG"}
+
+
 def segment(row):
-    """'probate_pr' | 'deceased_hold' | 'main' for one house/land lead."""
+    """'dead' | 'wrong_info' | 'probate_pr' | 'deceased_hold' | 'main' for one
+    house/land lead. dead / wrong_info come from the nightly QA check
+    (qa_check.py) and win over everything, so those leads never reach a
+    skip-trace upload."""
+    status = (row.get("lead_status") or "").strip()
+    if status in ("dead", "wrong_info"):
+        return status
     tags = set(row.get("source_tags") or [])
     if "probate" in tags:
         name, _, _ = probate_contact((row.get("raw") or {}).get("probate"))
@@ -478,6 +516,33 @@ def probate_csv(rows, today):
             st_when.strftime("%m/%d/%Y") if hasattr(st_when, "strftime") else (str(st_when)[:10] if st_when else ""),
             today.isoformat(),
         ])
+    return buf.getvalue()
+
+
+# --------------------------------------------------------- dead / wrong info
+STATUS_COLUMNS = ["Status", "Why", "Marked On"]
+
+
+def dead_rows(conn):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("select l.*, false as triple from leads l where l.lead_status = 'dead' "
+                    "order by l.lead_status_at desc nulls last, l.address")
+        return cur.fetchall()
+
+
+def status_csv(rows, today):
+    """Same columns as the call lists, with Status / Why / Marked On in front,
+    so a dead or wrong lead can be found in GHL by its address and fixed or
+    removed there."""
+    body = list(csv.reader(io.StringIO(to_csv(rows, today))))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(STATUS_COLUMNS + body[0])
+    for r, line in zip(rows, body[1:]):
+        when = r.get("lead_status_at")
+        w.writerow([{"dead": "Dead", "wrong_info": "Wrong Information"}.get(r.get("lead_status"), ""),
+                    r.get("lead_status_reason") or "",
+                    when.strftime("%m/%d/%Y") if hasattr(when, "strftime") else ""] + line)
     return buf.getvalue()
 
 
@@ -570,19 +635,29 @@ def upload(files, key, url=SUPABASE_URL, session=None):
 def build(conn, today=None):
     today = today or date.today()
     out, counts = [], {}
-    probate_pr, hold = [], []
+    probate_pr, hold, wrong = [], [], []
     for view in ("house_leads", "land_leads"):
         rows = lead_rows(conn, view)
         main_rows = []
         for r in rows:
             seg = segment(r)
-            (probate_pr if seg == "probate_pr" else hold if seg == "deceased_hold" else main_rows).append(r)
+            {"probate_pr": probate_pr, "deceased_hold": hold, "wrong_info": wrong,
+             "dead": []}.get(seg, main_rows).append(r)
         counts[view] = len(main_rows)
         out.append((f"{view}.csv", to_csv(main_rows, today), "text/csv"))
     counts["probate_pr_leads"] = len(probate_pr)
     counts["deceased_owner_hold"] = len(hold)
     out.append(("probate_pr_leads.csv", probate_csv(probate_pr, today), "text/csv"))
     out.append(("deceased_owner_hold.csv", to_csv(hold, today), "text/csv"))
+    # 2026-10-11 (T Dawg's ask): the nightly QA check's results, each in its
+    # own folder. Wrong-information leads come from the call-list views; dead
+    # leads (sold / off every list) are no longer in those views, so they're
+    # read straight from the leads table.
+    dead = dead_rows(conn)
+    counts["dead_leads"] = len(dead)
+    counts["wrong_information_leads"] = len(wrong)
+    out.append(("dead/dead_leads.csv", status_csv(dead, today), "text/csv"))
+    out.append(("wrong_information/wrong_information_leads.csv", status_csv(wrong, today), "text/csv"))
     report, warn = health_report(conn, counts, today)
     out.append(("system_health.txt", report, "text/plain"))
     return out, warn
@@ -601,6 +676,11 @@ def main():
         # ensure_schema() so the rebuilt views include them.
         cur.execute("alter table leads add column if not exists skiptrace_status text")
         cur.execute("alter table leads add column if not exists skiptrace_date timestamptz")
+        # nightly QA marks (qa_check.py, 2026-10-11) -- added before the views
+        # are rebuilt so they carry the columns.
+        cur.execute("alter table leads add column if not exists lead_status text")
+        cur.execute("alter table leads add column if not exists lead_status_reason text")
+        cur.execute("alter table leads add column if not exists lead_status_at timestamptz")
     ensure_schema(conn)
     conn.commit()
     files, warn = build(conn)

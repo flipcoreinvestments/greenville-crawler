@@ -113,6 +113,15 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/alert_stacked_leads.py
 
+      # 2026-10-11: re-checks the last 1,000 leads + every skip-traced lead;
+      # marks sold/off-list leads DEAD and bad-data leads WRONG INFORMATION
+      # so the export keeps them out of the skip-trace lists.
+      - name: Nightly QA check (dead / wrong information)
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/qa_check.py
+
       - name: Write call lists + system health (private Supabase bucket lead-exports)
         if: ${{ !cancelled() }}
         env:
