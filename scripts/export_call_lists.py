@@ -36,7 +36,7 @@ import psycopg2
 import psycopg2.extras
 
 from lead_common import ensure_schema
-from skiptrace_prep import compute_skiptrace_identity, probate_contact, probate_heirs, split_name
+from skiptrace_prep import compute_skiptrace_identity, probate_contact, probate_heirs, split_name, owner_trace_names
 
 PROBATE_CASE_URL = "https://www.greenvillecounty.org/appsas400/Probate/SearchDetails.aspx?CaseNumber={case_number}"
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://izxqrskybwtqzbbbzlux.supabase.co")
@@ -127,6 +127,9 @@ COLUMNS = [
     # says the mailing address improves the match because owners often live
     # somewhere else. Added at the end so saved GHL import mappings still line up.
     "Mailing Street", "Mailing City",
+    # 2026-10-11: second co-owner (spouse etc.) as a backup person to trace,
+    # and what kind of owner it is (Person / Trust / Company).
+    "Skiptrace Owner 2 First Name", "Skiptrace Owner 2 Last Name", "Owner Type",
 ]
 
 MAIL_TAIL = re.compile(r",?\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?\s*$", re.I)
@@ -306,6 +309,15 @@ def lead_rows(conn, view):
         return cur.fetchall()
 
 
+def _owner2(r, tags):
+    """(owner-2 first, owner-2 last, owner type). Probate leads trace the
+    Personal Representative, so no co-owner is offered there."""
+    n = owner_trace_names(r.get("owner_name"))
+    if "probate" in tags:
+        return "", "", n["kind"]
+    return n["first2"], n["last2"], n["kind"]
+
+
 def to_csv(rows, today):
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -378,6 +390,7 @@ def to_csv(rows, today):
             st_when.strftime("%m/%d/%Y") if hasattr(st_when, "strftime") else (str(st_when) if st_when else ""),
             *last_sale(raw),
             *split_contact_address(r.get("mailing_address"))[:2],
+            *_owner2(r, tags),
         ])
     return buf.getvalue()
 

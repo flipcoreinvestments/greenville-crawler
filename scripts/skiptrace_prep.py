@@ -179,6 +179,87 @@ def probate_heirs(probate, exclude_name=None, decedent_name=None):
     return "; ".join(out)
 
 
+# --------------------------------------------------------------------------
+# OWNER NAME -> SKIP-TRACE NAME (added 2026-10-11, T Dawg's ask: "some are
+# LLCs, some have 7 names, some are trusts -- how do I search that as a name?")
+#
+# The county writes owners LAST FIRST MIDDLE, glues co-owners on with "&" or
+# ",", tags ownership types in parentheses ((JTWROS), (L-EST), (SURV)...), and
+# cuts the whole field off at ~30 characters. A skip-trace platform needs ONE
+# person's first + last name. Rules:
+#   person        first owner listed = the person to trace; the second owner
+#                 goes in the Owner 2 columns (a spouse/co-owner is a second
+#                 shot at a working number)
+#   trust         a trust named for a person ("Jenkins Lonnie Revocable
+#                 Trust") is traced as that person -- usually the trustee
+#                 and owner. A family-name trust ("Anderson Family Living
+#                 Trust") has only a last name to search; the address does
+#                 the rest.
+#   company       LLC/Inc/etc. has no person to search by name: first name
+#                 blank, the full company name in last name (BatchData's
+#                 guidance: include the full business name). These leads are
+#                 already kept off the call lists (business_owned_leads).
+# --------------------------------------------------------------------------
+_TAG_RE = re.compile(r"\([^)&]*\)?|\bETAL\b|\bET AL\b|\bL-?EST\b|\bJTWROS\b|\bA/K/A\b.*$|\bAKA\b.*$", re.I)
+_TRUST_WORDS = re.compile(
+    r"\b(REVOCABLE|IRREVOCABLE|REVOC|REV|LIVING|FAMILY|TRUSTEES?|TRUST|TR|TRS|U/W|ESTATE OF|ESTATE|"
+    r"THE|DECLARATION|DATED|DTD|AGREEMENT|B|LIFE)\b\.?", re.I)
+_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
+_PARTICLES = {"DE", "DEL", "DELA", "DA", "DI", "DOS", "VAN", "VON", "LA", "LE", "ST", "MAC", "O"}
+# organizations the county lists that aren't in the business-owner word list
+# (kept local so the call-list split in lead_common.py doesn't change)
+_ORG_RE = re.compile(r"\b(HOUSING|CONNECTIONS|FOUNDATION|SERVICES|ASSOCIATES|FUND|VETERANS|AFFAIRS|"
+                     r"HOMEOWNERS|ADMIN|SOCIETY|CLUB|LODGE|CENTER|ACADEMY|CHILDREN|GRANDCHILDREN|HEIRS)\b", re.I)
+
+
+def _person_from_county(chunk, fallback_last=""):
+    """'Ables Milton Edward Jr' -> ('Milton', 'Ables'). 'David M' with a
+    fallback last name (co-owner listed without a surname, 'Butler William M
+    & David M') -> ('David', 'Butler')."""
+    toks = [t for t in re.findall(r"[A-Za-z][A-Za-z'\-]*", chunk or "") if t.upper().strip(".") not in _SUFFIXES]
+    if not toks:
+        return "", ""
+    # "De Jesus Claudia" -> last name "De Jesus"
+    while len(toks) > 2 and toks[0].upper() in _PARTICLES:
+        toks = [toks[0] + " " + toks[1]] + toks[2:]
+    if fallback_last and (len(toks) == 1 or (len(toks) == 2 and len(toks[1]) == 1)):
+        return toks[0].title(), fallback_last.title()
+    if len(toks) == 1:
+        return "", toks[0].title()
+    return toks[1].title(), toks[0].title()
+
+
+def owner_trace_names(owner_name):
+    """-> dict(first, last, first2, last2, kind) for the skip-trace upload."""
+    raw = (owner_name or "").strip()
+    out = {"first": "", "last": "", "first2": "", "last2": "", "kind": ""}
+    if not raw:
+        return out
+    if owner_is_entity(raw) or _ORG_RE.search(raw):
+        out.update(last=re.sub(r"\s+", " ", raw),
+                   kind="Trust" if re.search(r"\bTRUST", raw, re.I) else "Company")
+        return out
+    name = _TAG_RE.sub(" ", raw)
+    # county mashed two owner lines together ("Frisbee Betty DFrisbee Robert F")
+    name = re.sub(r"([a-z])([A-Z][a-z])", r"\1 & \2", name)
+    chunks = [c.strip() for c in re.split(r"\s*[&,]\s*", name) if c.strip()]
+    is_trust = bool(re.search(r"\b(TRUST|TRUSTEE|U/W|REVOC)", raw, re.I))
+    first_chunk = chunks[0] if chunks else ""
+    if is_trust:
+        first_chunk = _TRUST_WORDS.sub(" ", first_chunk)
+    f1, l1 = _person_from_county(first_chunk)
+    out.update(first=f1, last=l1, kind="Trust" if is_trust else "Person")
+    if len(chunks) > 1:
+        second = _TRUST_WORDS.sub(" ", chunks[1]) if is_trust else chunks[1]
+        toks = re.findall(r"[A-Za-z][A-Za-z'\-]*", second)
+        # skip a co-owner the county cut off mid-name ("Ledfo", "Jenn", "B")
+        if toks and not (len(toks) == 1 and len(toks[0]) <= 4 and toks[0].upper() != l1.upper()):
+            f2, l2 = _person_from_county(second, fallback_last=l1)
+            if f2 and (f2, l2) != (f1, l1):
+                out.update(first2=f2, last2=l2)
+    return out
+
+
 def compute_skiptrace_identity(r, tags):
     """
     r: one row dict from house_leads/land_leads (needs owner_name, address,
@@ -208,22 +289,24 @@ def compute_skiptrace_identity(r, tags):
             if pr_address:
                 return first, last, pr_address, None
             return first, last, property_address, PR_NO_ADDRESS_NOTE
-        first, last = split_name(owner_name)
-        return first, last, property_address, NO_PR_NOTE
+        n = owner_trace_names(owner_name)
+        return n["first"], n["last"], property_address, NO_PR_NOTE
 
     if "pre_probate" in tags:
         # 2026-10-10: PropStream says the owner died but no Greenville probate
         # case exists yet, so there's no Personal Representative to trace.
         # Trace the owner of record as before, but warn in the Call Brief.
-        first, last = split_name(owner_name)
+        n = owner_trace_names(owner_name)
+        first, last = n["first"], n["last"]
         addr = property_address if not is_untraceable_address(property_address) else mailing_address
         return first, last, addr, PRE_PROBATE_NOTE
 
     if is_untraceable_address(property_address):
-        first, last = split_name(owner_name)
+        n = owner_trace_names(owner_name)
+        first, last = n["first"], n["last"]
         if mailing_address:
             return first, last, mailing_address, None
         return first, last, "", LAND_NO_MAILING_NOTE
 
-    first, last = split_name(owner_name)
-    return first, last, property_address, None
+    n = owner_trace_names(owner_name)
+    return n["first"], n["last"], property_address, None
