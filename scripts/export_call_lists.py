@@ -479,6 +479,13 @@ def segment(row):
     status = (row.get("lead_status") or "").strip()
     if status in ("dead", "wrong_info"):
         return status
+    # 2026-10-11: anything already pulled for skip trace never goes back on
+    # the morning lists (skiptrace_intake.py marks it from her result files)
+    st = (row.get("skiptrace_status") or "").strip()
+    if st == "traced":
+        return "skiptraced"
+    if st == "failed":
+        return "fixed_unskiptraced" if row.get("skiptrace_fix_status") == "fixed" else "not_skiptraced"
     tags = set(row.get("source_tags") or [])
     if "probate" in tags:
         name, _, _ = probate_contact((row.get("raw") or {}).get("probate"))
@@ -557,6 +564,61 @@ def status_csv(rows, today):
                     r.get("lead_status_reason") or "",
                     when.strftime("%m/%d/%Y") if hasattr(when, "strftime") else ""] + line)
     return buf.getvalue()
+
+
+# ----------------------------------------------------- skip-trace folders
+def _d(v):
+    if hasattr(v, "strftime"):
+        return v.strftime("%m/%d/%Y")
+    return str(v)[:10] if v else ""
+
+
+def months_since_trace(r):
+    when = r.get("skiptrace_date")
+    traced_month = when.strftime("%Y-%m") if hasattr(when, "strftime") else str(when or "")[:7]
+    return len([m for m in (r.get("active_months") or []) if m > traced_month])
+
+
+def is_repeat_offender(r):
+    """Traced, and still a solid lead in a later month than it was traced."""
+    return (r.get("skiptrace_status") == "traced") and months_since_trace(r) >= 1
+
+
+def prefixed_csv(rows, today, headers, values, mark=None):
+    """The normal call-list columns with extra columns in front. `mark`
+    puts a "!" (repeat offender) or "#" (needs a person) in front of the
+    owner name so it shows up in GHL too."""
+    shown = []
+    for r in rows:
+        r2 = dict(r)
+        m = mark(r) if mark else ""
+        if m and r2.get("owner_name"):
+            r2["owner_name"] = m + r2["owner_name"]
+        shown.append(r2)
+    body = list(csv.reader(io.StringIO(to_csv(shown, today))))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(headers + body[0])
+    for r, line in zip(rows, body[1:]):
+        w.writerow(values(r) + line)
+    return buf.getvalue()
+
+
+def error_rows(conn, days=30):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """select e.found_at, e.reason, l.*, false as triple
+               from lead_error_log e join leads l on l.id = e.lead_id
+               where e.found_at > now() - (%s || ' days')::interval
+               order by e.found_at desc, l.address""", (str(days),))
+        return cur.fetchall()
+
+
+def errors_csv(rows, today):
+    """Already-pulled leads whose information changed -- update them in GHL."""
+    return prefixed_csv(rows, today, ["Found On", "What Changed (update GHL)", "Skip-Traced?"],
+                        lambda r: [_d(r.get("found_at")), r.get("reason") or "",
+                                   {"traced": "Traced", "failed": "Not traced"}.get(r.get("skiptrace_status"), "")])
 
 
 # ------------------------------------------------------------------ health
@@ -649,13 +711,15 @@ def build(conn, today=None):
     today = today or date.today()
     out, counts = [], {}
     probate_pr, hold, wrong = [], [], []
+    traced, not_traced, fixed = [], [], []
     for view in ("house_leads", "land_leads"):
         rows = lead_rows(conn, view)
         main_rows = []
         for r in rows:
             seg = segment(r)
-            {"probate_pr": probate_pr, "deceased_hold": hold, "wrong_info": wrong,
-             "dead": []}.get(seg, main_rows).append(r)
+            {"probate_pr": probate_pr, "deceased_hold": hold, "wrong_info": wrong, "dead": [],
+             "skiptraced": traced, "not_skiptraced": not_traced,
+             "fixed_unskiptraced": fixed}.get(seg, main_rows).append(r)
         counts[view] = len(main_rows)
         out.append((f"{view}.csv", to_csv(main_rows, today), "text/csv"))
     counts["probate_pr_leads"] = len(probate_pr)
@@ -671,6 +735,27 @@ def build(conn, today=None):
     counts["wrong_information_leads"] = len(wrong)
     out.append(("dead/dead_leads.csv", status_csv(dead, today), "text/csv"))
     out.append(("wrong_information/wrong_information_leads.csv", status_csv(wrong, today), "text/csv"))
+    # 2026-10-11 skip-trace folders (see skiptrace_intake.py / skiptrace_followup.py)
+    repeat = [r for r in traced if is_repeat_offender(r)]
+    counts.update({"skiptraced_leads": len(traced), "repeat_offenders": len(repeat),
+                   "not_skiptraced_leads": len(not_traced), "fixed_unskiptraced_leads": len(fixed)})
+    out.append(("skiptraced/skiptraced_leads.csv", prefixed_csv(
+        traced, today, ["Repeat Offender", "Months On Lists Since Traced", "Last Skip-Traced"],
+        lambda r: ["!" if is_repeat_offender(r) else "", months_since_trace(r), _d(r.get("skiptrace_date"))],
+        mark=lambda r: "! " if is_repeat_offender(r) else ""), "text/csv"))
+    out.append(("repeat_offenders/repeat_offenders.csv", prefixed_csv(
+        repeat, today, ["Months On Lists Since Traced", "Last Skip-Traced"],
+        lambda r: [months_since_trace(r), _d(r.get("skiptrace_date"))], mark=lambda r: "! "), "text/csv"))
+    out.append(("not_skiptraced/not_skiptraced_leads.csv", prefixed_csv(
+        not_traced, today, ["Needs Human (#)", "Why It Can't Be Traced Yet / What To Check", "Times Traced"],
+        lambda r: ["#", r.get("skiptrace_fix_note") or "", r.get("skiptrace_attempts") or 1],
+        mark=lambda r: "# "), "text/csv"))
+    out.append(("fixed_unskiptraced/fixed_unskiptraced_leads.csv", prefixed_csv(
+        fixed, today, ["What Was Fixed", "Times Traced"],
+        lambda r: [r.get("skiptrace_fix_note") or "", r.get("skiptrace_attempts") or 1]), "text/csv"))
+    err = error_rows(conn)
+    counts["errors_last_30_days"] = len(err)
+    out.append(("errors/errors.csv", errors_csv(err, today), "text/csv"))
     report, warn = health_report(conn, counts, today)
     out.append(("system_health.txt", report, "text/plain"))
     return out, warn
@@ -694,6 +779,9 @@ def main():
         cur.execute("alter table leads add column if not exists lead_status text")
         cur.execute("alter table leads add column if not exists lead_status_reason text")
         cur.execute("alter table leads add column if not exists lead_status_at timestamptz")
+    # skip-trace pipeline columns + error log (skiptrace_intake.py, 2026-10-11)
+    from skiptrace_intake import ensure_columns as ensure_skiptrace_columns
+    ensure_skiptrace_columns(conn)
     ensure_schema(conn)
     conn.commit()
     files, warn = build(conn)

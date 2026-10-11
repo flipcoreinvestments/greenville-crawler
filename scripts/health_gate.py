@@ -30,6 +30,8 @@ NIGHTLY_SOURCES = {
     "probate": "Probate",
     "code_violation": "Code violations",
     "qa_check": "Nightly QA check (dead / wrong information)",
+    "skiptrace_intake": "Skip-trace results import",
+    "skiptrace_followup": "Skip-trace follow-up (fixed / needs human / errors)",
 }
 WEEKLY_SOURCES = {"foreclosure_mie": "Foreclosure auctions"}
 
