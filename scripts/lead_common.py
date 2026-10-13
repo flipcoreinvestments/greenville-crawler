@@ -116,8 +116,15 @@ def is_residential(land_use):
     return None if code is None else code in RESIDENTIAL_LAND_USE
 
 
+# 2026-10-13: CHURCH and BANK are also surnames ("CHURCH , DEBRA LYNN").
+# A leading CHURCH / BANK(S) followed by a person's first name is a person;
+# "CHURCH OF GOD", "CHURCH IN GREENVILLE INC" stay organizations.
+SURNAME_WORDS_SQL = r"^\s*(CHURCH|BANKS?)(\s*,\s*|\s+)(?!(OF|IN|ON|AT|THE|AND)\M)"
+_SURNAME_WORDS_RE = re.compile(r"^\s*(CHURCH|BANKS?)(\s*,\s*|\s+)(?!(OF|IN|ON|AT|THE|AND)\b)", re.I)
+
+
 def owner_is_entity(owner_name):
-    return bool(owner_name and _ENTITY_RE.search(owner_name))
+    return bool(owner_name and _ENTITY_RE.search(_SURNAME_WORDS_RE.sub("", owner_name)))
 
 
 def mailing_is_address(mailing):
@@ -171,11 +178,20 @@ def ensure_schema(conn):
         # owner is part of that business (345 Ligon St and Made New
         # Renovations LLC both mail to 701 Easley Bridge Rd).
         mail_key = "lower(regexp_replace(coalesce({t}.mailing_address, ''), '[^a-zA-Z0-9]', '', 'g'))"
+        name_is_entity = ("(regexp_replace(coalesce({t}.owner_name, ''), '" + SURNAME_WORDS_SQL
+                          + "', '', 'i') ~* '" + ENTITY_SQL + "')")
+        # FIX 2026-10-13: the shared-mailing rule matched BLANK mailing
+        # addresses to each other, so ~980 person-owned leads (mostly probate
+        # owners with no mailing on file) were filed as business-owned and
+        # hidden from the call lists. A mailing address now has to be a full
+        # address (house/box number AND a 5-digit zip) before two owners can
+        # be tied together by it.
+        full_mail = "({t}.mailing_address ~* '^\\s*(\\d|P\\.?\\s*O\\.?\\s*BOX)' and {t}.mailing_address ~ '\\d{{5}}(-\\d{{4}})?\\s*$')"
         entity = (
-            f"(coalesce(l.owner_name, '') ~* '{ENTITY_SQL}' or exists ("
-            f"select 1 from leads b where b.mailing_address is not null and b.id <> l.id "
+            f"({name_is_entity.format(t='l')} or ({full_mail.format(t='l')} and exists ("
+            f"select 1 from leads b where b.id <> l.id and {full_mail.format(t='b')} "
             f"and {mail_key.format(t='b')} = {mail_key.format(t='l')} "
-            f"and coalesce(b.owner_name, '') ~* '{ENTITY_SQL}'))"
+            f"and {name_is_entity.format(t='b')})))"
         )
         # FIX 2026-09-27: without this index the shared-mailing check scans
         # all ~99k rows once per lead -- the views took 5+ minutes and timed

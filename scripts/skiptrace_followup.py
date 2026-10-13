@@ -141,7 +141,10 @@ def describe_changes(old, new, reason):
         out.append("sold (new deed recorded)")
     for key, label in [("owner", "owner"), ("mailing", "mailing address"), ("city", "city"),
                        ("zip", "zip"), ("pr", "Personal Representative")]:
-        if (old.get(key) or "") != (new.get(key) or "") and (new.get(key) or ""):
+        # 2026-10-13: only a real change counts -- the county re-sending the
+        # same name in different capitals / commas ("MAHAFFEY , WINFRED J" ->
+        # "Mahaffey Winfred J") is not an error on the lead.
+        if _norm(old.get(key)) != _norm(new.get(key)) and (new.get(key) or ""):
             was = old.get(key) or "blank"
             out.append(f"{label} changed: {was} -> {new.get(key)}")
     o, n = set(old.get("lists") or []), set(new.get("lists") or [])
@@ -150,6 +153,28 @@ def describe_changes(old, new, reason):
     if o - n and new.get("status") != "dead":
         out.append("dropped off: " + ", ".join(LIST_NAMES.get(x, x) for x in sorted(o - n)))
     return "; ".join(out)
+
+
+_CHANGE = re.compile(r"^\s*(owner|mailing address|city|zip|Personal Representative) changed: (.*) -> (.*)$")
+
+
+def dismiss_false_alarms(conn):
+    """2026-10-13: errors logged before the capitals/commas fix whose only
+    'change' was formatting are marked dismissed (kept, never deleted), so
+    they don't tag a lead "update lead info"."""
+    with conn.cursor() as cur:
+        cur.execute("alter table lead_error_log add column if not exists dismissed boolean not null default false")
+        cur.execute("select id, reason from lead_error_log where not dismissed")
+        ids = []
+        for eid, reason in cur.fetchall():
+            parts = [p for p in (reason or "").split("; ") if p.strip()]
+            ms = [_CHANGE.match(p) for p in parts]
+            if parts and all(m and _norm(m.group(2)) == _norm(m.group(3)) for m in ms):
+                ids.append(eid)
+        if ids:
+            cur.execute("update lead_error_log set dismissed = true where id = any(%s)", (ids,))
+    conn.commit()
+    return len(ids)
 
 
 def detect_errors(conn):
@@ -199,6 +224,9 @@ def main():
     ensure_schema(conn)
     conn.commit()
     qa = second_qa(conn)
+    dismissed = dismiss_false_alarms(conn)
+    if dismissed:
+        print(f"Dismissed {dismissed} old error(s) that were only capital-letter/comma differences.")
     errors = detect_errors(conn)
     repeat = track_months(conn)
     with conn.cursor() as cur:

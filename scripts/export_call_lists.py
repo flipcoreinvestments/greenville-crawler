@@ -130,6 +130,11 @@ COLUMNS = [
     # 2026-10-11: second co-owner (spouse etc.) as a backup person to trace,
     # and what kind of owner it is (Person / Trust / Company).
     "Skiptrace Owner 2 First Name", "Skiptrace Owner 2 Last Name", "Owner Type",
+    # 2026-10-13 (T Dawg's ask): a lead already pulled whose information
+    # changed (errors/errors.csv) stays on whatever list it is on, tagged
+    # "update lead info" so a GHL import with "update existing contacts"
+    # updates the contact already there. This column says what changed.
+    "What Changed (update GHL)",
 ]
 
 MAIL_TAIL = re.compile(r",?\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?\s*$", re.I)
@@ -318,6 +323,55 @@ def _owner2(r, tags):
     return n["first2"], n["last2"], n["kind"]
 
 
+# 2026-10-13: open errors (leads already pulled whose information changed in
+# the last ERROR_DAYS days), filled by build() before any file is written.
+ERROR_DAYS = 30
+OPEN_ERRORS = {}
+
+
+def open_errors(conn, days=ERROR_DAYS):
+    """{lead id: 'what changed; ...'} for every lead on the error list."""
+    with conn.cursor() as cur:
+        cur.execute("alter table lead_error_log add column if not exists dismissed boolean not null default false")
+        cur.execute("""select lead_id, string_agg(reason, '; ' order by found_at desc)
+                       from lead_error_log where found_at > now() - (%s || ' days')::interval
+                         and not coalesce(dismissed, false)
+                       group by lead_id""", (str(days),))
+        return {str(k): v for k, v in cur.fetchall()}
+
+
+def _same_person(a_first, a_last, b_first, b_last):
+    """Same last name and same first 3 letters of the first name (Loyd /
+    Lloyd, Jr / Sr suffixes and middle names don't count as a change)."""
+    n = lambda x: re.sub(r"[^a-z]", "", (x or "").lower())
+    if n(a_last) != n(b_last):
+        return False
+    fa, fb = n(a_first), n(b_first)
+    return not fa or not fb or fa[:3] == fb[:3]
+
+
+def ghl_update_tags(r, st_first, st_last):
+    """(extra GHL tags, what changed) for one lead.
+      update lead info    the lead is on the error list -- update its GHL contact
+      delete - dead lead  ... and it is now dead (sold / off every list)
+      retrace             it was traced, but the person to trace has changed
+                          since (a Personal Representative was appointed, the
+                          owner changed) -- the old phones are the wrong person's"""
+    tags, changed = [], OPEN_ERRORS.get(str(r.get("id"))) or ""
+    if changed:
+        tags.append("update lead info")
+        if r.get("lead_status") == "dead":
+            tags.append("delete - dead lead")
+    inp = r.get("skiptrace_input") or {}
+    if (r.get("skiptrace_status") == "traced" and (inp.get("first") or inp.get("last"))
+            and (st_first or st_last)
+            and not _same_person(inp.get("first"), inp.get("last"), st_first, st_last)):
+        tags.append("retrace")
+        note = f"person to trace is now {st_first} {st_last} (traced {inp.get('first', '')} {inp.get('last', '')})"
+        changed = f"{changed}; {note}" if changed else note
+    return tags, changed
+
+
 def to_csv(rows, today):
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -363,12 +417,14 @@ def to_csv(rows, today):
                 st_when = datetime.fromisoformat(st_when[:10])
             except ValueError:
                 pass
+        extra_tags, changed = ghl_update_tags(r, st_first, st_last)
         w.writerow([
             call_brief(r, tags, raw, mst, reasons),
             ", ".join(GHL_LIST_OPTIONS[x] for x in ordered),
             ", ".join(owner_situation(r, mst)),
             decision,
-            ", ".join("list-" + re.sub(r"[^a-z0-9]+", "-", GHL_LIST_OPTIONS[x].lower()).strip("-") for x in ordered),
+            ", ".join(["list-" + re.sub(r"[^a-z0-9]+", "-", GHL_LIST_OPTIONS[x].lower()).strip("-")
+                       for x in ordered] + extra_tags),
             i, flag, int(r.get("score") or 0), r["address"], (r.get("city") or "").title(),
             r.get("state") or "SC", r.get("zip") or "",
             r.get("owner_name") or "", r.get("mailing_address") or "", mst, mzip,
@@ -391,6 +447,7 @@ def to_csv(rows, today):
             *last_sale(raw),
             *split_contact_address(r.get("mailing_address"))[:2],
             *_owner2(r, tags),
+            changed,
         ])
     return buf.getvalue()
 
@@ -418,6 +475,7 @@ PROBATE_COLUMNS = [
     "Property Address", "Property City", "Property State", "Property Zip", "Owner on Title",
     "Distress List", "Tags", "Call Brief", "Flag", "Score", "Vacant (USPS)", "Tax Owed",
     "Land Use", "Parcel #", "Check Before Calling", "Skip-Traced", "Last Skip-Traced", "Exported",
+    "What Changed (update GHL)",
 ]
 
 _KNOWN_TOWNS = sorted([
@@ -518,6 +576,7 @@ def probate_csv(rows, today):
         amount = (raw.get("tax_sale") or {}).get("amount_due") or ""
         st_status = (r.get("skiptrace_status") or "").strip().lower()
         st_when = r.get("skiptrace_date")
+        extra_tags, changed = ghl_update_tags(r, first, last)
         w.writerow([
             first, last, name, role, street, city, st, z,
             re.sub(r"\s*,\s*", ", ", pb.get("decedent_name") or "").strip(" ,") or r.get("owner_name") or "",
@@ -527,7 +586,8 @@ def probate_csv(rows, today):
             r["address"], (r.get("city") or "").title(), r.get("state") or "SC", r.get("zip") or "",
             r.get("owner_name") or "",
             ", ".join(GHL_LIST_OPTIONS[x] for x in ordered),
-            ", ".join("list-" + re.sub(r"[^a-z0-9]+", "-", GHL_LIST_OPTIONS[x].lower()).strip("-") for x in ordered),
+            ", ".join(["list-" + re.sub(r"[^a-z0-9]+", "-", GHL_LIST_OPTIONS[x].lower()).strip("-")
+                       for x in ordered] + extra_tags),
             call_brief(r, tags, raw, mst, reasons),
             "***" if r.get("triple") else "", int(r.get("score") or 0), yn(r.get("is_vacant")),
             f"${float(amount):,.2f}" if re.match(r"^\d+(\.\d+)?$", str(amount)) else "",
@@ -535,6 +595,7 @@ def probate_csv(rows, today):
             {"traced": "Traced", "failed": "Failed"}.get(st_status, "No"),
             st_when.strftime("%m/%d/%Y") if hasattr(st_when, "strftime") else (str(st_when)[:10] if st_when else ""),
             today.isoformat(),
+            changed,
         ])
     return buf.getvalue()
 
@@ -604,13 +665,16 @@ def prefixed_csv(rows, today, headers, values, mark=None):
     return buf.getvalue()
 
 
-def error_rows(conn, days=30):
+def error_rows(conn, days=ERROR_DAYS):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            """select e.found_at, e.reason, l.*, false as triple
-               from lead_error_log e join leads l on l.id = e.lead_id
-               where e.found_at > now() - (%s || ' days')::interval
-               order by e.found_at desc, l.address""", (str(days),))
+            """select * from (
+                 select distinct on (l.id) e.found_at, e.reason, l.*, false as triple
+                 from lead_error_log e join leads l on l.id = e.lead_id
+                 where e.found_at > now() - (%s || ' days')::interval
+                   and not coalesce(e.dismissed, false)
+                 order by l.id, e.found_at desc) x
+               order by found_at desc, address""", (str(days),))
         return cur.fetchall()
 
 
@@ -709,6 +773,8 @@ def upload(files, key, url=SUPABASE_URL, session=None):
 
 def build(conn, today=None):
     today = today or date.today()
+    OPEN_ERRORS.clear()
+    OPEN_ERRORS.update(open_errors(conn))
     out, counts = [], {}
     probate_pr, hold, wrong = [], [], []
     traced, not_traced, fixed = [], [], []
