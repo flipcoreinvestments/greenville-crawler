@@ -39,6 +39,7 @@ house number to search on, whichever list the row is in.
 import re
 
 from lead_common import owner_is_entity
+from name_order import decide_order
 
 NO_PR_NOTE = ("no personal representative on file yet -- any phone/email found belongs to the "
               "deceased owner, not a reachable person")
@@ -82,7 +83,10 @@ def split_name(name):
         return "", ""
     if len(toks) == 1:
         return "", toks[0].title()
-    return toks[1].title(), toks[0].title()
+    # 2026-10-13: most sources write LAST FIRST, but some names are typed
+    # FIRST LAST ("LINDA HOOD") -- name_order.py checks and flips them.
+    first, last = decide_order(toks)
+    return first.title(), last.title()
 
 
 # --------------------------------------------------------------------------
@@ -236,7 +240,10 @@ def _person_from_county(chunk, fallback_last=""):
         return toks[0].title(), fallback_last.title()
     if len(toks) == 1:
         return "", toks[0].title()
-    return toks[1].title(), toks[0].title()
+    # 2026-10-13: most sources write LAST FIRST, but some names are typed
+    # FIRST LAST ("LINDA HOOD") -- name_order.py checks and flips them.
+    first, last = decide_order(toks)
+    return first.title(), last.title()
 
 
 def owner_trace_names(owner_name):
@@ -252,7 +259,9 @@ def owner_trace_names(owner_name):
     # probate-court style "OLIVER , STEPHEN LEE" (LAST , FIRST): one person
     m = re.match(r"^\s*([A-Za-z'\-]+)\s*,\s*([A-Za-z].*)$", raw)
     if m and "&" not in raw and "," not in m.group(2):
-        f, _ = _person_from_county("X " + m.group(2))
+        # comma format is explicit: the first word after the comma is the first name
+        given = [t for t in re.findall(r"[A-Za-z][A-Za-z'\-]*", m.group(2)) if t.upper().strip(".") not in _SUFFIXES]
+        f = given[0].title() if given else ""
         out.update(first=f, last=m.group(1).title(), kind="Person")
         return out
     name = _TAG_RE.sub(" ", raw)
