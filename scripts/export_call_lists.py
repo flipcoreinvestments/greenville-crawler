@@ -36,7 +36,7 @@ import psycopg2
 import psycopg2.extras
 
 from lead_common import ensure_schema
-from skiptrace_prep import compute_skiptrace_identity, probate_contact, probate_heirs, split_name, owner_trace_names
+from skiptrace_prep import compute_skiptrace_identity, probate_contact, probate_heirs, split_name, owner_trace_names, _clean_addr
 
 PROBATE_CASE_URL = "https://www.greenvillecounty.org/appsas400/Probate/SearchDetails.aspx?CaseNumber={case_number}"
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://izxqrskybwtqzbbbzlux.supabase.co")
@@ -435,7 +435,7 @@ def to_csv(rows, today):
             tax_sale_status(raw, tags),
             ((raw.get("foreclosure_mie") or {}).get("sale_date") or "") if "foreclosure_mie" in tags else "",
             (probate.get("pr_name") or "") if "probate" in tags else "",
-            (probate.get("pr_address") or "") if "probate" in tags else "",
+            _clean_addr(probate.get("pr_address")) if "probate" in tags else "",
             (probate.get("date_of_death") or "") if "probate" in tags else "",
             probate.get("case_number") or "",
             (PROBATE_CASE_URL.format(case_number=probate["case_number"]) if probate.get("case_number") else ""),

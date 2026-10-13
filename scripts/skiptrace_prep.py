@@ -129,6 +129,16 @@ def _clean_person(name):
     return re.sub(r"\s+", " ", re.sub(r"\s*,\s*", ", ", name or "")).strip(" ,")
 
 
+# 2026-10-13: the last party on a case page runs into the court site's footer
+# ("... GREENVILLE SC 29605 County Home \u2022 Browser Information \u2022 Legal
+# Notice ..."). Cut the address off where the footer starts.
+_FOOTER_RE = re.compile(r"\s*(County Home|Browser Information|Legal Notice|Privacy Statement|Contact Us)\b.*$", re.I | re.S)
+
+
+def _clean_addr(addr):
+    return _FOOTER_RE.sub("", re.sub(r"\s+", " ", addr or "")).strip(" ,\u2022")
+
+
 def parse_parties(parties_text):
     """'( 3 ) Name: DOE , JANE Party Type: Personal Representative Address: 1 MAIN ST ...'
     -> [{'name': 'DOE, JANE', 'role': 'personal representative', 'address': '1 MAIN ST ...'}, ...]"""
@@ -138,7 +148,7 @@ def parse_parties(parties_text):
         role = re.sub(r"\s+", " ", (m.group(2) or "")).strip().lower()
         if not name or not role:
             continue
-        out.append({"name": name, "role": role, "address": re.sub(r"\s+", " ", m.group(3) or "").strip()})
+        out.append({"name": name, "role": role, "address": _clean_addr(m.group(3))})
     return out
 
 
@@ -155,10 +165,10 @@ def probate_contact(probate):
                 if role == "personal representative" and probate.get("pr_name"):
                     # the parsed PR (same person; keeps one spelling everywhere)
                     return (_clean_person(probate["pr_name"]), ROLE_LABELS[role],
-                            probate.get("pr_address") or p["address"])
+                            _clean_addr(probate.get("pr_address")) or p["address"])
                 return p["name"], ROLE_LABELS[role], p["address"]
     if probate.get("pr_name"):
-        return _clean_person(probate["pr_name"]), ROLE_LABELS["personal representative"], probate.get("pr_address") or ""
+        return _clean_person(probate["pr_name"]), ROLE_LABELS["personal representative"], _clean_addr(probate.get("pr_address"))
     return None, None, None
 
 
@@ -203,7 +213,7 @@ def probate_heirs(probate, exclude_name=None, decedent_name=None):
 _TAG_RE = re.compile(r"\([^)&]*\)?|\bETAL\b|\bET AL\b|\bL-?EST\b|\bJTWROS\b|\bA/K/A\b.*$|\bAKA\b.*$", re.I)
 _TRUST_WORDS = re.compile(
     r"\b(REVOCABLE|IRREVOCABLE|REVOC|REV|LIVING|FAMILY|TRUSTEES?|TRUST|TR|TRS|U/W|ESTATE OF|ESTATE|"
-    r"THE|DECLARATION|DATED|DTD|AGREEMENT|B|LIFE)\b\.?", re.I)
+    r"THE|DECLARATION|DATED|DTD|AGREEMENT|B|LIFE|MARITAL|BYPASS|CREDIT|SHELTER|SURVIVORS?|QTIP)\b\.?", re.I)
 _SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
 _PARTICLES = {"DE", "DEL", "DELA", "DA", "DI", "DOS", "VAN", "VON", "LA", "LE", "ST", "MAC", "O"}
 # organizations the county lists that aren't in the business-owner word list
