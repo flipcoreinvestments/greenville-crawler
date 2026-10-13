@@ -32,6 +32,7 @@ NIGHTLY_SOURCES = {
     "qa_check": "Nightly QA check (dead / wrong information)",
     "skiptrace_intake": "Skip-trace results import",
     "skiptrace_followup": "Skip-trace follow-up (fixed / needs human / errors)",
+    "dnc_scrub": "Do Not Call scrub (texting list)",
 }
 WEEKLY_SOURCES = {"foreclosure_mie": "Foreclosure auctions"}
 

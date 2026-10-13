@@ -685,6 +685,90 @@ def errors_csv(rows, today):
                                    {"traced": "Traced", "failed": "Not traced"}.get(r.get("skiptrace_status"), "")])
 
 
+# ------------------------------------------------------- texting list
+# 2026-10-13 (T Dawg's ask): the leads ready to text. Built from the
+# skip-traced leads, keeping only phones dnc_scrub.py checked against a
+# Do Not Call registry copy under 31 days old and found clean (not on the
+# registry, never opted out). Leads whose person to trace has changed
+# (retrace) and dead / wrong-information leads are left out.
+TEXT_COLUMNS = ["First Name", "Last Name", "Phone 1", "Phone 2", "Phone 3", "Phone 4", "Phone 5",
+                "Property Address", "Property City", "Property State", "Property Zip",
+                "Mailing Street", "Mailing City", "Mailing State", "Mailing Zip",
+                "Distress List", "Tags", "Owner Type", "Last Skip-Traced", "Phones Removed (DNC / opt-out / unchecked)"]
+DNC_FRESH_DAYS = 31
+
+
+def clean_phones(conn):
+    """{phone: True if textable}. Missing table (scrub never ran) = nothing textable."""
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('public.phone_dnc')")
+        if cur.fetchone()[0] is None:
+            return {}
+        cur.execute(f"""select phone, (on_dnc is false and not suppressed
+                                         and registry_as_of > now() - interval '{DNC_FRESH_DAYS} days')
+                        from phone_dnc""")
+        return dict(cur.fetchall())
+
+
+def text_ready_csv(conn, rows, today):
+    ok = clean_phones(conn)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(TEXT_COLUMNS)
+    n = 0
+    for r in rows:
+        if r.get("lead_status") or r.get("skiptrace_status") != "traced":
+            continue
+        tags = list(r.get("source_tags") or [])
+        first, last, _, _ = compute_skiptrace_identity(r, tags)
+        extra, _ = ghl_update_tags(r, first, last)
+        if "retrace" in extra:
+            continue
+        phones = list(r.get("skiptrace_phones") or [])
+        good = [p for p in phones if ok.get(p)]
+        if not good:
+            continue
+        ordered = [x for x in BRIEF_ORDER if x in tags]
+        street, mcity, mst, mzip = split_contact_address(r.get("mailing_address"))
+        w.writerow([first, last] + (good + [""] * 5)[:5] + [
+            r["address"], (r.get("city") or "").title(), r.get("state") or "SC", r.get("zip") or "",
+            street, mcity, mst, mzip,
+            ", ".join(GHL_LIST_OPTIONS[x] for x in ordered),
+            ", ".join(["list-" + re.sub(r"[^a-z0-9]+", "-", GHL_LIST_OPTIONS[x].lower()).strip("-")
+                       for x in ordered] + extra),
+            owner_trace_names(r.get("owner_name"))["kind"], _d(r.get("skiptrace_date")),
+            len(phones) - len(good)])
+        n += 1
+    return buf.getvalue(), n
+
+
+def dnc_health(conn, today):
+    """Lines + warnings for system_health.txt."""
+    lines, warn = ["DO NOT CALL REGISTRY (texting list uses only phones checked against a copy under 31 days old)"], []
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('public.dnc_registry_files')")
+        if cur.fetchone()[0] is None:
+            return lines + ["  no registry files uploaded yet -- text_ready.csv stays empty", ""], \
+                ["Upload this month's Do Not Call registry download to the dnc-registry bucket -- "
+                 "until then the texting list (text_ready.csv) is empty."]
+        cur.execute("""select code, max(uploaded_at) from dnc_registry_files, unnest(area_codes) code
+                       group by code order by code""")
+        rows = cur.fetchall()
+    if not rows:
+        warn.append("Upload this month's Do Not Call registry download to the dnc-registry bucket -- "
+                    "until then the texting list (text_ready.csv) is empty.")
+    for code, up in rows:
+        age = (datetime.now(timezone.utc) - up).days
+        lines.append(f"  area code {code}: uploaded {up:%m/%d/%Y} ({age} days old)")
+        if age >= DNC_FRESH_DAYS:
+            warn.append(f"Do Not Call file for area code {code} is {age} days old -- numbers in {code} are off "
+                        f"the texting list until a new download is uploaded.")
+        elif age >= DNC_FRESH_DAYS - 5:
+            warn.append(f"Do Not Call file for area code {code} expires in {DNC_FRESH_DAYS - age} days -- "
+                        f"download a fresh copy and upload it to dnc-registry.")
+    return lines + [""], warn
+
+
 # ------------------------------------------------------------------ health
 def health_report(conn, counts, today):
     lines = [f"Restart Homes lead system -- status as of {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC", ""]
@@ -749,6 +833,9 @@ def health_report(conn, counts, today):
             if age >= PROPSTREAM_WARN_DAYS:
                 warn.append(f"PropStream {label} export drops off every lead on {drops:%m/%d/%Y} "
                             f"({PROPSTREAM_STALE_DAYS - age} days) -- re-export it from PropStream and upload it.")
+    dl, dw = dnc_health(conn, today)
+    lines += dl
+    warn += dw
     head = ["ACTION NEEDED:"] + [f"  - {w}" for w in warn] if warn else ["ACTION NEEDED: nothing"]
     return "\n".join(lines[:2] + head + [""] + lines[2:]) + "\n", warn
 
@@ -819,6 +906,9 @@ def build(conn, today=None):
     out.append(("fixed_unskiptraced/fixed_unskiptraced_leads.csv", prefixed_csv(
         fixed, today, ["What Was Fixed", "Times Traced"],
         lambda r: [r.get("skiptrace_fix_note") or "", r.get("skiptrace_attempts") or 1]), "text/csv"))
+    text_csv, n_text = text_ready_csv(conn, traced, today)
+    counts["text_ready_leads"] = n_text
+    out.append(("text_ready/text_ready.csv", text_csv, "text/csv"))
     err = error_rows(conn)
     counts["errors_last_30_days"] = len(err)
     out.append(("errors/errors.csv", errors_csv(err, today), "text/csv"))

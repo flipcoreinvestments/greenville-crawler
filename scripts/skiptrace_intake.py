@@ -54,7 +54,10 @@ def ensure_columns(conn):
         for col, typ in [("skiptrace_status", "text"), ("skiptrace_date", "timestamptz"),
                          ("skiptrace_input", "jsonb"), ("skiptrace_attempts", "int"),
                          ("skiptrace_fix_status", "text"), ("skiptrace_fix_note", "text"),
-                         ("skiptrace_snapshot", "jsonb"), ("active_months", "text[]")]:
+                         ("skiptrace_snapshot", "jsonb"), ("active_months", "text[]"),
+                         # 2026-10-13: the phones a trace returned (private DB only), so
+                         # dnc_scrub.py can check them and text_ready.csv can list them
+                         ("skiptrace_phones", "text[]")]:
             cur.execute(f"alter table leads add column if not exists {col} {typ}")
         cur.execute("""create table if not exists skiptrace_files (
                          name text primary key, rows_read int, matched int, traced int, failed int,
@@ -72,6 +75,18 @@ def _first(row, cols):
         if v not in (None, ""):
             return str(v).strip()
     return ""
+
+
+def row_phones(row):
+    """Every 10-digit phone in a result row, in column order, no repeats."""
+    out = []
+    for k, v in row.items():
+        if PHONE_RE.search((k or "").strip()):
+            d = re.sub(r"\D", "", str(v or ""))
+            d = d[1:] if len(d) == 11 and d.startswith("1") else d
+            if len(d) == 10 and d not in out:
+                out.append(d)
+    return out
 
 
 def has_phone(row):
@@ -138,7 +153,63 @@ def mark_row(cur, row, status, when_label):
                skiptrace_fix_status = null, skiptrace_fix_note = null
            where id = %s""",
         (status, json.dumps(inp), hit[0]))
+    save_phones(cur, hit[0], row_phones(row))
     return hit[0]
+
+
+def save_phones(cur, lead_id, phones):
+    """Newest file's phones first, older ones kept after them (max 10)."""
+    if not phones:
+        return
+    cur.execute("select coalesce(skiptrace_phones, '{}') from leads where id = %s", (lead_id,))
+    old = list(cur.fetchone()[0] or [])
+    merged = []
+    for p in list(phones) + old:
+        if p not in merged:
+            merged.append(p)
+    cur.execute("update leads set skiptrace_phones = %s where id = %s", (merged[:10], lead_id))
+
+
+def backfill_phones(conn, key):
+    """One time (2026-10-13): files read before phones were saved are read
+    again for their phones only -- nothing else on the lead changes."""
+    with conn.cursor() as cur:
+        cur.execute("select 1 from pipeline_migrations where name = 'skiptrace_phones_backfill_v1'")
+        if cur.fetchone():
+            return 0
+    import requests
+    s = requests.Session()
+    h = {"Authorization": f"Bearer {key}", "apikey": key}
+    n = 0
+    for name, _ in list_files(s, key):
+        r = s.get(f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{name}", headers=h, timeout=120)
+        if r.status_code != 200:
+            continue
+        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(name)[1]) as tmp:
+            tmp.write(r.content)
+            tmp.flush()
+            rows = read_rows(tmp.name)
+        with conn.cursor() as cur:
+            for row in rows:
+                phones = row_phones(row)
+                addr = re.sub(r"^[^0-9A-Za-z]+", "", _first(row, ADDR_COLS))
+                if not phones or not addr:
+                    continue
+                z = re.sub(r"\D", "", _first(row, ZIP_COLS))[:5]
+                cur.execute("""select id from leads where address_core(address) = address_core(%s)
+                                 and (%s = '' or coalesce(zip, '') = '' or zip = %s)
+                               order by is_duplicate, is_sold, list_count desc limit 1""", (addr, z, z))
+                hit = cur.fetchone()
+                if hit:
+                    save_phones(cur, hit[0], phones)
+                    n += 1
+        conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("insert into pipeline_migrations (name) values ('skiptrace_phones_backfill_v1') "
+                    "on conflict do nothing")
+    conn.commit()
+    print(f"  phones backfilled from earlier result files: {n} rows")
+    return n
 
 
 def intake(conn, key):
@@ -206,6 +277,7 @@ def main():
     if not key:
         print("SUPABASE_SERVICE_KEY is not set -- can't read the skiptrace-results bucket")
         return
+    backfill_phones(conn, key)
     totals, unmatched = intake(conn, key)
     with conn.cursor() as cur:
         cur.execute("insert into source_runs (source_name, records_found, records_new, notes) "

@@ -140,6 +140,16 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/skiptrace_followup.py
 
+      # 2026-10-13: checks every skip-traced phone against the Do Not Call
+      # registry files she uploads monthly (private bucket dnc-registry) and
+      # her opt-out list; only clean phones go on text_ready.csv.
+      - name: Do Not Call scrub (private Supabase bucket dnc-registry)
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/dnc_scrub.py
+
       - name: Write call lists + system health (private Supabase bucket lead-exports)
         if: ${{ !cancelled() }}
         env:
