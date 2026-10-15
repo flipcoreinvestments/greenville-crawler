@@ -125,6 +125,16 @@ def list_files(session, key, url=SUPABASE_URL):
     return out
 
 
+def _same_person(a_first, a_last, b_first, b_last):
+    """Same rule as export_call_lists._same_person: same last name and the
+    same first 3 letters of the first name."""
+    n = lambda x: re.sub(r"[^a-z]", "", (x or "").lower())
+    if n(a_last) != n(b_last):
+        return False
+    fa, fb = n(a_first), n(b_first)
+    return not fa or not fb or fa[:3] == fb[:3]
+
+
 def mark_row(cur, row, status, when_label):
     # old exports put the '*'/'***' flag in front of the address
     addr = re.sub(r"^[^0-9A-Za-z]+", "", _first(row, ADDR_COLS))
@@ -142,6 +152,15 @@ def mark_row(cur, row, status, when_label):
         return None
     inp = {"first": _first(row, FIRST_COLS), "last": _first(row, LAST_COLS), "address": addr,
            "city": _first(row, CITY_COLS), "zip": z, "file": when_label}
+    # 2026-10-15: a retrace (the person to call changed) replaces the old
+    # person's phones instead of keeping them behind the new ones, and an
+    # empty retrace shows as not traced rather than keeping the wrong phones.
+    cur.execute("select skiptrace_input from leads where id = %s", (hit[0],))
+    old = (cur.fetchone() or [None])[0] or {}
+    if ((old.get("first") or old.get("last")) and (inp["first"] or inp["last"])
+            and not _same_person(old.get("first"), old.get("last"), inp["first"], inp["last"])):
+        cur.execute("update leads set skiptrace_phones = null, skiptrace_status = null where id = %s",
+                    (hit[0],))
     # a lead already marked traced stays traced (a later empty re-run of the
     # same lead never erases phones she already has)
     cur.execute(

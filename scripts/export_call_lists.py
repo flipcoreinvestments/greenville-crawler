@@ -751,6 +751,11 @@ def ghl_upload_rows(traced, err):
     now = datetime.now(timezone.utc)
     out = []
     for r in err:
+        # GHL can only find a contact by phone: an error-list lead with no
+        # skip-trace phones would import as a brand-new duplicate, so it stays
+        # in errors/errors.csv only (find it in GHL by address).
+        if not (r.get("skiptrace_phones") or []):
+            continue
         out.append(("DELETE" if r.get("lead_status") == "dead" else "UPDATE", r))
     for r in traced:
         when = r.get("skiptrace_date")
