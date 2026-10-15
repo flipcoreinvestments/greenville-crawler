@@ -37,6 +37,7 @@ import psycopg2.extras
 
 from lead_common import ensure_schema
 from skiptrace_prep import compute_skiptrace_identity, probate_contact, probate_heirs, split_name, owner_trace_names, _clean_addr
+from ghl_sync import ensure_columns as ensure_ghl_columns, plan_ghl_rows, good_phones
 
 PROBATE_CASE_URL = "https://www.greenvillecounty.org/appsas400/Probate/SearchDetails.aspx?CaseNumber={case_number}"
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://izxqrskybwtqzbbbzlux.supabase.co")
@@ -139,6 +140,10 @@ COLUMNS = [
     # matches an existing contact by phone or email, so these are what make
     # "update existing contacts" find the contact instead of creating a new one.
     "Phone 1", "Phone 2", "Phone 3", "Phone 4", "Phone 5",
+    # 2026-10-16 (T Dawg's ask): what she has to fix by hand before this lead
+    # can be traced (blank = nothing, trace it as is). Filter on it so only
+    # the leads that need an edit get touched.
+    "Edit Before Trace",
 ]
 
 MAIL_TAIL = re.compile(r",?\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?\s*$", re.I)
@@ -361,17 +366,88 @@ def _owner2(r, tags):
 # the last ERROR_DAYS days), filled by build() before any file is written.
 ERROR_DAYS = 30
 OPEN_ERRORS = {}
+OPEN_ERRORS_AT = {}  # 2026-10-16: lead id -> newest found_at (the GHL file sends each change once)
 
 
 def open_errors(conn, days=ERROR_DAYS):
     """{lead id: 'what changed; ...'} for every lead on the error list."""
     with conn.cursor() as cur:
         cur.execute("alter table lead_error_log add column if not exists dismissed boolean not null default false")
-        cur.execute("""select lead_id, string_agg(reason, '; ' order by found_at desc)
+        # error time for the GHL file leaves out caller feedback read from a
+        # GHL export (ghl_sync.py) -- that's already on the contact in GHL
+        cur.execute("""select lead_id, string_agg(reason, '; ' order by found_at desc),
+                              max(found_at) filter (where reason not like 'caller reported%%')
                        from lead_error_log where found_at > now() - (%s || ' days')::interval
                          and not coalesce(dismissed, false)
                        group by lead_id""", (str(days),))
-        return {str(k): v for k, v in cur.fetchall()}
+        rows = cur.fetchall()
+    OPEN_ERRORS_AT.clear()
+    OPEN_ERRORS_AT.update({str(k): at for k, _, at in rows})
+    return {str(k): v for k, v, _ in rows}
+
+
+_INCOMPLETE_STREET = re.compile(r"^\s*\d+\s+[A-Za-z]+\s*$")
+
+
+def same_search(r, first, last, addr):
+    """True when tracing this lead now would send BatchData the same name and
+    the same address it already searched -- it would just return the same
+    numbers again (the money T Dawg lost on the 10.11 retrace list)."""
+    inp = r.get("skiptrace_input") or {}
+    if not (inp.get("first") or inp.get("last")):
+        return False
+    if not _same_person(inp.get("first"), inp.get("last"), first, last):
+        return False
+    # the address searched (recorded since 2026-10-16); older traces didn't
+    # record it, so the same person counts as the same search -- she checks
+    # the address by hand (ORANGE) rather than the system paying twice
+    then = inp.get("searched_address")
+    if not then:
+        return True
+    n = lambda x: re.sub(r"[^a-z0-9]", "", re.split(r",", x or "")[0].lower())[:14]
+    return not n(addr) or n(addr) == n(then)
+
+
+def trace_edit_note(r, first, last, addr):
+    """What has to be fixed by hand before this lead can be traced ('' = trace as is)."""
+    tags = set(r.get("source_tags") or [])
+    kind = owner_trace_names(r.get("owner_name")).get("kind")
+    if not (first or last):
+        if "probate" in tags or "pre_probate" in tags:
+            return ("Wrong name -- no personal representative or heir on file yet: find one (probate case link) "
+                    "and type the name into Skiptrace First/Last Name")
+        return "No person to trace -- type the owner's name into Skiptrace First/Last Name"
+    if not first and kind in ("Company", "Trust"):
+        return ("Company/trust owner -- replace the Skiptrace name with a real person "
+                "(officer, registered agent or trustee)")
+    if not (addr or "").strip():
+        return "No address to trace -- add the person's mailing address in Skiptrace Address"
+    if addr == r.get("address") and _INCOMPLETE_STREET.match(addr or ""):
+        return "Incomplete address -- add the street type (Rd, St, Dr...) to Skiptrace Address"
+    if r.get("retrace_reason") and same_search(r, first, last, addr):
+        why = re.sub(r"^caller reported ", "caller said ", r["retrace_reason"])
+        return (f"Same person as the last trace ({why}) -- tracing the same name and "
+                "address again returns the same numbers: change the Skiptrace name/address to the right "
+                "person, or use a second skip-trace provider or a manual search")
+    return ""
+
+
+def person_changed(r, first, last):
+    """The person to trace now (first, last) is someone else than the one
+    traced: differs from the name searched AND from who the system itself
+    would have traced at the time (skiptrace_input.system_*, recorded since
+    2026-10-16) -- so a name she corrected by hand before tracing isn't
+    mistaken for a change, while a Personal Representative appointed later is."""
+    inp = r.get("skiptrace_input") or {}
+    if not (inp.get("first") or inp.get("last")) or not (first or last):
+        return False
+    if _same_person(inp.get("first"), inp.get("last"), first, last):
+        return False
+    if "system_first" in inp or "system_last" in inp:
+        if (inp.get("system_first") or inp.get("system_last")) and _same_person(
+                inp.get("system_first"), inp.get("system_last"), first, last):
+            return False
+    return True
 
 
 def _same_person(a_first, a_last, b_first, b_last):
@@ -397,12 +473,15 @@ def ghl_update_tags(r, st_first, st_last):
         if r.get("lead_status") == "dead":
             tags.append("delete - dead lead")
     inp = r.get("skiptrace_input") or {}
-    if (r.get("skiptrace_status") == "traced" and (inp.get("first") or inp.get("last"))
-            and (st_first or st_last)
-            and not _same_person(inp.get("first"), inp.get("last"), st_first, st_last)):
+    if r.get("skiptrace_status") == "traced" and person_changed(r, st_first, st_last):
         tags.append("retrace")
         note = f"person to trace is now {st_first} {st_last} (traced {inp.get('first', '')} {inp.get('last', '')})"
         changed = f"{changed}; {note}" if changed else note
+    elif r.get("retrace_reason") and r.get("skiptrace_status") == "traced":
+        # 2026-10-16: a caller tagged the GHL contact "wrong person" (ghl_sync.py)
+        tags.append("retrace")
+        if r["retrace_reason"] not in changed:
+            changed = f"{changed}; {r['retrace_reason']}" if changed else r["retrace_reason"]
     return tags, changed
 
 
@@ -452,6 +531,13 @@ def to_csv(rows, today):
             except ValueError:
                 pass
         extra_tags, changed = ghl_update_tags(r, st_first, st_last)
+        # 2026-10-16: a lead to retrace carries no phones on the lists (they
+        # are the wrong person's), and numbers a caller reported wrong are
+        # never exported again.
+        retrace = "retrace" in extra_tags
+        phones = [] if retrace else good_phones(r)
+        to_trace = retrace or st_status != "traced"
+        edit = trace_edit_note(r, st_first, st_last, st_address) if to_trace else ""
         w.writerow([
             call_brief(r, tags, raw, mst, reasons),
             ", ".join(GHL_LIST_OPTIONS[x] for x in ordered),
@@ -482,7 +568,8 @@ def to_csv(rows, today):
             *split_contact_address(r.get("mailing_address"))[:2],
             *_owner2(r, tags),
             changed,
-            *((list(r.get("skiptrace_phones") or []) + [""] * 5)[:5]),
+            *((phones + [""] * 5)[:5]),
+            edit,
         ])
     return buf.getvalue()
 
@@ -510,7 +597,7 @@ PROBATE_COLUMNS = [
     "Property Address", "Property City", "Property State", "Property Zip", "Owner on Title",
     "Distress List", "Tags", "Call Brief", "Flag", "Score", "Vacant (USPS)", "Tax Owed",
     "Land Use", "Parcel #", "Check Before Calling", "Skip-Traced", "Last Skip-Traced", "Exported",
-    "What Changed (update GHL)",
+    "What Changed (update GHL)", "Edit Before Trace",
 ]
 
 _KNOWN_TOWNS = sorted([
@@ -565,11 +652,24 @@ _UNIT_WORDS = {"APT", "UNIT", "STE", "SUITE", "#", "LOT", "BLDG"}
 
 
 def needs_retrace(row):
-    inp = row.get("skiptrace_input") or {}
-    if row.get("skiptrace_status") != "traced" or not (inp.get("first") or inp.get("last")):
+    """Traced, but the person to call is wrong: the person to trace changed
+    (Personal Representative appointed, owner changed) or a caller tagged the
+    GHL contact "wrong person" (2026-10-16)."""
+    if row.get("skiptrace_status") != "traced":
         return False
+    if row.get("retrace_reason"):
+        return True
     first, last, _, _ = compute_skiptrace_identity(row, list(row.get("source_tags") or []))
-    return bool(first or last) and not _same_person(inp.get("first"), inp.get("last"), first, last)
+    return person_changed(row, first, last)
+
+
+def retrace_is_same_search(row):
+    """A retrace that would search the same name and address as last time
+    (wrong person reported, but the system has no different person yet)."""
+    if not needs_retrace(row):
+        return False
+    first, last, addr, _ = compute_skiptrace_identity(row, list(row.get("source_tags") or []))
+    return same_search(row, first, last, addr)
 
 
 def segment(row):
@@ -588,6 +688,14 @@ def segment(row):
     # pull list tagged "retrace" so they're traced with the day's new leads.
     if st == "traced" and not needs_retrace(row):
         return "skiptraced"
+    # 2026-10-16 retrace guard: never put a lead back on a pull list when the
+    # trace would search the same name and address again (same numbers back,
+    # money burnt). It waits in not_skiptraced/ with a note instead.
+    if st == "traced" and retrace_is_same_search(row):
+        row["skiptrace_fix_note"] = ("caller reported the wrong person, but the system would search the same "
+                                     "name and address again -- find the right person (or use a second "
+                                     "provider) before paying for another trace")
+        return "not_skiptraced"
     if st == "failed":
         return "fixed_unskiptraced" if row.get("skiptrace_fix_status") == "fixed" else "not_skiptraced"
     tags = set(row.get("source_tags") or [])
@@ -623,6 +731,8 @@ def probate_csv(rows, today):
         st_status = (r.get("skiptrace_status") or "").strip().lower()
         st_when = r.get("skiptrace_date")
         extra_tags, changed = ghl_update_tags(r, first, last)
+        to_trace = "retrace" in extra_tags or st_status != "traced"
+        edit = trace_edit_note(r, first, last, addr or r["address"]) if to_trace else ""
         w.writerow([
             first, last, name, role, street, city, st, z,
             re.sub(r"\s*,\s*", ", ", pb.get("decedent_name") or "").strip(" ,") or r.get("owner_name") or "",
@@ -642,6 +752,7 @@ def probate_csv(rows, today):
             st_when.strftime("%m/%d/%Y") if hasattr(st_when, "strftime") else (str(st_when)[:10] if st_when else ""),
             today.isoformat(),
             changed,
+            edit,
         ])
     return buf.getvalue()
 
@@ -732,77 +843,172 @@ def errors_csv(rows, today):
 
 
 # ------------------------------------------------------- GHL upload file
-# 2026-10-15 (T Dawg's ask): ONE file to import into GoHighLevel each day,
-# so she never cross-references the error list by hand:
-#   NEW     traced in the last 7 days (phones from the skip trace) -- creates
-#           the contact (or updates it if it's already there)
-#   UPDATE  (yellow) already in GHL and something changed -- updates it
-#   DELETE  (red) now dead -- import tags it "delete - dead lead"; then filter
-#           by that tag and bulk delete
-# Import with "Update existing records" on: GHL matches by phone, so a row
-# that's already in GHL is updated and never duplicated. Re-importing the
-# same row on a later day is harmless (it just updates again).
-GHL_NEW_DAYS = 7
-GHL_FILL = {"NEW": None, "UPDATE": "FFFF00", "DELETE": "EA9999"}
+# 2026-10-15: ONE file to import into GoHighLevel each day.
+# 2026-10-16 (rebuilt, T Dawg's ask -- "no backtracking week over week"):
+# what goes in it is decided by ghl_sync.plan_ghl_rows(), against what GHL
+# actually holds (the GHL contact export she drops in the ghl-sync bucket):
+#   RED     DELETE   dead -- import tags it "delete - dead lead"; bulk delete that tag
+#   ORANGE  RETRACE  wrong/changed person and she must edit it first ("Edit
+#                    Before Trace" says what) -- import tags the old contact
+#                    "retrace"; bulk delete that tag; fix; trace
+#   YELLOW  RETRACE  same, the right person is already in the Skiptrace columns
+#   YELLOW  UPDATE   same person, something changed -- import updates it
+#   GREEN   NEW      traced, alive, not in GHL -- import creates it
+# Phone 1 is always the phone GHL has for the contact (the only thing its
+# import matches on). Each change is in exactly ONE daily file (ghl_sent log),
+# so importing every file once never re-creates a contact she deleted.
+#   ghl_upload/ghl_upload.csv (+ .xlsx colored)   today's changes only
+#   ghl_upload/ghl_upload_last_7_days.csv (+ .xlsx) everything from the last 7
+#                                                 daily files, latest state --
+#                                                 for a once-a-week import
+#   ghl_upload/history/YYYY-MM-DD.csv            every day's file, kept
+GHL_FILL = {"RED": "EA9999", "ORANGE": "F9CB9C", "YELLOW": "FFFF00", "GREEN": "B6D7A8"}
+GHL_HEAD = ["Action", "Color", "Edit Before Trace", "Other Properties (same contact)"]
+_DROPPED = re.compile(r"dropped off: ([^;]+)")
+_NAME_TO_KEY = {v: k for k, v in GHL_LIST_OPTIONS.items()}
+_NAME_TO_KEY.update({"Damage Permit": "insurance_damage"})
 
 
-def ghl_upload_rows(traced, err):
-    err_ids = {str(r.get("id")) for r in err}
-    now = datetime.now(timezone.utc)
-    out = []
-    for r in err:
-        # GHL can only find a contact by phone: an error-list lead with no
-        # skip-trace phones would import as a brand-new duplicate, so it stays
-        # in errors/errors.csv only (find it in GHL by address).
-        if not (r.get("skiptrace_phones") or []):
+def _list_slug(key):
+    return "list-" + re.sub(r"[^a-z0-9]+", "-", GHL_LIST_OPTIONS[key].lower()).strip("-")
+
+
+def ghl_row_tags(x, today):
+    r = x["lead"]
+    tags = [_list_slug(k) for k in BRIEF_ORDER if k in set(r.get("source_tags") or [])]
+    if x["action"] == "DELETE":
+        tags += ["update lead info", "delete - dead lead"]
+    elif x["action"] == "RETRACE":
+        tags += ["update lead info", "retrace"]
+    elif x["action"] == "UPDATE":
+        tags.append("update lead info")
+        for m in _DROPPED.finditer(r.get("error") or ""):
+            for name in m.group(1).split(","):
+                k = _NAME_TO_KEY.get(name.strip())
+                if k:
+                    tags.append("dropped: " + _list_slug(k))
+    else:
+        tags.append("skiptraced")
+    tags.append(f"ghl file {today:%Y-%m-%d}")
+    return ", ".join(dict.fromkeys(tags))
+
+
+def ghl_leads(rows):
+    """The lead dicts plan_ghl_rows() needs: + error / error_at / retrace."""
+    out, seen = [], set()
+    for r in rows:
+        if str(r.get("id")) in seen:
             continue
-        out.append(("DELETE" if r.get("lead_status") == "dead" else "UPDATE", r))
-    for r in traced:
-        when = r.get("skiptrace_date")
-        if (str(r.get("id")) in err_ids or r.get("lead_status") or not hasattr(when, "tzinfo")
-                or not (r.get("skiptrace_phones") or [])):
-            continue
-        w = when if when.tzinfo else when.replace(tzinfo=timezone.utc)
-        if now - w <= timedelta(days=GHL_NEW_DAYS):
-            out.append(("NEW", r))
-    order = {"DELETE": 0, "UPDATE": 1, "NEW": 2}
-    out.sort(key=lambda x: order[x[0]])
+        seen.add(str(r.get("id")))
+        tags = list(r.get("source_tags") or [])
+        first, last, addr, _ = compute_skiptrace_identity(r, tags)
+        d = dict(r)
+        d["error"] = OPEN_ERRORS.get(str(r.get("id"))) or ""
+        d["error_at"] = OPEN_ERRORS_AT.get(str(r.get("id")))
+        rr = r.get("retrace_reason") or ""
+        d["retrace_at"] = r.get("ghl_seen_at") if rr else None
+        d["retrace"] = ({"who": " -- ".join(x for x in (f"{first} {last}".strip(), rr) if x),
+                         "edit": trace_edit_note(r, first, last, addr)}
+                        if r.get("lead_status") != "dead" and needs_retrace(r) else None)
+        out.append(d)
     return out
 
 
-def ghl_upload_files(traced, err, today):
-    rows = ghl_upload_rows(traced, err)
-    body = list(csv.reader(io.StringIO(to_csv([r for _, r in rows], today))))
-    header = ["Action"] + body[0]
-    lines = [[a] + line for (a, _), line in zip(rows, body[1:])]
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(header)
-    w.writerows(lines)
-    xlsx = None
+def _ghl_lines(plan, today):
+    body = list(csv.reader(io.StringIO(to_csv([x["lead"] for x in plan], today))))
+    head = GHL_HEAD + body[0]
+    i_tags, i_p1, i_edit = (COLUMNS.index("Tags"), COLUMNS.index("Phone 1"),
+                            COLUMNS.index("Edit Before Trace"))
+    lines = []
+    for x, line in zip(plan, body[1:]):
+        line[i_tags] = ghl_row_tags(x, today)
+        line[i_p1:i_p1 + 5] = (list(x["phones"]) + [""] * 5)[:5]
+        line[i_edit] = x["edit"]
+        others = "; ".join(f"{o['lead'].get('address')} [{o['action']}]" for o in x.get("others") or [])
+        lines.append([x["action"], x["color"], x["edit"], others] + line)
+    return head, lines
+
+
+def _xlsx(head, lines):
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "GHL upload"
-        ws.append(header)
-        for c in ws[1]:
-            c.font = Font(bold=True)
-        for line in lines:
-            ws.append(line)
-            fill = GHL_FILL.get(line[0])
-            if fill:
-                for c in ws[ws.max_row]:
-                    c.fill = PatternFill("solid", fgColor=fill)
-        ws.freeze_panes = "A2"
-        b = io.BytesIO()
-        wb.save(b)
-        xlsx = b.getvalue()
     except ImportError:
-        pass
-    counts = {a: sum(1 for x, _ in rows if x == a) for a in ("NEW", "UPDATE", "DELETE")}
-    return buf.getvalue(), xlsx, counts
+        return None
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "GHL upload"
+    ws.append(head)
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for line in lines:
+        ws.append(line)
+        fill = GHL_FILL.get(line[1])
+        if fill:
+            for c in ws[ws.max_row]:
+                c.fill = PatternFill("solid", fgColor=fill)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    b = io.BytesIO()
+    wb.save(b)
+    return b.getvalue()
+
+
+def _csv(head, lines):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(head)
+    w.writerows(lines)
+    return buf.getvalue()
+
+
+def load_ghl_sent(conn):
+    with conn.cursor() as cur:
+        cur.execute("select lead_id, action, detail, sent_at, file_date from ghl_sent")
+        return {(str(a), b, c): (d, f) for a, b, c, d, f in cur.fetchall()}
+
+
+def ghl_upload_files(rows, sent_log, today):
+    """-> (files, counts, keys to log as sent today)."""
+    leads = ghl_leads(rows)
+    sent = {k: v[0] for k, v in sent_log.items()}
+    # a second export on the same day (the on-demand button) rebuilds the
+    # whole day's file, not just what changed since the morning
+    today_keys = {k for k, v in sent_log.items() if v[1] == today}
+    daily = plan_ghl_rows(leads, {k: v for k, v in sent.items() if k not in today_keys})
+    week_ago = today - timedelta(days=6)
+    recent = {k for k, v in sent_log.items() if v[1] and v[1] >= week_ago}
+    weekly = plan_ghl_rows(leads, {k: v for k, v in sent.items() if k not in recent})
+    files = []
+    for name, plan in (("ghl_upload/ghl_upload", daily), ("ghl_upload/ghl_upload_last_7_days", weekly)):
+        head, lines = _ghl_lines(plan, today)
+        files.append((name + ".csv", _csv(head, lines), "text/csv"))
+        x = _xlsx(head, lines)
+        if x:
+            files.append((name + ".xlsx", x, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+        if plan is daily:
+            files.append((f"ghl_upload/history/{today:%Y-%m-%d}.csv", _csv(head, lines), "text/csv"))
+    keys = []
+    for x in daily:
+        for y in [x] + list(x.get("others") or []):
+            keys.append((str(y["lead"]["id"]), y["action"], y["detail"]))
+    counts = {c: sum(1 for x in daily if x["color"] == c) for c in ("RED", "ORANGE", "YELLOW", "GREEN")}
+    counts["week"] = len(weekly)
+    return files, counts, keys
+
+
+def log_ghl_sent(conn, keys, today, now=None):
+    """Record what went out in today's file. A NEW row makes the lead count
+    as in GHL from then on (ghl_sync.ghl_state) until a GHL export says
+    otherwise -- nothing on the lead itself is changed here, so the
+    on-demand export later the same day rebuilds the identical file."""
+    with conn.cursor() as cur:
+        for lead_id, action, detail in keys:
+            cur.execute("""insert into ghl_sent (lead_id, action, detail, file_date, sent_at)
+                           values (%s, %s, %s, %s, coalesce(%s, now()))
+                           on conflict (lead_id, action, detail)
+                           do update set sent_at = excluded.sent_at, file_date = excluded.file_date""",
+                        (lead_id, action, detail, today, now))
 
 
 # ------------------------------------------------------- texting list
@@ -844,7 +1050,7 @@ def text_ready_csv(conn, rows, today):
         extra, _ = ghl_update_tags(r, first, last)
         if "retrace" in extra:
             continue
-        phones = list(r.get("skiptrace_phones") or [])
+        phones = good_phones(r)  # 2026-10-16: numbers a caller reported wrong are dropped
         good = [p for p in phones if ok.get(p)]
         if not good:
             continue
@@ -953,6 +1159,30 @@ def health_report(conn, counts, today):
             if age >= PROPSTREAM_WARN_DAYS:
                 warn.append(f"PropStream {label} export drops off every lead on {drops:%m/%d/%Y} "
                             f"({PROPSTREAM_STALE_DAYS - age} days) -- re-export it from PropStream and upload it.")
+    # 2026-10-16: how fresh the system's picture of GHL is (ghl_sync.py)
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('public.ghl_sync_files')")
+        has = cur.fetchone()[0] is not None
+        last = None
+        if has:
+            cur.execute("""select file_time, contacts, matched_leads, gone, wrong_number, wrong_person,
+                                  unmatched_contacts from ghl_sync_files where file_time is not null
+                           order by file_time desc limit 1""")
+            last = cur.fetchone()
+    lines.append("GHL CONTACT EXPORT (ghl-sync bucket -- how the system knows what GHL holds)")
+    if last:
+        age = (datetime.now(timezone.utc) - last[0]).days
+        lines.append(f"  last export {last[0]:%m/%d/%Y} ({age} days old): {last[1]:,} contacts, {last[2]:,} leads "
+                     f"matched, {last[3]:,} no longer in GHL, {last[4]} wrong-number tags, {last[5]} wrong-person "
+                     f"tags, {last[6]} list contacts matching no lead")
+        if age > 8:
+            warn.append("GHL contact export is over a week old -- export all contacts from GHL and drop the file "
+                        "in the ghl-sync bucket (the weekly routine), so the GHL file matches what's in GHL.")
+    else:
+        lines.append("  none yet -- export all contacts from GHL and drop the file in the ghl-sync bucket")
+        warn.append("No GHL contact export yet -- export all contacts from GHL and drop the CSV in the ghl-sync "
+                    "bucket once, so every GHL row matches the phone GHL actually has.")
+    lines.append("")
     dl, dw = dnc_health(conn, today)
     lines += dl
     warn += dw
@@ -978,6 +1208,9 @@ def upload(files, key, url=SUPABASE_URL, session=None):
         print(f"  uploaded {BUCKET}/{name} ({len(body):,} bytes)")
 
 
+GHL_KEYS = []  # rows in today's GHL file -- logged as sent once the files are uploaded
+
+
 def build(conn, today=None):
     today = today or date.today()
     OPEN_ERRORS.clear()
@@ -986,8 +1219,10 @@ def build(conn, today=None):
     out, counts = [], {}
     probate_pr, hold, wrong = [], [], []
     traced, not_traced, fixed = [], [], []
+    all_rows = []
     for view in ("house_leads", "land_leads"):
         rows = lead_rows(conn, view)
+        all_rows += rows
         main_rows = []
         for r in rows:
             seg = segment(r)
@@ -1042,13 +1277,14 @@ def build(conn, today=None):
     counts["errors_delete_in_ghl"] = len(dele)
     out.append(("errors/update_in_ghl.csv", errors_csv(upd, today), "text/csv"))
     out.append(("errors/delete_in_ghl.csv", errors_csv(dele, today), "text/csv"))
-    g_csv, g_xlsx, g_counts = ghl_upload_files(traced, err, today)
-    counts.update({"ghl_upload_new": g_counts["NEW"], "ghl_upload_update": g_counts["UPDATE"],
-                   "ghl_upload_delete": g_counts["DELETE"]})
-    out.append(("ghl_upload/ghl_upload.csv", g_csv, "text/csv"))
-    if g_xlsx:
-        out.append(("ghl_upload/ghl_upload.xlsx", g_xlsx,
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+    # 2026-10-16: the GHL file is planned from every lead (live and dead)
+    # against what GHL holds -- see ghl_sync.py.
+    g_files, g_counts, g_keys = ghl_upload_files(all_rows + list(dead), load_ghl_sent(conn), today)
+    GHL_KEYS[:] = g_keys
+    counts.update({"ghl_upload_red_delete": g_counts["RED"], "ghl_upload_orange_retrace_edit": g_counts["ORANGE"],
+                   "ghl_upload_yellow": g_counts["YELLOW"], "ghl_upload_green_new": g_counts["GREEN"],
+                   "ghl_upload_last_7_days": g_counts["week"]})
+    out += g_files
     report, warn = health_report(conn, counts, today)
     out.append(("system_health.txt", report, "text/plain"))
     return out, warn
@@ -1075,11 +1311,15 @@ def main():
     # skip-trace pipeline columns + error log (skiptrace_intake.py, 2026-10-11)
     from skiptrace_intake import ensure_columns as ensure_skiptrace_columns
     ensure_skiptrace_columns(conn)
+    ensure_ghl_columns(conn)
     ensure_schema(conn)
     conn.commit()
     files, warn = build(conn)
-    conn.close()
     upload(files, key)
+    # only after the files are safely uploaded: today's GHL rows count as sent
+    log_ghl_sent(conn, GHL_KEYS, date.today())
+    conn.commit()
+    conn.close()
     print(files[-1][1])
     for w in warn:
         print(f"::warning::{w}")

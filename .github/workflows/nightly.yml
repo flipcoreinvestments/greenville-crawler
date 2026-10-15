@@ -122,6 +122,16 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python scripts/skiptrace_intake.py
 
+      # 2026-10-16: reads the newest GHL contact export she drops in the
+      # private ghl-sync bucket -- which phone each GHL contact has, which
+      # contacts are gone, and "wrong number" / "wrong person" tags from calls.
+      - name: GHL sync (private Supabase bucket ghl-sync)
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/ghl_sync.py
+
       # 2026-10-11: re-checks the last 1,000 leads + every skip-traced lead;
       # marks sold/off-list leads DEAD and bad-data leads WRONG INFORMATION
       # so the export keeps them out of the skip-trace lists.

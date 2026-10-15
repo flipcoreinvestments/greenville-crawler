@@ -66,10 +66,14 @@ def diagnose(r):
         if cur["first"] and not inp.get("first"):
             fixes.append(f"owner's first name added ({cur['first']} {cur['last']})")
         elif (cur["first"] or cur["last"]) and (inp.get("first") or inp.get("last")) and \
-                _norm(cur["first"] + cur["last"]) != _norm((inp.get("first") or "") + (inp.get("last") or "")):
+                _norm(cur["first"] + cur["last"]) != _norm((inp.get("first") or "") + (inp.get("last") or "")) and \
+                not ("system_first" in inp and _norm(cur["first"] + cur["last"]) ==
+                     _norm((inp.get("system_first") or "") + (inp.get("system_last") or ""))):
+            # (2026-10-16: not when she typed her own name in and the system's
+            # person is still the same as then -- nothing new to try)
             who = "Personal Representative" if "probate" in tags else "name"
             fixes.append(f"{who} corrected to {cur['first']} {cur['last']}".strip())
-        if cur["address"] and _norm(cur["address"])[:12] != _norm(inp.get("address"))[:12]:
+        if cur["address"] and _norm(cur["address"])[:12] != _norm(inp.get("searched_address") or inp.get("address"))[:12]:
             fixes.append(f"now searching {cur['address']}")
         if cur["zip"] and not inp.get("zip"):
             fixes.append(f"zip added ({cur['zip']})")

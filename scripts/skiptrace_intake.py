@@ -35,6 +35,7 @@ import tempfile
 import psycopg2
 
 from lead_common import ensure_schema
+from skiptrace_prep import compute_skiptrace_identity
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://izxqrskybwtqzbbbzlux.supabase.co")
 BUCKET = "skiptrace-results"
@@ -46,6 +47,11 @@ CITY_COLS = ["Input Data:Property City", "Input Data:City", "Property City", "Ci
 ZIP_COLS = ["Input Data:Property Zip", "Input Data:Postal Code", "Property Zip", "Postal Code", "Zip"]
 FIRST_COLS = ["Input Data:first name", "Input Data:First Name", "Skiptrace First Name", "first name", "First Name"]
 LAST_COLS = ["Input Data:last name", "Input Data:Last Name", "Skiptrace Last Name", "last name", "Last Name"]
+# 2026-10-16: the address that was actually searched (Skiptrace Address on
+# the pull list; "Mailing Address" in BatchData's mapped files), kept so a
+# retrace that would search the same name AND address again is caught.
+SEARCH_ADDR_COLS = ["Input Data:Skiptrace Address", "Input Data:Mailing Address", "Skiptrace Address",
+                    "Mailing Address"]
 PHONE_RE = re.compile(r"(phonenumbers\.\d+\.number|^phone( number \d+)?$|^phone\s*\d*$)", re.I)
 
 
@@ -57,7 +63,11 @@ def ensure_columns(conn):
                          ("skiptrace_snapshot", "jsonb"), ("active_months", "text[]"),
                          # 2026-10-13: the phones a trace returned (private DB only), so
                          # dnc_scrub.py can check them and text_ready.csv can list them
-                         ("skiptrace_phones", "text[]")]:
+                         ("skiptrace_phones", "text[]"),
+                         # 2026-10-16: GHL sync (ghl_sync.py)
+                         ("ghl_phone", "text"), ("ghl_in_crm", "boolean"), ("retrace_reason", "text"),
+                         ("ghl_contact_id", "text"), ("ghl_seen_at", "timestamptz"), ("ghl_tags", "text[]"),
+                         ("ghl_reset_at", "timestamptz")]:
             cur.execute(f"alter table leads add column if not exists {col} {typ}")
         cur.execute("""create table if not exists skiptrace_files (
                          name text primary key, rows_read int, matched int, traced int, failed int,
@@ -151,15 +161,36 @@ def mark_row(cur, row, status, when_label):
     if not hit:
         return None
     inp = {"first": _first(row, FIRST_COLS), "last": _first(row, LAST_COLS), "address": addr,
-           "city": _first(row, CITY_COLS), "zip": z, "file": when_label}
+           "city": _first(row, CITY_COLS), "zip": z, "file": when_label,
+           "searched_address": _first(row, SEARCH_ADDR_COLS)}
     # 2026-10-15: a retrace (the person to call changed) replaces the old
     # person's phones instead of keeping them behind the new ones, and an
     # empty retrace shows as not traced rather than keeping the wrong phones.
-    cur.execute("select skiptrace_input from leads where id = %s", (hit[0],))
-    old = (cur.fetchone() or [None])[0] or {}
-    if ((old.get("first") or old.get("last")) and (inp["first"] or inp["last"])
-            and not _same_person(old.get("first"), old.get("last"), inp["first"], inp["last"])):
-        cur.execute("update leads set skiptrace_phones = null, skiptrace_status = null where id = %s",
+    cur.execute("""select skiptrace_input, retrace_reason, owner_name, address, mailing_address, raw, source_tags
+                   from leads where id = %s""", (hit[0],))
+    old, was_wrong, owner, paddr, maddr, raw, stags = (cur.fetchone() or [None] * 7)
+    old = old or {}
+    # 2026-10-16: who the SYSTEM would have traced at this moment. When she
+    # edited the name before tracing (an ORANGE row), the traced name differs
+    # from the system's -- that is not a "person changed" retrace; only a later
+    # change of the system's own person (a PR appointed...) is.
+    try:
+        sf, sl, _, _ = compute_skiptrace_identity(
+            {"owner_name": owner, "address": paddr, "mailing_address": maddr, "raw": raw or {}}, stags or [])
+        inp["system_first"], inp["system_last"] = sf or "", sl or ""
+    except Exception:
+        pass
+    # ...and so does a new trace after a caller reported "wrong person" (even
+    # with the same name -- she changed the address or used another provider):
+    # the old contact was tagged retrace and deleted, its phones were wrong.
+    if was_wrong or ((old.get("first") or old.get("last")) and (inp["first"] or inp["last"])
+                     and not _same_person(old.get("first"), old.get("last"), inp["first"], inp["last"])):
+        # 2026-10-16: the new person gets a NEW GHL contact (the old one was
+        # tagged "retrace" and deleted), so the old contact's phone and the
+        # retrace reason are forgotten too (ghl_sync.py columns).
+        cur.execute("""update leads set skiptrace_phones = null, skiptrace_status = null,
+                              ghl_phone = null, ghl_in_crm = null, ghl_contact_id = null, ghl_seen_at = null,
+                              ghl_tags = null, retrace_reason = null, ghl_reset_at = now() where id = %s""",
                     (hit[0],))
     # a lead already marked traced stays traced (a later empty re-run of the
     # same lead never erases phones she already has)
