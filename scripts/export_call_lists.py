@@ -152,15 +152,45 @@ def yn(v):
     return "Yes" if v is True else ("No" if v is False else "")
 
 
+# 2026-10-14: filled by build() from the latest tax_sale run -- whether the
+# county list is still up and the sale date printed on it.
+TAX_SALE = {"list_up": None, "sale_date": None}
+
+
+def load_tax_sale_info(conn):
+    with conn.cursor() as cur:
+        cur.execute("""select records_found, notes, run_at from source_runs where source_name = 'tax_sale'
+                       order by run_at desc limit 1""")
+        r = cur.fetchone()
+        cur.execute("""select substring(notes from 'sale_date:([0-9-]+)') from source_runs
+                       where source_name = 'tax_sale' and notes like '%%sale_date:%%'
+                       order by run_at desc limit 1""")
+        d = cur.fetchone()
+    TAX_SALE["list_up"] = bool(r and (r[0] or 0) > 0
+                               and (datetime.now(timezone.utc) - r[2]) < timedelta(days=3))
+    TAX_SALE["sale_date"] = date.fromisoformat(d[0]) if d and d[0] else None
+
+
 def tax_sale_status(raw, tags):
+    """A lead keeps its tax_sale tag while its parcel is on the county list
+    (a parcel whose owner pays drops off the list and loses the tag). After
+    the sale the county takes the list down; sold parcels keep the tag for
+    the 12-month redemption period."""
     if "tax_sale" not in tags:
         return ""
+    sale = TAX_SALE.get("sale_date")
+    today = date.today()
+    if sale and today <= sale:
+        return f"On county tax sale list -- sale {sale:%m/%d/%Y}"
+    if sale and today > sale:
+        return (f"Sale held {sale:%m/%d/%Y} -- owner has 12 months from the sale "
+                f"(to {sale.replace(year=sale.year + 1):%m/%d/%Y}) to redeem")
+    if TAX_SALE.get("list_up") is not False:
+        return "On county tax sale list"
     fetched = ((raw or {}).get("tax_sale") or {}).get("fetched_at") or ""
     try:
         seen = datetime.fromisoformat(fetched.replace("Z", "+00:00")).date()
     except ValueError:
-        return "On county tax sale list"
-    if (date.today() - seen).days <= 3:
         return "On county tax sale list"
     return (f"Sale held -- last on county list {seen:%m/%d/%Y}; owner has 12 months "
             f"from the sale to redeem")
@@ -862,6 +892,7 @@ def build(conn, today=None):
     today = today or date.today()
     OPEN_ERRORS.clear()
     OPEN_ERRORS.update(open_errors(conn))
+    load_tax_sale_info(conn)
     out, counts = [], {}
     probate_pr, hold, wrong = [], [], []
     traced, not_traced, fixed = [], [], []

@@ -428,9 +428,49 @@ def match_owners_to_estates(conn):
     'probate_name_match' review flag so a common name is double-checked.
     Never creates a lead -- only tags properties already on a distress list.
     """
+    # FIX 2026-10-14: when two open estates match the same owner (same name,
+    # two cases), the old UPDATE ... FROM picked one at random each night and
+    # the lead flip-flopped between cases (152 Holland Ford Rd: PR Stephanie
+    # Davis one night, Bank of America the next). Now one best case per lead
+    # is chosen the same way every night -- an address match first, then the
+    # newest case number -- and a lead already on that case is left alone.
     with conn.cursor() as cur:
         cur.execute(
             r"""
+            with cand as (
+                select distinct on (l.id) l.id as lead_id, c.*,
+                       case when exists (
+                           select 1 from unnest(array[c.decedent_street, c.pr_street]) s(st)
+                           where address_core(s.st) is not null and (
+                               address_core(s.st) = address_core(l.address)
+                               or address_core(l.mailing_address) = address_core(s.st)
+                               or address_core(l.mailing_address) like address_core(s.st) || ' %'))
+                            then 'owner_name_and_address' else 'owner_name' end as match_kind
+                from leads l join probate_cases c
+                  on coalesce(c.closed_date, '') = ''
+                 and c.decedent_last is not null and c.decedent_first is not null
+                 and length(c.decedent_first) >= 2
+                 and upper(coalesce(l.owner_name, '')) ~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\M')
+                 -- middle-initial rule: if the county lists a single-letter middle
+                 -- initial right after LAST FIRST, it must be the decedent's
+                 -- (Doe John E is not DOE, JOHN WAYNE).
+                 and (c.decedent_middle is null
+                      or upper(l.owner_name) !~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\s+[A-Z]\M')
+                      or upper(l.owner_name) ~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\s+' || c.decedent_middle || '\M'))
+                where l.list_count > 0 and l.is_sold = false and l.is_duplicate = false
+                  -- a case matched by the property's own address (no 'match'
+                  -- key) is never replaced by a name-only match
+                  and (not ('probate' = any(l.source_tags)) or l.raw->'probate'->>'match' is not null)
+                order by l.id,
+                         (case when exists (
+                             select 1 from unnest(array[c.decedent_street, c.pr_street]) s(st)
+                             where address_core(s.st) is not null and (
+                                 address_core(s.st) = address_core(l.address)
+                                 or address_core(l.mailing_address) = address_core(s.st)
+                                 or address_core(l.mailing_address) like address_core(s.st) || ' %'))
+                          then 1 else 0 end) desc,
+                         c.case_number desc
+            )
             update leads l set
                 source_tags = array(select distinct unnest(l.source_tags || array['probate'])),
                 raw = coalesce(l.raw, '{}'::jsonb) || jsonb_build_object('probate', jsonb_build_object(
@@ -438,29 +478,10 @@ def match_owners_to_estates(conn):
                     'date_of_death', c.date_of_death, 'file_date', c.file_date,
                     'pr_name', c.pr_name, 'pr_address', c.pr_address,
                     'creditor_deadline', c.creditor_deadline, 'parties', c.parties,
-                    -- owner_name_and_address = the probate file's address (decedent's
-                    -- or PR's) is the property itself or the owner's mailing address.
-                    -- owner_name alone = verify by hand (common names).
-                    'match', case when exists (
-                        select 1 from unnest(array[c.decedent_street, c.pr_street]) s(st)
-                        where address_core(s.st) is not null and (
-                            address_core(s.st) = address_core(l.address)
-                            or address_core(l.mailing_address) = address_core(s.st)
-                            or address_core(l.mailing_address) like address_core(s.st) || ' %'))
-                        then 'owner_name_and_address' else 'owner_name' end)),
+                    'match', c.match_kind)),
                 updated_at = now()
-            from probate_cases c
-            where l.list_count > 0 and l.is_sold = false and l.is_duplicate = false
-              and coalesce(c.closed_date, '') = ''
-              and c.decedent_last is not null and c.decedent_first is not null
-              and length(c.decedent_first) >= 2
-              and upper(coalesce(l.owner_name, '')) ~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\M')
-              -- middle-initial rule: if the county lists a single-letter middle
-              -- initial right after LAST FIRST, it must be the decedent's
-              -- (Doe John E is not DOE, JOHN WAYNE).
-              and (c.decedent_middle is null
-                   or upper(l.owner_name) !~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\s+[A-Z]\M')
-                   or upper(l.owner_name) ~ ('\m' || c.decedent_last || '\s+' || c.decedent_first || '\s+' || c.decedent_middle || '\M'))
+            from cand c
+            where l.id = c.lead_id
               and not ('probate' = any(l.source_tags) and l.raw->'probate'->>'case_number' = c.case_number)
             """
         )

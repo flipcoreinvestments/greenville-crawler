@@ -132,6 +132,11 @@ LIST_NAMES = {
 
 
 def describe_changes(old, new, reason):
+    # 2026-10-14: a lead that was already dead (sold, merged duplicate, off
+    # every list) and is still dead isn't news -- don't put it on the
+    # error list again just because a field on the dead record moved.
+    if old.get("status") == "dead" and new.get("status") == "dead":
+        return ""
     out = []
     if new.get("status") == "dead" and old.get("status") != "dead":
         out.append(f"now DEAD ({reason or 'see dead list'}) -- remove or close it in GHL")

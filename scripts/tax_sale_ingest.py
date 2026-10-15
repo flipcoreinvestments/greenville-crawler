@@ -84,6 +84,22 @@ def fetch(url):
     return resp.text
 
 
+_MONTHS = {m: i for i, m in enumerate(["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST",
+                                        "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"], start=1)}
+
+
+def parse_sale_date(html):
+    """'Tax Sale date: OCTOBER 19 AND 20, 2026' -> '2026-10-20' (the last
+    day of the sale), or None. Added 2026-10-14 so the call lists can tell
+    'owner paid before the sale' from 'parcel sold at the sale'."""
+    m = re.search(r"Tax\s*Sale\s*date:?\s*([A-Za-z]+)\s+(\d{1,2})(?:\s*(?:AND|&|-|,)\s*(\d{1,2}))?,?\s*(\d{4})",
+                  BeautifulSoup(html or "", "html.parser").get_text(" "), re.I)
+    if not m or m.group(1).upper() not in _MONTHS:
+        return None
+    day = int(m.group(3) or m.group(2))
+    return f"{int(m.group(4)):04d}-{_MONTHS[m.group(1).upper()]:02d}-{day:02d}"
+
+
 def parse_list(html):
     """Find the tax sale table and return [{map_number, owner_name, amount_due}]."""
     soup = BeautifulSoup(html, "html.parser")
@@ -344,7 +360,8 @@ def main():
     expire_post_sale(conn)
 
     rescore_all(conn)
-    log_run(conn, len(rows), new_count, "ok")
+    sale_date = parse_sale_date(list_html)
+    log_run(conn, len(rows), new_count, "ok" + (f" sale_date:{sale_date}" if sale_date else ""))
     conn.commit()
     conn.close()
     print(f"Done. {new_count} properties upserted and rescored.")
