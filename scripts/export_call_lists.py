@@ -564,6 +564,14 @@ _STREET_WORDS = {
 _UNIT_WORDS = {"APT", "UNIT", "STE", "SUITE", "#", "LOT", "BLDG"}
 
 
+def needs_retrace(row):
+    inp = row.get("skiptrace_input") or {}
+    if row.get("skiptrace_status") != "traced" or not (inp.get("first") or inp.get("last")):
+        return False
+    first, last, _, _ = compute_skiptrace_identity(row, list(row.get("source_tags") or []))
+    return bool(first or last) and not _same_person(inp.get("first"), inp.get("last"), first, last)
+
+
 def segment(row):
     """'dead' | 'wrong_info' | 'probate_pr' | 'deceased_hold' | 'main' for one
     house/land lead. dead / wrong_info come from the nightly QA check
@@ -575,7 +583,10 @@ def segment(row):
     # 2026-10-11: anything already pulled for skip trace never goes back on
     # the morning lists (skiptrace_intake.py marks it from her result files)
     st = (row.get("skiptrace_status") or "").strip()
-    if st == "traced":
+    # 2026-10-14: ...unless the person to trace has changed since (a Personal
+    # Representative was appointed, the owner changed). Those go back on the
+    # pull list tagged "retrace" so they're traced with the day's new leads.
+    if st == "traced" and not needs_retrace(row):
         return "skiptraced"
     if st == "failed":
         return "fixed_unskiptraced" if row.get("skiptrace_fix_status") == "fixed" else "not_skiptraced"
@@ -718,6 +729,75 @@ def errors_csv(rows, today):
     return prefixed_csv(rows, today, ["Found On", "What Changed (update GHL)", "Skip-Traced?"],
                         lambda r: [_d(r.get("found_at")), r.get("reason") or "",
                                    {"traced": "Traced", "failed": "Not traced"}.get(r.get("skiptrace_status"), "")])
+
+
+# ------------------------------------------------------- GHL upload file
+# 2026-10-15 (T Dawg's ask): ONE file to import into GoHighLevel each day,
+# so she never cross-references the error list by hand:
+#   NEW     traced in the last 7 days (phones from the skip trace) -- creates
+#           the contact (or updates it if it's already there)
+#   UPDATE  (yellow) already in GHL and something changed -- updates it
+#   DELETE  (red) now dead -- import tags it "delete - dead lead"; then filter
+#           by that tag and bulk delete
+# Import with "Update existing records" on: GHL matches by phone, so a row
+# that's already in GHL is updated and never duplicated. Re-importing the
+# same row on a later day is harmless (it just updates again).
+GHL_NEW_DAYS = 7
+GHL_FILL = {"NEW": None, "UPDATE": "FFFF00", "DELETE": "EA9999"}
+
+
+def ghl_upload_rows(traced, err):
+    err_ids = {str(r.get("id")) for r in err}
+    now = datetime.now(timezone.utc)
+    out = []
+    for r in err:
+        out.append(("DELETE" if r.get("lead_status") == "dead" else "UPDATE", r))
+    for r in traced:
+        when = r.get("skiptrace_date")
+        if (str(r.get("id")) in err_ids or r.get("lead_status") or not hasattr(when, "tzinfo")
+                or not (r.get("skiptrace_phones") or [])):
+            continue
+        w = when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+        if now - w <= timedelta(days=GHL_NEW_DAYS):
+            out.append(("NEW", r))
+    order = {"DELETE": 0, "UPDATE": 1, "NEW": 2}
+    out.sort(key=lambda x: order[x[0]])
+    return out
+
+
+def ghl_upload_files(traced, err, today):
+    rows = ghl_upload_rows(traced, err)
+    body = list(csv.reader(io.StringIO(to_csv([r for _, r in rows], today))))
+    header = ["Action"] + body[0]
+    lines = [[a] + line for (a, _), line in zip(rows, body[1:])]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(header)
+    w.writerows(lines)
+    xlsx = None
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "GHL upload"
+        ws.append(header)
+        for c in ws[1]:
+            c.font = Font(bold=True)
+        for line in lines:
+            ws.append(line)
+            fill = GHL_FILL.get(line[0])
+            if fill:
+                for c in ws[ws.max_row]:
+                    c.fill = PatternFill("solid", fgColor=fill)
+        ws.freeze_panes = "A2"
+        b = io.BytesIO()
+        wb.save(b)
+        xlsx = b.getvalue()
+    except ImportError:
+        pass
+    counts = {a: sum(1 for x, _ in rows if x == a) for a in ("NEW", "UPDATE", "DELETE")}
+    return buf.getvalue(), xlsx, counts
 
 
 # ------------------------------------------------------- texting list
@@ -888,7 +968,7 @@ def upload(files, key, url=SUPABASE_URL, session=None):
     for name, body, ctype in files:
         r = s.post(f"{url}/storage/v1/object/{BUCKET}/{name}",
                    headers={**h, "x-upsert": "true", "Content-Type": ctype},
-                   data=body.encode("utf-8"), timeout=120)
+                   data=body if isinstance(body, bytes) else body.encode("utf-8"), timeout=120)
         r.raise_for_status()
         print(f"  uploaded {BUCKET}/{name} ({len(body):,} bytes)")
 
@@ -957,6 +1037,13 @@ def build(conn, today=None):
     counts["errors_delete_in_ghl"] = len(dele)
     out.append(("errors/update_in_ghl.csv", errors_csv(upd, today), "text/csv"))
     out.append(("errors/delete_in_ghl.csv", errors_csv(dele, today), "text/csv"))
+    g_csv, g_xlsx, g_counts = ghl_upload_files(traced, err, today)
+    counts.update({"ghl_upload_new": g_counts["NEW"], "ghl_upload_update": g_counts["UPDATE"],
+                   "ghl_upload_delete": g_counts["DELETE"]})
+    out.append(("ghl_upload/ghl_upload.csv", g_csv, "text/csv"))
+    if g_xlsx:
+        out.append(("ghl_upload/ghl_upload.xlsx", g_xlsx,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
     report, warn = health_report(conn, counts, today)
     out.append(("system_health.txt", report, "text/plain"))
     return out, warn
