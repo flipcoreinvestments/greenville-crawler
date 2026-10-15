@@ -135,6 +135,10 @@ COLUMNS = [
     # "update lead info" so a GHL import with "update existing contacts"
     # updates the contact already there. This column says what changed.
     "What Changed (update GHL)",
+    # 2026-10-14: the phones the skip trace returned (newest first). GHL
+    # matches an existing contact by phone or email, so these are what make
+    # "update existing contacts" find the contact instead of creating a new one.
+    "Phone 1", "Phone 2", "Phone 3", "Phone 4", "Phone 5",
 ]
 
 MAIL_TAIL = re.compile(r",?\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?\s*$", re.I)
@@ -478,6 +482,7 @@ def to_csv(rows, today):
             *split_contact_address(r.get("mailing_address"))[:2],
             *_owner2(r, tags),
             changed,
+            *((list(r.get("skiptrace_phones") or []) + [""] * 5)[:5]),
         ])
     return buf.getvalue()
 
@@ -943,6 +948,15 @@ def build(conn, today=None):
     err = error_rows(conn)
     counts["errors_last_30_days"] = len(err)
     out.append(("errors/errors.csv", errors_csv(err, today), "text/csv"))
+    # 2026-10-14: the same error list split the two ways it goes into GHL --
+    # update_in_ghl.csv (still a lead: import with "update existing contacts")
+    # and delete_in_ghl.csv (now dead: import to tag, then bulk delete).
+    upd = [r for r in err if r.get("lead_status") != "dead"]
+    dele = [r for r in err if r.get("lead_status") == "dead"]
+    counts["errors_update_in_ghl"] = len(upd)
+    counts["errors_delete_in_ghl"] = len(dele)
+    out.append(("errors/update_in_ghl.csv", errors_csv(upd, today), "text/csv"))
+    out.append(("errors/delete_in_ghl.csv", errors_csv(dele, today), "text/csv"))
     report, warn = health_report(conn, counts, today)
     out.append(("system_health.txt", report, "text/plain"))
     return out, warn
