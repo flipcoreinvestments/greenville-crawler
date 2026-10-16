@@ -32,11 +32,12 @@ import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 
+import json
 import psycopg2
 import psycopg2.extras
 
 from lead_common import ensure_schema
-from skiptrace_prep import compute_skiptrace_identity, probate_contact, probate_heirs, split_name, owner_trace_names, _clean_addr
+from skiptrace_prep import PR_NO_ADDRESS_NOTE, compute_skiptrace_identity, probate_contact, probate_heirs, split_name, owner_trace_names, _clean_addr
 from ghl_sync import ensure_columns as ensure_ghl_columns, plan_ghl_rows, good_phones
 
 PROBATE_CASE_URL = "https://www.greenvillecounty.org/appsas400/Probate/SearchDetails.aspx?CaseNumber={case_number}"
@@ -422,6 +423,9 @@ def trace_edit_note(r, first, last, addr):
                 "(officer, registered agent or trustee)")
     if not (addr or "").strip():
         return "No address to trace -- add the person's mailing address in Skiptrace Address"
+    if "probate" in tags and compute_skiptrace_identity(r, list(tags))[3] == PR_NO_ADDRESS_NOTE:
+        return ("Personal Representative has no address on file -- add the PR's mailing address "
+                "(probate case link) to Skiptrace Address before tracing")
     if addr == r.get("address") and _INCOMPLETE_STREET.match(addr or ""):
         return "Incomplete address -- add the street type (Rd, St, Dr...) to Skiptrace Address"
     if r.get("retrace_reason") and same_search(r, first, last, addr):
@@ -1211,6 +1215,29 @@ def upload(files, key, url=SUPABASE_URL, session=None):
 GHL_KEYS = []  # rows in today's GHL file -- logged as sent once the files are uploaded
 
 
+def record_trace_offers(conn, rows, today):
+    """2026-10-16: remember every person the pull lists offered for each lead
+    (leads.trace_offers, newest last). Skip-trace intake compares the name she
+    searched with these: a name the system offered (even one since replaced,
+    e.g. a PR appointed after the pull) means a later change of person is a
+    real retrace; a name never offered means she corrected it by hand.
+    Only leads whose offered person changed are written."""
+    changed = []
+    for r in rows:
+        first, last, _, _ = compute_skiptrace_identity(r, list(r.get("source_tags") or []))
+        if not (first or last):
+            continue
+        offers = list(r.get("trace_offers") or [])
+        if offers and _same_person(offers[-1].get("first"), offers[-1].get("last"), first, last):
+            continue
+        offers = (offers + [{"first": first, "last": last, "date": f"{today:%Y-%m-%d}"}])[-10:]
+        changed.append((json.dumps(offers), str(r["id"])))
+    if changed:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, "update leads set trace_offers = %s::jsonb where id = %s", changed,
+                                          page_size=500)
+
+
 def build(conn, today=None):
     today = today or date.today()
     OPEN_ERRORS.clear()
@@ -1219,7 +1246,7 @@ def build(conn, today=None):
     out, counts = [], {}
     probate_pr, hold, wrong = [], [], []
     traced, not_traced, fixed = [], [], []
-    all_rows = []
+    all_rows, offered = [], []
     for view in ("house_leads", "land_leads"):
         rows = lead_rows(conn, view)
         all_rows += rows
@@ -1231,6 +1258,8 @@ def build(conn, today=None):
              "fixed_unskiptraced": fixed}.get(seg, main_rows).append(r)
         counts[view] = len(main_rows)
         out.append((f"{view}.csv", to_csv(main_rows, today), "text/csv"))
+        offered += main_rows
+    record_trace_offers(conn, offered + probate_pr, today)
     counts["probate_pr_leads"] = len(probate_pr)
     counts["deceased_owner_hold"] = len(hold)
     out.append(("probate_pr_leads.csv", probate_csv(probate_pr, today), "text/csv"))

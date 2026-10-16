@@ -359,6 +359,21 @@ def main():
     d = by_addr(daily)
     check(d.get(addr(conn, "pr1"), {}).get("Action") == "DELETE", "died again -> DELETE again")
     check(len(daily) == 1, f"and nothing else ({len(daily)} rows)")
+
+    print("N8 (10/23: PR changes between the pull and the trace upload; new PR has no address):")
+    add(conn, "gap1", owner_name="LEE ROSE", source_tags=["probate"],
+        raw={"probate": {"pr_name": "LEE , RAY", "pr_address": "9 ELM ST GREER SC 29651"}})
+    conn.commit()
+    night(conn, date(2026, 10, 23))  # on the pull list with Ray -> offer recorded
+    upd(conn, "gap1", raw={"probate": {"pr_name": "LEE , SUE"}})
+    with conn.cursor() as cur:
+        si.mark_row(cur, {"Property Address": addr(conn, "gap1"), "Property Zip": "29601", "First Name": "Ray",
+                          "Last Name": "Lee", "Phone": "8640000080"}, "traced", "t8")
+    conn.commit()
+    daily, week, house, nots, f = night(conn, date(2026, 10, 24))
+    g = by_addr(house).get(addr(conn, "gap1"), {})
+    check(bool(g), "traced the old PR, a new PR was appointed before the upload -> back on the pull list as a retrace")
+    check("no address" in g.get("Edit Before Trace", ""), "...ORANGE note: the new PR has no address on file")
     conn.close()
     print("\nALL PASSED" if not FAILS else f"\n{len(FAILS)} FAILED")
     sys.exit(1 if FAILS else 0)

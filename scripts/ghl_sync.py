@@ -61,7 +61,8 @@ def ensure_columns(conn):
     with conn.cursor() as cur:
         for col, typ in [("ghl_phone", "text"), ("ghl_contact_id", "text"), ("ghl_in_crm", "boolean"),
                          ("ghl_seen_at", "timestamptz"), ("ghl_tags", "text[]"), ("ghl_reset_at", "timestamptz"),
-                         ("bad_phones", "text[]"), ("retrace_reason", "text"), ("ghl_feedback", "text[]")]:
+                         ("bad_phones", "text[]"), ("retrace_reason", "text"), ("ghl_feedback", "text[]"),
+                         ("trace_offers", "jsonb")]:
             cur.execute(f"alter table leads add column if not exists {col} {typ}")
         cur.execute("create index if not exists idx_leads_ghl_phone on leads(ghl_phone) where ghl_phone is not null")
         cur.execute("""create table if not exists ghl_sent (

@@ -67,7 +67,7 @@ def ensure_columns(conn):
                          # 2026-10-16: GHL sync (ghl_sync.py)
                          ("ghl_phone", "text"), ("ghl_in_crm", "boolean"), ("retrace_reason", "text"),
                          ("ghl_contact_id", "text"), ("ghl_seen_at", "timestamptz"), ("ghl_tags", "text[]"),
-                         ("ghl_reset_at", "timestamptz")]:
+                         ("ghl_reset_at", "timestamptz"), ("trace_offers", "jsonb")]:
             cur.execute(f"alter table leads add column if not exists {col} {typ}")
         cur.execute("""create table if not exists skiptrace_files (
                          name text primary key, rows_read int, matched int, traced int, failed int,
@@ -166,20 +166,33 @@ def mark_row(cur, row, status, when_label):
     # 2026-10-15: a retrace (the person to call changed) replaces the old
     # person's phones instead of keeping them behind the new ones, and an
     # empty retrace shows as not traced rather than keeping the wrong phones.
-    cur.execute("""select skiptrace_input, retrace_reason, owner_name, address, mailing_address, raw, source_tags
+    cur.execute("""select skiptrace_input, retrace_reason, owner_name, address, mailing_address, raw, source_tags,
+                          trace_offers
                    from leads where id = %s""", (hit[0],))
-    old, was_wrong, owner, paddr, maddr, raw, stags = (cur.fetchone() or [None] * 7)
+    old, was_wrong, owner, paddr, maddr, raw, stags, offers = (cur.fetchone() or [None] * 8)
     old = old or {}
     # 2026-10-16: who the SYSTEM would have traced at this moment. When she
     # edited the name before tracing (an ORANGE row), the traced name differs
     # from the system's -- that is not a "person changed" retrace; only a later
     # change of the system's own person (a PR appointed...) is.
-    try:
-        sf, sl, _, _ = compute_skiptrace_identity(
-            {"owner_name": owner, "address": paddr, "mailing_address": maddr, "raw": raw or {}}, stags or [])
-        inp["system_first"], inp["system_last"] = sf or "", sl or ""
-    except Exception:
-        pass
+    # The pull lists record every person they offered (trace_offers): if she
+    # searched one of them, that's the system's person -- even when a PR was
+    # appointed between the pull and this upload, so the change still shows
+    # as a retrace. A name never offered = she corrected it by hand; the
+    # system's person is then the newest one offered.
+    offers = [o for o in (offers or []) if o.get("first") or o.get("last")]
+    match = next((o for o in reversed(offers)
+                  if _same_person(o.get("first"), o.get("last"), inp["first"], inp["last"])), None)
+    if match or offers:
+        o = match or offers[-1]
+        inp["system_first"], inp["system_last"] = o.get("first") or "", o.get("last") or ""
+    else:
+        try:
+            sf, sl, _, _ = compute_skiptrace_identity(
+                {"owner_name": owner, "address": paddr, "mailing_address": maddr, "raw": raw or {}}, stags or [])
+            inp["system_first"], inp["system_last"] = sf or "", sl or ""
+        except Exception:
+            pass
     # ...and so does a new trace after a caller reported "wrong person" (even
     # with the same name -- she changed the address or used another provider):
     # the old contact was tagged retrace and deleted, its phones were wrong.
