@@ -30,6 +30,9 @@ concurrency:
 jobs:
   ingest:
     runs-on: ubuntu-latest
+    # 2026-10-19: write access lets the last step publish the watchdog status file
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -148,7 +151,7 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/skiptrace_followup.py
+        run: python scripts/skiptrace_followup.py | tee followup.log
 
       # 2026-10-13: checks every skip-traced phone against the Do Not Call
       # registry files she uploads monthly (private bucket dnc-registry) and
@@ -174,3 +177,25 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/health_gate.py
+
+      # 2026-10-19: publishes a tiny status file (pass/fail + how many pulled
+      # leads changed, count only) to the watchdog-status branch. Claude's
+      # daily watchdog reads it from raw.githubusercontent.com, which still
+      # works when Claude's cloud blocks the GitHub API.
+      - name: Publish watchdog status
+        if: ${{ always() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          ERRS=$(grep -oP 'New errors on already-pulled leads: \K[0-9]+' followup.log 2>/dev/null || echo unknown)
+          mkdir -p /tmp/st && cd /tmp/st
+          git init -q -b watchdog-status
+          printf '{"run_id":"%s","event":"%s","status":"%s","lead_errors":"%s","finished_utc":"%s"}\n' \
+            "$RUN_ID" "$EVENT" "$JOB_STATUS" "$ERRS" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > status.json
+          git add status.json
+          git -c user.name=crawler-bot -c user.email=actions@users.noreply.github.com commit -qm "watchdog status $RUN_ID"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" watchdog-status
