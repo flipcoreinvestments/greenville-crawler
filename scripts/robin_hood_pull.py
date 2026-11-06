@@ -415,14 +415,20 @@ def pull_clarity():
 
 # ---------------------------------------------------------------------- PageSpeed
 def pull_pagespeed():
+    # Without a key, Google's shared free quota is often used up on GitHub's
+    # servers (HTTP 429). PAGESPEED_KEY = an API key from the Unstuck Robin
+    # Hood Google Cloud project, restricted to the PageSpeed Insights API.
+    key = os.environ.get("PAGESPEED_KEY")
     out = {}
     for strategy in ("mobile", "desktop"):
         data = None
+        params = {"url": SITE, "strategy": strategy, "category": "performance"}
+        if key:
+            params["key"] = key
         for attempt in range(2):
             try:
                 data = safe_get("https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
-                                params={"url": SITE, "strategy": strategy, "category": "performance"},
-                                label=f"pagespeed {strategy}")
+                                params=params, label=f"pagespeed {strategy}")
                 break
             except SourceError:
                 if attempt:

@@ -38,4 +38,5 @@ jobs:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           CLARITY_TOKEN: ${{ secrets.CLARITY_TOKEN }}
           BING_API_KEY: ${{ secrets.BING_API_KEY }}
+          PAGESPEED_KEY: ${{ secrets.PAGESPEED_KEY }}
         run: python scripts/robin_hood_pull.py
