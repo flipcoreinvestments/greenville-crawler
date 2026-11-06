@@ -1,0 +1,41 @@
+name: Robin Hood daily pull
+
+# 2026-11-06: reads Unstuck Homes' numbers (GHL, Google Analytics, Search
+# Console, Bing, Clarity, PageSpeed, site check) view-only and saves one
+# snapshot per source per day to the private Supabase table robin_hood_daily.
+# Claude's morning Robin Hood report reads that table. Logs show counts only.
+# Separate from the nightly crawler so a crawler problem never blocks it.
+
+on:
+  schedule:
+    # 10:20 UTC = 5:20 AM Eastern in winter (6:20 AM in summer)
+    - cron: "20 10 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: robin-hood
+  cancel-in-progress: false
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests==2.32.3 psycopg2-binary==2.9.9 google-auth==2.35.0
+
+      - name: Pull every source (view-only)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GHL_TOKEN: ${{ secrets.GHL_TOKEN }}
+          GHL_LOCATION_ID: ${{ secrets.GHL_LOCATION_ID }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          CLARITY_TOKEN: ${{ secrets.CLARITY_TOKEN }}
+          BING_API_KEY: ${{ secrets.BING_API_KEY }}
+        run: python scripts/robin_hood_pull.py
