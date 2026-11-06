@@ -4,7 +4,7 @@ DO NOT CALL SCRUB (added 2026-10-13, T Dawg's ask). Runs every night after the
 skip-trace intake and before the call lists are written.
 
 What she does (once a month):
-  1. Log in at telemarketing.donotcall.gov (Restart Homes' subscription; the
+  1. Log in at telemarketing.donotcall.gov (Unstuck Homes' subscription; the
      first 5 area codes are free) and download the full list for each area
      code she subscribed to.
   2. Drop the downloaded files into the private Supabase Storage bucket

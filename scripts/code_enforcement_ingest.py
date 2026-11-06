@@ -71,7 +71,7 @@ DETAIL_URL_TMPL = (
 SOURCE_NAME = "code_violation"
 REQUEST_TIMEOUT = 30
 HEADERS = {
-    "User-Agent": "RestartHomesResearch/1.0 (+info@restarthomes.net; one-off public-record lookup, low volume)"
+    "User-Agent": "UnstuckHomesResearch/1.0 (+tala@unstuckhomes.com; one-off public-record lookup, low volume)"
 }
 
 

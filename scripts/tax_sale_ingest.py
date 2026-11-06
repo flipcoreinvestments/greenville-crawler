@@ -43,7 +43,7 @@ from lead_common import ensure_schema, expire_by_raw_key, mailing_is_address, re
 LIST_URL = "https://www.greenvillecounty.org/appsas400/taxsale/"
 DETAILS_URL = "https://www.greenvillecounty.org/appsas400/RealProperty/Details.aspx?TaxYear={year}&MapNumber={map_number}"
 HEADERS = {
-    "User-Agent": "RestartHomesResearch/1.0 (+info@restarthomes.net; one-off public-record lookup, low volume)"
+    "User-Agent": "UnstuckHomesResearch/1.0 (+tala@unstuckhomes.com; one-off public-record lookup, low volume)"
 }
 REQUEST_DELAY_SECONDS = 1.5  # be polite to the county's server
 ROW_RETRY_ATTEMPTS = 3

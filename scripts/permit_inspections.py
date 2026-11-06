@@ -36,7 +36,7 @@ STALLED_DAYS = 180
 RECHECK_DAYS = 7
 MAX_LOOKUPS_PER_RUN = 250
 REQUEST_DELAY_SECONDS = 1.0
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RestartHomesResearch/1.0; +info@restarthomes.net)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; UnstuckHomesResearch/1.0; +tala@unstuckhomes.com)"}
 _DATE_RE = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
 
 

@@ -1,6 +1,6 @@
 # Greenville Crawler
 
-Nightly automated lead pull for Restart Homes, Greenville County only.
+Nightly automated lead pull for Unstuck Homes, Greenville County only.
 
 ## What it does right now
 

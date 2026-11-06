@@ -1101,7 +1101,7 @@ def dnc_health(conn, today):
 
 # ------------------------------------------------------------------ health
 def health_report(conn, counts, today):
-    lines = [f"Restart Homes lead system -- status as of {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC", ""]
+    lines = [f"Unstuck Homes lead system -- status as of {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC", ""]
     warn = []
     with conn.cursor() as cur:
         lines.append("LEAD LISTS")
