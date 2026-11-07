@@ -1,0 +1,50 @@
+name: Bankruptcy ingest
+
+# 2026-11-07: weekly search of PACER (official Case Locator API) for new
+# Chapter 7 / 13 filings in the SC Bankruptcy Court, matched to crawler leads
+# by first name + middle initial + last name. Runs Mondays 6:31am ET, before
+# Morbius's 7:47am sync. Capped at 12 billed pages (~$1.20) per run.
+#   check = true -> only logs in and out (free) to prove the secrets work.
+
+on:
+  schedule:
+    - cron: "31 11 * * 1"
+  workflow_dispatch:
+    inputs:
+      check:
+        description: "Login test only (free)"
+        type: boolean
+        default: true
+      days:
+        description: "How many days back to search"
+        type: string
+        default: "8"
+
+concurrency:
+  group: bankruptcy
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests==2.32.3 psycopg2-binary==2.9.9
+      - name: Bankruptcy ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PACER_USERNAME: ${{ secrets.PACER_USERNAME }}
+          PACER_PASSWORD: ${{ secrets.PACER_PASSWORD }}
+          PACER_TOTP_SECRET: ${{ secrets.PACER_TOTP_SECRET }}
+        run: |
+          cd scripts
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.check }}" = "true" ]; then
+            python bankruptcy_ingest.py --check
+          else
+            DAYS="${{ inputs.days }}"; [ -z "$DAYS" ] && DAYS=8
+            python bankruptcy_ingest.py --days "$DAYS"
+          fi

@@ -337,6 +337,9 @@ def years_owned(d):
     return None
 
 
+BANKRUPT = {}  # lead id -> (chapter, date_filed, case_number), filled in main()
+
+
 def build(lead, d, phones, fields, readded=False, readd_reason=""):
     tags_src = set(lead.get("source_tags") or [])
     owner = owner_trace_names(lead.get("owner_name"))
@@ -372,7 +375,10 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
     cf = {
         "crawler id": str(lead["id"]),
         "confidence": conf,
-        "their story": (f"{readd_reason}\n\n" if readd_reason else "") + f"Confidence {conf}%: {why}.\n\n{story}",
+        "their story": (f"{readd_reason}\n\n" if readd_reason else "") + (
+            f"Bankruptcy: Chapter {BANKRUPT[str(lead['id'])][0]} filed {BANKRUPT[str(lead['id'])][1]} "
+            f"(SC case {BANKRUPT[str(lead['id'])][2]}). Check: confirm it's the same owner and this property "
+            f"before calling.\n\n" if str(lead["id"]) in BANKRUPT else "") + f"Confidence {conf}%: {why}.\n\n{story}",
         "skip trace info": "\n".join(info),
         "mailing address": d.get("Mailing Address") or "",
         "county": f"{lead.get('county') or 'Greenville'} County, SC",
@@ -400,6 +406,8 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
         tags.append("verified 95+")
     if "code_violation" in tags_src:
         tags.append("condemned")
+    if str(lead["id"]) in BANKRUPT:
+        tags.append("bankruptcy")
     if any(isinstance(v, dict) and v.get("mls_status") for k, v in raw.items() if k.startswith("propstream")):
         tags.append("listed on mls")
 
@@ -501,6 +509,15 @@ def main():
     for r in rows:
         r["story"] = stories.get(str(r["id"]))
     print(f"Stories attached: {sum(1 for r in rows if r.get('story'))}")
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('public.bankruptcy_filings') is not null")
+        if cur.fetchone()[0]:
+            cur.execute("""select matched_lead_id, chapter, to_char(date_filed,'MM/DD/YYYY'), case_number
+                           from bankruptcy_filings where matched_lead_id is not null""")
+            for lid_, ch, df, cn in cur.fetchall():
+                BANKRUPT[lid_] = (ch, df, cn)
+    c_bk = len(BANKRUPT)
+    print(f"Bankruptcy matches on file: {c_bk}")
     by_id = {str(r["id"]): r for r in rows}
     ok = clean_phones(conn)
     mapped = load_map(conn)
