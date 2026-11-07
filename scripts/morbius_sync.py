@@ -343,7 +343,7 @@ def build(lead, d, phones, fields, readded=False):
         info.append(call_line)
     else:
         call_line = "Call: owner"
-    info.append(f"Traced: {d.get('Last Skip-Traced') or 'yes'}")
+    info.append(f"Traced: {str(d.get('Last Skip-Traced') or '').strip() or 'yes'}")
 
     rp = raw.get("redemption_period") or {}
     if d.get("Foreclosure Auction Date"):
@@ -481,12 +481,20 @@ def main():
 
     today = date.today()
     rows = lead_rows(conn, "house_leads")
+    # Morbius's stories live on the leads table (the house_leads view doesn't carry them)
+    with conn.cursor() as cur:
+        cur.execute("select id::text, story from leads where story is not null")
+        stories = dict(cur.fetchall())
+    for r in rows:
+        r["story"] = stories.get(str(r["id"]))
+    print(f"Stories attached: {sum(1 for r in rows if r.get('story'))}")
     by_id = {str(r["id"]): r for r in rows}
     ok = clean_phones(conn)
     mapped = load_map(conn)
     c = dict(new=0, linked_existing=0, updated=0, kept_her_edit=0, retrace=0, deleted_dead=0,
              deleted_tagged=0, protected_kept=0, skipped_no_clean_phone=0, readded=0, errors=0)
     new_budget = a.limit if a.limit >= 0 else 10 ** 9
+    edit_keys = {}
 
     # ---------- GREEN / YELLOW / ORANGE
     for lead in rows:
@@ -525,6 +533,8 @@ def main():
                 upd["customFields"] = [f for f in body["customFields"]
                                        if "cf:" + id_to_name.get(f["id"], "") not in edits]
                 c["kept_her_edit"] += len(edits)
+                for k in edits:
+                    edit_keys[k] = edit_keys.get(k, 0) + 1
                 api.update_contact(cid, upd)
                 api.add_tags(cid, tags)
                 stale = {"warm", "hot", "very hot", "verified 95+"} - set(tags)
@@ -625,6 +635,8 @@ def main():
         conn.commit()
     conn.close()
     print("Morbius counts: " + ", ".join(f"{k} {v}" for k, v in c.items()))
+    if edit_keys:
+        print("Her edits kept, by field: " + ", ".join(f"{k} x{v}" for k, v in sorted(edit_keys.items())))
 
 
 if __name__ == "__main__":
