@@ -41,7 +41,7 @@ import json
 import os
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import psycopg2
 import psycopg2.extras
@@ -201,6 +201,12 @@ def ensure_tables(conn):
         cur.execute("alter table morbius_runs enable row level security")
         cur.execute("alter table leads add column if not exists story text")
         cur.execute("alter table morbius_contacts add column if not exists deleted_tags text[]")
+        cur.execute("""create table if not exists morbius_skiptrace_queue (
+                         lead_id text primary key, status text not null, reason text, confidence int,
+                         list_count int, days_on_list int, updated_at timestamptz default now(),
+                         alerted_at timestamptz, approved_at timestamptz)""")
+        cur.execute("alter table morbius_skiptrace_queue enable row level security")
+        cur.execute("revoke all on morbius_skiptrace_queue from anon, authenticated")
     conn.commit()
 
 
@@ -610,6 +616,67 @@ def main():
             conn.rollback()
             c["errors"] += 1
             print(f"  lead skipped: {type(e).__name__}: {str(e)[:120]}")
+
+    # ---------- SKIP-TRACE QUEUE (purple = on hold)
+    # Tala's rule (Nov 7 2026): no skip tracing until at least 50 crawler leads in GHL have
+    # been called/updated (pipeline card moved off New, closed, or a note logged). Until then
+    # untraced leads wait PURPLE. Exception -> URGENT (she gets a chat + phone alert asking to
+    # approve): Confidence 95+, on 3+ lists, or a hard deadline (foreclosure auction / tax-sale
+    # redemption) within 60 days. Nothing is ever traced without her approval.
+    worked = 0
+    for lid, m in mapped.items():
+        if m.get("ghl_contact_id") and not m.get("deleted_at"):
+            try:
+                worked += bool(protected(api, m["ghl_contact_id"]))
+            except Exception:
+                pass
+    c["called_or_updated"] = worked
+    gate_open = worked >= 50
+    queue = []
+    for lead in rows:
+        if lead.get("lead_status") or lead.get("skiptrace_status") in ("traced",) or not_worked(lead):
+            continue
+        if not (lead.get("list_count") or 0) or lead.get("is_duplicate"):
+            continue
+        raw = lead.get("raw") or {}
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        conf, _ = confidence(lead, raw)
+        days = days_on_list(lead)
+        lc = lead.get("list_count") or 0
+        why = []
+        if conf >= 95:
+            why.append(f"Confidence {conf}%")
+        if lc >= 3:
+            why.append(f"on {lc} lists")
+        d = row_dict(lead, today)
+        for label, val in (("foreclosure auction", d.get("Foreclosure Auction Date")),
+                           ("tax-sale redemption deadline", (raw.get("redemption_period") or {}).get("redemption_deadline"))):
+            try:
+                dd = date.fromisoformat(str(val)[:10]) if val else None
+            except ValueError:
+                dd = None
+            if dd and today <= dd <= today + timedelta(days=60):
+                why.append(f"{label} {dd:%m/%d/%Y}")
+        status = "urgent" if why else ("ready" if gate_open else "purple")
+        queue.append((str(lead["id"]), status, "; ".join(why) or None, conf, lc, days))
+    c["skiptrace_urgent"] = sum(1 for q in queue if q[1] == "urgent")
+    c["skiptrace_purple"] = sum(1 for q in queue if q[1] == "purple")
+    c["skiptrace_ready"] = sum(1 for q in queue if q[1] == "ready")
+    if a.live:
+        with conn.cursor() as cur:
+            ids = [q[0] for q in queue]
+            cur.execute("delete from morbius_skiptrace_queue where not (lead_id = any(%s))", (ids,))
+            for q in queue:
+                cur.execute("""insert into morbius_skiptrace_queue (lead_id, status, reason, confidence, list_count,
+                                 days_on_list, updated_at) values (%s,%s,%s,%s,%s,%s,now())
+                               on conflict (lead_id) do update set
+                                 status = case when morbius_skiptrace_queue.approved_at is not null then 'approved'
+                                               else excluded.status end,
+                                 reason=excluded.reason, confidence=excluded.confidence,
+                                 list_count=excluded.list_count, days_on_list=excluded.days_on_list, updated_at=now(),
+                                 alerted_at = case when excluded.status='urgent' then morbius_skiptrace_queue.alerted_at end""", q)
+        conn.commit()
 
     # ---------- VERIFY: read back up to 10 GHL cards whose lead has a Morbius story
     if a.live and "their story" in fields:

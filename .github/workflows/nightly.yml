@@ -125,15 +125,9 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python scripts/skiptrace_intake.py
 
-      # 2026-10-16: reads the newest GHL contact export she drops in the
-      # private ghl-sync bucket -- which phone each GHL contact has, which
-      # contacts are gone, and "wrong number" / "wrong person" tags from calls.
-      - name: GHL sync (private Supabase bucket ghl-sync)
-        if: ${{ !cancelled() }}
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python scripts/ghl_sync.py
+      # 2026-11-07: the old "GHL sync" step (read Restart Homes' GHL contact exports from the
+      # ghl-sync bucket) was removed. Nothing in this system reads from or writes to Restart
+      # Homes. Unstuck's GHL is kept in sync by Morbius (morbius.yml).
 
       # 2026-10-11: re-checks the last 1,000 leads + every skip-traced lead;
       # marks sold/off-list leads DEAD and bad-data leads WRONG INFORMATION
