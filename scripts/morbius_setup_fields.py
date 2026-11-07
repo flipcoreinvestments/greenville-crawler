@@ -60,6 +60,9 @@ def main():
         sys.exit(1)
     r = requests.get(f"{BASE}/locations/{LOC}/customFields", headers=HEAD, params={"model": "contact"}, timeout=30)
     if r.status_code != 200:
+        print("GHL said:", r.text[:300].replace(TOKEN, "***"))
+        c = requests.get(f"{BASE}/contacts/", headers=HEAD, params={"locationId": LOC, "limit": 1}, timeout=30)
+        print(f"Key check: contacts read = HTTP {c.status_code}; key length {len(TOKEN)}; starts with 'pit-': {TOKEN.startswith('pit-')}")
         print(f"Could not read existing custom fields: HTTP {r.status_code}. "
               "Check that the Morbius key has View Custom Fields + Edit Custom Fields.")
         sys.exit(1)
