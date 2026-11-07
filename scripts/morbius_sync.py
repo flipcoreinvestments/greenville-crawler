@@ -326,11 +326,20 @@ def build(lead, d, phones, fields, readded=False):
     return body, tags, call_line
 
 
+def _norm(k, v):
+    v = str(v or "").strip()
+    if k == "phone":
+        return "".join(ch for ch in v if ch.isdigit())[-10:]
+    return " ".join(v.lower().split())
+
+
 def her_edits(contact, written):
-    """Tracked fields whose GHL value no longer matches what Morbius last wrote."""
+    """Tracked fields whose GHL value no longer matches what Morbius last wrote.
+    GHL reformats values (phone -> +1XXXXXXXXXX, name/address casing), so
+    values are compared normalized; only a real change counts as her edit."""
     out = set()
     for k in TRACKED:
-        if k in written and (contact.get(k) or "") != (written.get(k) or ""):
+        if k in written and _norm(k, contact.get(k)) != _norm(k, written.get(k)):
             out.add(k)
     return out
 
