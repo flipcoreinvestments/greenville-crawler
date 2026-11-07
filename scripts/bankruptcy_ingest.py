@@ -71,6 +71,7 @@ def login():
         if "otp" in str(msg).lower() or "multi" in str(msg).lower():
             print("Looks like MFA is on: add the authenticator setup key as the PACER_TOTP_SECRET secret.")
         sys.exit(1)
+    print(f"PACER login result: {j.get('loginResult')} {str(j.get('errorDescription') or '')[:120]}".strip())
     return token
 
 
@@ -141,6 +142,18 @@ def search(token, d_from, d_to):
     head = {"Content-type": "application/json", "Accept": "application/json", "X-NEXT-GEN-CSO": token}
     while page < pages and page < MAX_PAGES:
         r = requests.post(f"{PCL}/cases/find", params={"page": page}, json=body, headers=head, timeout=60)
+        if r.status_code == 401 and page == 0:
+            for alt in ("X-NEXT-GENCSO", "X-NEXTGEN-CSO"):
+                h2 = {k: v for k, v in head.items() if k != "X-NEXT-GEN-CSO"}
+                h2[alt] = token
+                r = requests.post(f"{PCL}/cases/find", params={"page": page}, json=body, headers=h2, timeout=60)
+                if r.status_code != 401:
+                    head = h2
+                    break
+            if r.status_code == 401:
+                r = requests.post(f"{PCL}/cases/find", params={"page": page}, json=body, headers=head,
+                                  cookies={"NextGenCSO": token}, timeout=60)
+            print(f"PCL retry: HTTP {r.status_code} {r.text[:200].replace(token, '***')}")
         if r.status_code != 200:
             print(f"PCL search failed on page {page}: HTTP {r.status_code}")
             break
