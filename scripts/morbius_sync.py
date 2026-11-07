@@ -540,7 +540,9 @@ def main():
                 contact = api.get_contact(cid)
                 if contact is None:
                     continue  # she deleted it herself; it stays deleted
-                edits = her_edits(contact, m.get("written") or {}, fields)
+                prev = m.get("written") or {}
+                # once Tala edits a field it stays hers forever (locked), not just for one run
+                edits = her_edits(contact, prev, fields) | set(prev.get("_locked") or [])
                 upd = {k: v for k, v in body.items() if k not in edits and k != "source"}
                 upd["customFields"] = [f for f in body["customFields"]
                                        if "cf:" + id_to_name.get(f["id"], "") not in edits]
@@ -554,6 +556,7 @@ def main():
                 have = {f.get("id"): f.get("value", f.get("field_value")) for f in (contact.get("customFields") or [])}
                 for k in edits:
                     written[k] = have.get(fields.get(k[3:])) if k.startswith("cf:") else contact.get(k)
+                written["_locked"] = sorted(edits)
                 c["updated"] += 1
                 if a.live:
                     with conn.cursor() as cur:
@@ -569,6 +572,7 @@ def main():
                     api.add_tags(cid, tags)
                     api.update_contact(cid, {"customFields": body["customFields"]})
                     c["linked_existing"] += 1
+                    written["_locked"] = list(TRACKED)  # her own contact: name/phone/address stay hers
                 else:
                     c["new"] += 1
                 if readded:
@@ -592,6 +596,23 @@ def main():
             conn.rollback()
             c["errors"] += 1
             print(f"  lead skipped: {type(e).__name__}: {str(e)[:120]}")
+
+    # ---------- VERIFY: read back up to 10 GHL cards whose lead has a Morbius story
+    if a.live and "their story" in fields:
+        checked = shown = 0
+        for lid, m in load_map(conn).items():
+            lead = by_id.get(lid)
+            if checked >= 10 or not lead or not lead.get("story") or m.get("deleted_at") or not m.get("ghl_contact_id"):
+                continue
+            if "cf:their story" in ((m.get("written") or {}).get("_locked") or []):
+                continue
+            contact = api.get_contact(m["ghl_contact_id"])
+            if contact is None:
+                continue
+            checked += 1
+            val = next((f.get("value") for f in contact.get("customFields") or [] if f.get("id") == fields["their story"]), "")
+            shown += "Here's the stitch" in str(val)
+        print(f"Verified in GHL: {shown}/{checked} cards show Morbius's story")
 
     # ---------- RED: dead leads + her "delete" tag
     dead = []
