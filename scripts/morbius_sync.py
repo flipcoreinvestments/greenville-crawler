@@ -209,6 +209,71 @@ def load_map(conn):
         return {str(r["lead_id"]): r for r in cur.fetchall()}
 
 
+
+# ------------------------------------------------------------------ confidence
+# Which public office / data source each distress tag comes from. Two tags from
+# the same office (tax sale + redemption) count as ONE source.
+SOURCE_OF = {
+    "tax_sale": "county tax collector", "repeat_tax_delinquent": "county tax collector",
+    "probate": "probate court", "foreclosure_mie": "Master-in-Equity court",
+    "hoa_foreclosure": "Master-in-Equity court", "code_violation": "county code enforcement",
+    "permit_expired": "city permits", "permit_demolition": "city permits", "insurance_damage": "city permits",
+    "pre_foreclosure": "PropStream", "pre_probate": "PropStream", "involuntary_lien": "PropStream",
+    "failed_listing": "PropStream",
+}
+RAW_KEY = {"county tax collector": ["tax_sale", "redemption_period"], "probate court": ["probate"],
+           "Master-in-Equity court": ["foreclosure_mie"], "county code enforcement": ["code_violation"],
+           "city permits": ["building_permits", "permit"]}
+ID_DOUBT = {"probate_name_match", "missing_owner", "probate_owner_mismatch", "corrupted_address"}
+
+
+def _fresh(raw, source, days=7):
+    for k in RAW_KEY.get(source, []):
+        f = (raw.get(k) or {}).get("fetched_at") if isinstance(raw.get(k), dict) else None
+        if f:
+            try:
+                t = datetime.fromisoformat(f.replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - t).days <= days:
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
+def confidence(lead, raw):
+    """0-100: how sure we are this owner is really in this situation right now.
+    95+ needs 2+ independent live sources, a clean identity and fresh data."""
+    srcs = []
+    for t in lead.get("source_tags") or []:
+        s = SOURCE_OF.get(t)
+        if s and s not in srcs:
+            srcs.append(s)
+    if not srcs:
+        return 0, "no live distress source"
+    county = [s for s in srcs if s != "PropStream"]
+    fresh = [s for s in county if _fresh(raw, s)]
+    score = 45 if (fresh or not county) else 35
+    if len(srcs) >= 2:
+        score += 25
+    if len(srcs) >= 3:
+        score += 10
+    reasons = set(lead.get("review_reasons") or [])
+    id_ok = not (reasons & ID_DOUBT)
+    if id_ok:
+        score += 15
+    if county and len(fresh) == len(county):
+        score += 15
+    elif not county:
+        score += 5  # PropStream only: monthly data, never rechecked live
+    if lead.get("distress_any_stale"):
+        score -= 20
+    if not id_ok:
+        score -= 15
+    score = max(0, min(100, score))
+    bits = [f"{s} (checked this week)" if s in fresh else s for s in srcs]
+    why = " + ".join(bits) + ("; owner identity clean" if id_ok else "; owner identity uncertain")
+    return score, why
+
 # ------------------------------------------------------------------ building a contact
 def row_dict(lead, today):
     body = list(csv.reader(io.StringIO(to_csv([lead], today))))
@@ -289,9 +354,12 @@ def build(lead, d, phones, fields, readded=False):
         nxt = d.get("Tax Sale Status") or ""
     heirs = probate_heirs(raw.get("probate"), d.get("Personal Representative"), lead.get("owner_name")) if probate else ""
 
+    conf, why = confidence(lead, raw)
+    story = (lead.get("story") or d.get("Call Brief") or "").strip()
     cf = {
         "crawler id": str(lead["id"]),
-        "their story": (lead.get("story") or d.get("Call Brief") or "").strip(),
+        "confidence": conf,
+        "their story": f"Confidence {conf}%: {why}.\n\n{story}",
         "skip trace info": "\n".join(info),
         "mailing address": d.get("Mailing Address") or "",
         "county": f"{lead.get('county') or 'Greenville'} County, SC",
@@ -315,6 +383,12 @@ def build(lead, d, phones, fields, readded=False):
         tags.append(h)
     if readded:
         tags.append("re-added")
+    if conf >= 95:
+        tags.append("verified 95+")
+    if "code_violation" in tags_src:
+        tags.append("condemned")
+    if any(isinstance(v, dict) and v.get("mls_status") for k, v in raw.items() if k.startswith("propstream")):
+        tags.append("listed on mls")
 
     first = (owner.get("first") or "").title()
     last = (owner.get("last") or "").title()
@@ -427,7 +501,7 @@ def main():
                 c["kept_her_edit"] += len(edits)
                 api.update_contact(cid, upd)
                 api.add_tags(cid, tags)
-                stale = {"warm", "hot", "very hot"} - set(tags)
+                stale = {"warm", "hot", "very hot", "verified 95+"} - set(tags)
                 api.remove_tags(cid, stale)
                 for k in edits:
                     written[k] = contact.get(k)

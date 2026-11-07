@@ -21,6 +21,7 @@ HEAD = {"Authorization": f"Bearer {TOKEN}", "Version": "2021-07-28", "Accept": "
 FIELDS = [
     # Additional Info
     ("Crawler ID", "TEXT", "Additional Info"),
+    ("Confidence", "NUMERICAL", "Additional Info"),
     ("Their Story", "LARGE_TEXT", "Additional Info"),
     ("Skip Trace Info", "LARGE_TEXT", "Additional Info"),
     ("Mailing Address", "TEXT", "Additional Info"),
