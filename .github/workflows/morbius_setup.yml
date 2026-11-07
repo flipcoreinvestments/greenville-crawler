@@ -1,0 +1,23 @@
+name: Morbius setup (create GHL custom fields)
+
+# 2026-11-07: run by hand once. Creates Tala's Unstuck Homes contact custom
+# fields in GHL. Safe to re-run: existing fields are skipped.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests==2.32.3
+      - name: Create custom fields
+        env:
+          GHL_MORBIUS_TOKEN: ${{ secrets.GHL_MORBIUS_TOKEN }}
+          GHL_LOCATION_ID: ${{ secrets.GHL_LOCATION_ID }}
+        run: python scripts/morbius_setup_fields.py
