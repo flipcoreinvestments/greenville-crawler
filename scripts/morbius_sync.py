@@ -260,21 +260,17 @@ def build(lead, d, phones, fields, readded=False):
         raw = json.loads(raw)
     days = days_on_list(lead)
 
-    call_first, call_last, call_addr, _ = compute_skiptrace_identity(lead, list(tags_src))
+    call_first, call_last, _, _ = compute_skiptrace_identity(lead, list(tags_src))
+    info = []
     if probate and d.get("Personal Representative"):
         call_line = f"Call: {nice_name(d['Personal Representative'])} (Personal Representative)"
-    elif probate:
-        call_line = f"Call: {call_first} {call_last}".strip() + " (family contact)"
+        info.append(call_line)
+    elif probate and (call_first or call_last):
+        call_line = f"Call: {nice_name(call_first + ' ' + call_last)} (family contact)"
+        info.append(call_line)
     else:
         call_line = "Call: owner"
-    info = [call_line]
-    if probate and d.get("PR Address"):
-        info.append(f"PR address: {d['PR Address']}")
-    info.append(f"Traced: {d.get('Last Skip-Traced') or 'yes'} (BatchData)")
-    info.append(f"Primary phone = most recent clean number; {max(0, len(phones) - 1)} backup number(s) in Phone 2-5")
-    blocked = len(lead.get("skiptrace_phones") or []) - len(phones)
-    if blocked > 0:
-        info.append(f"Blocked: {blocked} number(s) left out (Do Not Call, unchecked area code or reported wrong)")
+    info.append(f"Traced: {d.get('Last Skip-Traced') or 'yes'}")
 
     rp = raw.get("redemption_period") or {}
     if d.get("Foreclosure Auction Date"):
@@ -352,13 +348,13 @@ def protected(api, cid):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true", help="actually write to GHL")
-    ap.add_argument("--limit", type=int, default=0, help="max new contacts this run (0 = no limit)")
+    ap.add_argument("--limit", type=int, default=-1, help="max new contacts this run (0 = none, -1 = no limit)")
     a = ap.parse_args()
     if not (TOKEN and LOC and os.environ.get("DATABASE_URL")):
         print("Missing GHL_MORBIUS_TOKEN, GHL_LOCATION_ID or DATABASE_URL.")
         sys.exit(1)
     mode = "LIVE" if a.live else "PRACTICE (nothing written to GHL)"
-    print(f"Morbius sync -- {mode}" + (f", limit {a.limit} new" if a.limit else ""))
+    print(f"Morbius sync -- {mode}" + (f", limit {a.limit} new" if a.limit >= 0 else ", no limit on new"))
 
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
     ensure_tables(conn)
@@ -381,7 +377,7 @@ def main():
     mapped = load_map(conn)
     c = dict(new=0, linked_existing=0, updated=0, kept_her_edit=0, retrace=0, deleted_dead=0,
              deleted_tagged=0, protected_kept=0, skipped_no_clean_phone=0, readded=0, errors=0)
-    new_budget = a.limit or 10 ** 9
+    new_budget = a.limit if a.limit >= 0 else 10 ** 9
 
     # ---------- GREEN / YELLOW / ORANGE
     for lead in rows:
