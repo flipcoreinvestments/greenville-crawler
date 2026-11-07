@@ -463,3 +463,42 @@ def expire_by_address(conn, tag, current_addresses, min_ratio=0.5):
                    {"cores": cores})
     print(f"  expired {tag} from {n} lead(s) no longer on the source list")
     return n
+  # ---------------------------------------------------------------------------
+# Database login retry (added 2026-11-07, Tala's call)
+# On 2026-11-06 three ingest steps died with "authentication did not complete
+# within 15000ms" from the Supabase pooler. That 15-second limit is set on
+# Supabase's side, so we can't raise it. Instead, every psycopg2.connect()
+# in any script that imports this file keeps retrying for up to 120 seconds
+# before giving up.
+# ---------------------------------------------------------------------------
+import time as _time
+
+try:
+    import psycopg2 as _pg
+except ImportError:
+    _pg = None
+
+DB_LOGIN_WINDOW_SECONDS = 120
+
+if _pg is not None and not getattr(_pg.connect, "_retry_wrapped", False):
+    _original_connect = _pg.connect
+
+    def _connect_with_retry(*args, **kwargs):
+        deadline = _time.monotonic() + DB_LOGIN_WINDOW_SECONDS
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return _original_connect(*args, **kwargs)
+            except _pg.OperationalError as e:
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    raise
+                wait = min(10, remaining)
+                first_line = str(e).strip().splitlines()[0] if str(e).strip() else "?"
+                print(f"  database login attempt {attempt} failed ({first_line}); "
+                      f"retrying in {wait:.0f}s ({remaining:.0f}s left)", flush=True)
+                _time.sleep(wait)
+
+    _connect_with_retry._retry_wrapped = True
+    _pg.connect = _connect_with_retry
