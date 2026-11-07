@@ -207,6 +207,12 @@ def ensure_tables(conn):
                          alerted_at timestamptz, approved_at timestamptz)""")
         cur.execute("alter table morbius_skiptrace_queue enable row level security")
         cur.execute("revoke all on morbius_skiptrace_queue from anon, authenticated")
+        cur.execute("""create table if not exists morbius_worked (ghl_contact_id text primary key,
+                         first_seen timestamptz default now())""")
+        cur.execute("""create table if not exists morbius_state (key text primary key, value bigint not null default 0)""")
+        cur.execute("alter table morbius_worked enable row level security")
+        cur.execute("alter table morbius_state enable row level security")
+        cur.execute("revoke all on morbius_worked, morbius_state from anon, authenticated")
     conn.commit()
 
 
@@ -623,15 +629,31 @@ def main():
     # untraced leads wait PURPLE. Exception -> URGENT (she gets a chat + phone alert asking to
     # approve): Confidence 95+, on 3+ lists, or a hard deadline (foreclosure auction / tax-sale
     # redemption) within 60 days. Nothing is ever traced without her approval.
-    worked = 0
+    # Every lead she has ever called/updated is remembered (deleting it later doesn't undo the count).
+    now_worked = []
     for lid, m in mapped.items():
         if m.get("ghl_contact_id") and not m.get("deleted_at"):
             try:
-                worked += bool(protected(api, m["ghl_contact_id"]))
+                if protected(api, m["ghl_contact_id"]):
+                    now_worked.append(m["ghl_contact_id"])
             except Exception:
                 pass
+    with conn.cursor() as cur:
+        if a.live:
+            for cid_ in now_worked:
+                cur.execute("insert into morbius_worked (ghl_contact_id) values (%s) on conflict do nothing", (cid_,))
+            conn.commit()
+        cur.execute("select count(*) from morbius_worked")
+        worked = max(cur.fetchone()[0], len(now_worked))
+        cur.execute("select value from morbius_state where key='released'")
+        r_ = cur.fetchone()
+        released = r_[0] if r_ else 0
+        cur.execute("select lead_id from morbius_skiptrace_queue where status in ('ready','approved')")
+        already_ready = {x[0] for x in cur.fetchall()}
     c["called_or_updated"] = worked
-    gate_open = worked >= 50
+    # Tala's rule: every 50 leads called/updated releases the 100 hottest untraced leads.
+    earned = (worked // 50) * 100
+    to_release = max(0, earned - released)
     queue = []
     for lead in rows:
         if lead.get("lead_status") or lead.get("skiptrace_status") in ("traced",) or not_worked(lead):
@@ -650,6 +672,7 @@ def main():
         if lc >= 3:
             why.append(f"on {lc} lists")
         d = row_dict(lead, today)
+        soon = None
         for label, val in (("foreclosure auction", d.get("Foreclosure Auction Date")),
                            ("tax-sale redemption deadline", (raw.get("redemption_period") or {}).get("redemption_deadline"))):
             try:
@@ -658,13 +681,30 @@ def main():
                 dd = None
             if dd and today <= dd <= today + timedelta(days=60):
                 why.append(f"{label} {dd:%m/%d/%Y}")
-        status = "urgent" if why else ("ready" if gate_open else "purple")
-        queue.append((str(lead["id"]), status, "; ".join(why) or None, conf, lc, days))
+                soon = min(soon or dd, dd)
+        lid = str(lead["id"])
+        status = "urgent" if why else ("ready" if lid in already_ready else "purple")
+        # hottest first: urgent, then the nearest deadline, Confidence, lists, days on list
+        rank = (0 if why else 1, (soon - today).days if soon else 999, -conf, -lc, -days)
+        queue.append([lid, status, "; ".join(why) or None, conf, lc, days, rank])
+    queue.sort(key=lambda q: q[6])
+    for q in queue:
+        if to_release <= 0:
+            break
+        if q[1] == "purple":
+            q[1] = "ready"
+            to_release -= 1
+            released += 1
+    queue = [tuple(q[:6]) for q in queue]
+    c["released_total"] = released
+    c["next_batch_at"] = (worked // 50 + 1) * 50
     c["skiptrace_urgent"] = sum(1 for q in queue if q[1] == "urgent")
     c["skiptrace_purple"] = sum(1 for q in queue if q[1] == "purple")
     c["skiptrace_ready"] = sum(1 for q in queue if q[1] == "ready")
     if a.live:
         with conn.cursor() as cur:
+            cur.execute("""insert into morbius_state (key, value) values ('released', %s)
+                           on conflict (key) do update set value = excluded.value""", (released,))
             ids = [q[0] for q in queue]
             cur.execute("delete from morbius_skiptrace_queue where not (lead_id = any(%s))", (ids,))
             for q in queue:
