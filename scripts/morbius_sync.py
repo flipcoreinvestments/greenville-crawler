@@ -465,11 +465,21 @@ def her_edits(contact, written, fields=None):
     return out
 
 
+FIRST_STAGE_ID = None  # the Sellers pipeline's first stage, set in main()
+
+
 def protected(api, cid):
-    """Worked lead: a pipeline card past the first stage / not open, or any note."""
+    """Worked lead: a pipeline card moved off the first stage (e.g. to "Contacted"),
+    closed/won/lost, or any note on the contact. GHL's search returns the stage as an
+    id (pipelineStageId), so compare ids; fall back to the stage name if one is given."""
     for o in api.opportunities(cid):
+        if (o.get("status") or "open") != "open":
+            return True
+        sid = o.get("pipelineStageId")
+        if sid and FIRST_STAGE_ID and sid != FIRST_STAGE_ID:
+            return True
         stage = (o.get("pipelineStageName") or o.get("stageName") or "").strip().lower()
-        if (o.get("status") or "open") != "open" or (stage and stage != FIRST_STAGE.lower()):
+        if not sid and stage and stage != FIRST_STAGE.lower():
             return True
     return api.has_notes(cid)
 
@@ -498,6 +508,8 @@ def main():
         print(f"Missing custom fields in GHL: {', '.join(missing)} -- run Morbius setup first.")
         sys.exit(1)
     pipeline_id, stage_id = api.sellers_stage()
+    global FIRST_STAGE_ID
+    FIRST_STAGE_ID = stage_id
     print(f"Sellers pipeline found: {bool(pipeline_id)}; first stage found: {bool(stage_id)}")
 
     today = date.today()
