@@ -200,6 +200,7 @@ def ensure_tables(conn):
         cur.execute("alter table morbius_contacts enable row level security")
         cur.execute("alter table morbius_runs enable row level security")
         cur.execute("alter table leads add column if not exists story text")
+        cur.execute("alter table morbius_contacts add column if not exists deleted_tags text[]")
     conn.commit()
 
 
@@ -324,7 +325,7 @@ def years_owned(d):
     return None
 
 
-def build(lead, d, phones, fields, readded=False):
+def build(lead, d, phones, fields, readded=False, readd_reason=""):
     tags_src = set(lead.get("source_tags") or [])
     owner = owner_trace_names(lead.get("owner_name"))
     probate = bool(tags_src & PROBATE_TAGS)
@@ -359,7 +360,7 @@ def build(lead, d, phones, fields, readded=False):
     cf = {
         "crawler id": str(lead["id"]),
         "confidence": conf,
-        "their story": f"Confidence {conf}%: {why}.\n\n{story}",
+        "their story": (f"{readd_reason}\n\n" if readd_reason else "") + f"Confidence {conf}%: {why}.\n\n{story}",
         "skip trace info": "\n".join(info),
         "mailing address": d.get("Mailing Address") or "",
         "county": f"{lead.get('county') or 'Greenville'} County, SC",
@@ -503,8 +504,19 @@ def main():
             continue
         phones = [p for p in good_phones(lead) if ok.get(p)]
         m = mapped.get(lid)
-        if m and m.get("deleted_at") and (m.get("delete_reason") or "").startswith("tagged delete"):
-            continue  # Tala tagged it "delete": it stays gone
+        readd_reason = ""
+        if m and m.get("deleted_at"):
+            src = set(lead.get("source_tags") or [])
+            if (m.get("delete_reason") or "").startswith("tagged delete"):
+                # Tala tagged it "delete": it stays gone unless it lands on a NEW list
+                new_lists = sorted(src - set(m.get("deleted_tags") or []))
+                if not new_lists:
+                    continue
+                readd_reason = (f"Re-added: now also on {', '.join(t.replace('_', ' ') for t in new_lists)} "
+                                f"(you deleted it {m['deleted_at']:%m/%d/%Y}).")
+            else:
+                readd_reason = (f"Re-added: back on {', '.join(t.replace('_', ' ') for t in sorted(src))} "
+                                f"(removed {m['deleted_at']:%m/%d/%Y} as a dead lead).")
         live_map = m and m.get("ghl_contact_id") and not m.get("deleted_at")
         if not phones:
             c["skipped_no_clean_phone"] += 1
@@ -512,7 +524,7 @@ def main():
         try:
             d = row_dict(lead, today)
             readded = bool(m and m.get("deleted_at"))
-            body, tags, _ = build(lead, d, phones, fields, readded)
+            body, tags, _ = build(lead, d, phones, fields, readded, readd_reason)
             if needs_retrace(lead):
                 if live_map:
                     api.add_tags(m["ghl_contact_id"], ["retrace"])
@@ -571,7 +583,7 @@ def main():
                                        values (%s,%s,%s,%s,now(),%s)
                                        on conflict (lead_id) do update set ghl_contact_id=excluded.ghl_contact_id,
                                          opportunity_id=coalesce(excluded.opportunity_id, morbius_contacts.opportunity_id),
-                                         written=excluded.written, updated_at=now(), deleted_at=null,
+                                         written=excluded.written, updated_at=now(), deleted_at=null, delete_reason=null,
                                          readded_count=morbius_contacts.readded_count + %s""",
                                     (lid, cid, opp, json.dumps(written), 1 if readded else 0, 1 if readded else 0))
             if a.live:
@@ -619,8 +631,9 @@ def main():
                 if a.live:
                     with conn.cursor() as cur:
                         if lid:
-                            cur.execute("""update morbius_contacts set deleted_at=now(), delete_reason=%s, backup=%s
-                                           where lead_id=%s""", (why, json.dumps(contact), lid))
+                            src = list((by_id.get(lid) or {}).get("source_tags") or [])
+                            cur.execute("""update morbius_contacts set deleted_at=now(), delete_reason=%s, backup=%s,
+                                           deleted_tags=%s where lead_id=%s""", (why, json.dumps(contact), src, lid))
                         else:
                             cur.execute("""insert into morbius_contacts (lead_id, ghl_contact_id, deleted_at,
                                              delete_reason, backup)
