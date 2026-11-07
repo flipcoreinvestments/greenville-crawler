@@ -59,6 +59,14 @@ PIPELINE_NAME = "Sellers"
 FIRST_STAGE = "New"
 DELETE_BRAKE = 25
 PROBATE_TAGS = {"probate", "pre_probate"}
+# Tala doesn't work mobile/manufactured homes (2026-11-07). They stay in the
+# master list (sellable inventory) but never go into her calling GHL.
+import re as _re
+NOT_WORKED = _re.compile(r"\bMH\b|mobile|manufactur", _re.I)
+
+
+def not_worked(lead):
+    return bool(NOT_WORKED.search(lead.get("land_use") or ""))
 # fields Morbius writes (her edits to these always win)
 TRACKED = ["firstName", "lastName", "phone", "address1", "city", "state", "postalCode"]
 
@@ -391,7 +399,7 @@ def main():
     # ---------- GREEN / YELLOW / ORANGE
     for lead in rows:
         lid = str(lead["id"])
-        if lead.get("lead_status") or lead.get("skiptrace_status") != "traced":
+        if lead.get("lead_status") or lead.get("skiptrace_status") != "traced" or not_worked(lead):
             continue
         phones = [p for p in good_phones(lead) if ok.get(p)]
         m = mapped.get(lid)
@@ -470,6 +478,8 @@ def main():
         lead = by_id.get(lid)
         if lead is None or lead.get("lead_status") == "dead":
             dead.append((lid, m["ghl_contact_id"], "dead lead: no longer on any list / resolved / sold"))
+        elif not_worked(lead):
+            dead.append((lid, m["ghl_contact_id"], "mobile/manufactured home: not worked (kept in master list)"))
     tagged, status = api.tagged_delete()
     if status != 200:
         print(f"Could not search for 'delete' tags (HTTP {status}); dead-lead deletes still checked.")
