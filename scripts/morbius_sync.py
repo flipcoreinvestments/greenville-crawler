@@ -496,6 +496,12 @@ def main():
              deleted_tagged=0, protected_kept=0, skipped_no_clean_phone=0, readded=0, errors=0)
     new_budget = a.limit if a.limit >= 0 else 10 ** 9
     edit_keys = {}
+    # one owner, several properties -> one GHL contact: the first lead linked owns the card,
+    # the others are listed under "Other Properties Owned" instead of overwriting it
+    shared = {}
+    for lid_, m_ in sorted(mapped.items(), key=lambda x: (x[1].get("created_at") is None, str(x[1].get("created_at")))):
+        if m_.get("ghl_contact_id") and not m_.get("deleted_at"):
+            shared.setdefault(m_["ghl_contact_id"], []).append(lid_)
 
     # ---------- GREEN / YELLOW / ORANGE
     for lead in rows:
@@ -537,6 +543,14 @@ def main():
                     written["cf:" + id_to_name[f["id"]]] = f["field_value"]
             if live_map:
                 cid = m["ghl_contact_id"]
+                owners = shared.get(cid, [lid])
+                if owners[0] != lid:
+                    continue  # second property of the same owner: shown on the first lead's card
+                others = [by_id[x] for x in owners[1:] if x in by_id]
+                if others and "other properties owned" in fields:
+                    body["customFields"] = [f for f in body["customFields"] if f["id"] != fields["other properties owned"]]
+                    body["customFields"].append({"id": fields["other properties owned"], "field_value": "\n".join(
+                        f"{o.get('address') or ''} (crawler: {', '.join(o.get('source_tags') or [])})" for o in others)})
                 contact = api.get_contact(cid)
                 if contact is None:
                     continue  # she deleted it herself; it stays deleted
