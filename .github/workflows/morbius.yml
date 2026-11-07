@@ -1,0 +1,45 @@
+name: Morbius GHL sync
+
+# 2026-11-07: Morbius keeps Tala's Unstuck Homes GHL in step with the master
+# lead list (new / update / retrace / delete). Run by hand for now:
+#   live = false -> practice run, nothing written to GHL
+#   limit        -> max NEW contacts this run (10 for the first test)
+# The nightly schedule is added only after Tala approves the 10-lead test.
+# Logs show counts only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      live:
+        description: "Write to GHL? (false = practice run)"
+        type: boolean
+        default: false
+      limit:
+        description: "Max new contacts this run (0 = no limit)"
+        type: string
+        default: "10"
+
+concurrency:
+  group: morbius
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install requests==2.32.3 psycopg2-binary==2.9.9 openpyxl==3.1.5
+      - name: Morbius sync
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GHL_MORBIUS_TOKEN: ${{ secrets.GHL_MORBIUS_TOKEN }}
+          GHL_LOCATION_ID: ${{ secrets.GHL_LOCATION_ID }}
+        run: |
+          cd scripts
+          if [ "${{ inputs.live }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
+          python morbius_sync.py $LIVE --limit "${{ inputs.limit }}"
