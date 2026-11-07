@@ -1,13 +1,15 @@
 name: Morbius GHL sync
 
 # 2026-11-07: Morbius keeps Tala's Unstuck Homes GHL in step with the master
-# lead list (new / update / retrace / delete). Run by hand for now:
+# lead list (new / update / retrace / delete). Run by hand:
 #   live = false -> practice run, nothing written to GHL
 #   limit        -> max NEW contacts this run (0 = update only, -1 = no limit)
-# The nightly schedule is added only after Tala approves the 10-lead test.
-# Logs show counts only.
+# Every morning at 7:47am ET (after the 5am crawler and Morbius's 7:13am
+# stories) it runs LIVE with no limit on new leads. Logs show counts only.
 
 on:
+  schedule:
+    - cron: "47 12 * * *"
   workflow_dispatch:
     inputs:
       live:
@@ -41,5 +43,6 @@ jobs:
           GHL_LOCATION_ID: ${{ secrets.GHL_LOCATION_ID }}
         run: |
           cd scripts
-          if [ "${{ inputs.live }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
-          python morbius_sync.py $LIVE --limit "${{ inputs.limit }}"
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.live }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
+          LIMIT="${{ inputs.limit }}"; [ -z "$LIMIT" ] && LIMIT="-1"
+          python morbius_sync.py $LIVE --limit "$LIMIT"

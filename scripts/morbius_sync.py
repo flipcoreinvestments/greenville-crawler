@@ -409,20 +409,38 @@ def build(lead, d, phones, fields, readded=False):
 
 
 def _norm(k, v):
-    v = str(v or "").strip()
-    if k == "phone":
+    if isinstance(v, list):
+        v = ", ".join(str(x) for x in v)
+    v = str(v if v is not None else "").strip()
+    if k == "phone" or k.startswith("phone "):
         return "".join(ch for ch in v if ch.isdigit())[-10:]
+    try:
+        f = float(v.replace(",", "").replace("$", ""))
+        return str(int(f)) if f == int(f) else str(f)
+    except ValueError:
+        pass
     return " ".join(v.lower().split())
 
 
-def her_edits(contact, written):
-    """Tracked fields whose GHL value no longer matches what Morbius last wrote.
-    GHL reformats values (phone -> +1XXXXXXXXXX, name/address casing), so
-    values are compared normalized; only a real change counts as her edit."""
+def her_edits(contact, written, fields=None):
+    """Fields whose GHL value no longer matches what Morbius last wrote = Tala's edits.
+    Covers the standard fields (TRACKED) and every custom field Morbius writes
+    (stored in `written` as "cf:<field name>"). GHL reformats values (phone ->
+    +1XXXXXXXXXX, casing, 95 -> 95.0), so values are compared normalized; only a
+    real change counts as her edit."""
     out = set()
     for k in TRACKED:
         if k in written and _norm(k, contact.get(k)) != _norm(k, written.get(k)):
             out.add(k)
+    if fields:
+        have = {f.get("id"): f.get("value", f.get("field_value")) for f in (contact.get("customFields") or [])}
+        for k, v in written.items():
+            if not k.startswith("cf:"):
+                continue
+            name = k[3:]
+            fid = fields.get(name)
+            if fid and _norm(name, have.get(fid)) != _norm(name, v):
+                out.add(k)
     return out
 
 
@@ -477,6 +495,8 @@ def main():
             continue
         phones = [p for p in good_phones(lead) if ok.get(p)]
         m = mapped.get(lid)
+        if m and m.get("deleted_at") and (m.get("delete_reason") or "").startswith("tagged delete"):
+            continue  # Tala tagged it "delete": it stays gone
         live_map = m and m.get("ghl_contact_id") and not m.get("deleted_at")
         if not phones:
             c["skipped_no_clean_phone"] += 1
@@ -491,20 +511,27 @@ def main():
                     c["retrace"] += 1
                 continue
             written = {k: body.get(k) for k in TRACKED}
+            id_to_name = {v: k for k, v in fields.items()}
+            for f in body["customFields"]:
+                if f["id"] in id_to_name:
+                    written["cf:" + id_to_name[f["id"]]] = f["field_value"]
             if live_map:
                 cid = m["ghl_contact_id"]
                 contact = api.get_contact(cid)
                 if contact is None:
                     continue  # she deleted it herself; it stays deleted
-                edits = her_edits(contact, m.get("written") or {})
+                edits = her_edits(contact, m.get("written") or {}, fields)
                 upd = {k: v for k, v in body.items() if k not in edits and k != "source"}
+                upd["customFields"] = [f for f in body["customFields"]
+                                       if "cf:" + id_to_name.get(f["id"], "") not in edits]
                 c["kept_her_edit"] += len(edits)
                 api.update_contact(cid, upd)
                 api.add_tags(cid, tags)
                 stale = {"warm", "hot", "very hot", "verified 95+"} - set(tags)
                 api.remove_tags(cid, stale)
+                have = {f.get("id"): f.get("value", f.get("field_value")) for f in (contact.get("customFields") or [])}
                 for k in edits:
-                    written[k] = contact.get(k)
+                    written[k] = have.get(fields.get(k[3:])) if k.startswith("cf:") else contact.get(k)
                 c["updated"] += 1
                 if a.live:
                     with conn.cursor() as cur:
