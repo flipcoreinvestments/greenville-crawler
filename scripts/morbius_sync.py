@@ -253,9 +253,36 @@ def _fresh(raw, source, days=7):
     return False
 
 
+def past_deadline(raw, today=None):
+    """2026-11-08 (Tala's rule): a lead whose Master-in-Equity foreclosure sale
+    date or tax-sale redemption deadline has already PASSED may already be sold.
+    Until a source shows it again (the weekly MIE ingest re-tags it with a new
+    future sale date, or the redemption record is refreshed), we can't be sure
+    the owner still owns it -- so it can never be 'full confidence' or urgent.
+    Returns a plain-English reason, or None."""
+    today = today or datetime.now(timezone.utc).date()
+    checks = (("Master-in-Equity sale date", (raw.get("foreclosure_mie") or {}).get("sale_date")),
+              ("tax-sale redemption deadline", (raw.get("redemption_period") or {}).get("redemption_deadline")))
+    for label, val in checks:
+        if not val:
+            continue
+        v = str(val).strip()
+        dd = None
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                dd = datetime.strptime(v[:10], fmt).date()
+                break
+            except ValueError:
+                pass
+        if dd and dd < today:
+            return f"{label} {dd:%m/%d/%Y} already passed -- may be sold, verify before calling or tracing"
+    return None
+
+
 def confidence(lead, raw):
     """0-100: how sure we are this owner is really in this situation right now.
-    95+ needs 2+ independent live sources, a clean identity and fresh data."""
+    95+ needs 2+ independent live sources, a clean identity and fresh data.
+    A passed foreclosure-sale / redemption deadline caps it at 50 (see past_deadline)."""
     srcs = []
     for t in lead.get("source_tags") or []:
         s = SOURCE_OF.get(t)
@@ -285,6 +312,10 @@ def confidence(lead, raw):
     score = max(0, min(100, score))
     bits = [f"{s} (checked this week)" if s in fresh else s for s in srcs]
     why = " + ".join(bits) + ("; owner identity clean" if id_ok else "; owner identity uncertain")
+    gone = past_deadline(raw)
+    if gone:
+        score = min(score, 50)
+        why += "; " + gone
     return score, why
 
 # ------------------------------------------------------------------ building a contact
@@ -696,6 +727,12 @@ def main():
         days = days_on_list(lead)
         lc = lead.get("list_count") or 0
         why = []
+        if past_deadline(raw, today):
+            # may already be sold: hold it (purple), never urgent, until a source confirms it's still live
+            lid = str(lead["id"])
+            queue.append([lid, "ready" if lid in already_ready else "purple", None, conf, lc, days,
+                          (2, 999, -conf, -lc, -days)])  # 2 = never auto-released in a batch
+            continue
         if conf >= 95:
             why.append(f"Confidence {conf}%")
         if lc >= 3:
@@ -720,7 +757,7 @@ def main():
     for q in queue:
         if to_release <= 0:
             break
-        if q[1] == "purple":
+        if q[1] == "purple" and q[6][0] != 2:
             q[1] = "ready"
             to_release -= 1
             released += 1
