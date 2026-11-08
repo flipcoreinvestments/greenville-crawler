@@ -8,8 +8,11 @@ name: Robin Hood daily pull
 
 on:
   schedule:
-    # 10:20 UTC = 5:20 AM Eastern in winter (6:20 AM in summer)
-    - cron: "20 10 * * *"
+    # 05:05 UTC = 12:05 AM Eastern in winter (1:05 AM in summer). GitHub starts
+    # this repo's scheduled runs 5-7 hours late, so start just after midnight
+    # Eastern: the run lands before the 6:41 AM report on most days, and the
+    # report starts the pull itself if it hasn't landed yet.
+    - cron: "5 5 * * *"
   workflow_dispatch:
 
 concurrency:
