@@ -2,13 +2,16 @@ name: Bankruptcy ingest
 
 # 2026-11-07: weekly search of PACER (official Case Locator API) for new
 # Chapter 7 / 13 filings in the SC Bankruptcy Court, matched to crawler leads
-# by first name + middle initial + last name. Runs Mondays 6:31am ET, before
+# by first name + middle initial + last name. Runs late Sunday night ET, before
 # Morbius's 7:47am sync. Capped at 12 billed pages (~$1.20) per run.
 #   check = true -> only logs in and out (free) to prove the secrets work.
 
 on:
   schedule:
-    - cron: "31 11 * * 1"
+    # 04:41 UTC Monday = 11:41 PM Sunday Eastern (moved 2026-11-08 from
+    # 11:31 UTC: GitHub starts scheduled runs 5-7 hours late, and this has to
+    # land before the Monday Morbius sync).
+    - cron: "41 4 * * 1"
   workflow_dispatch:
     inputs:
       check:

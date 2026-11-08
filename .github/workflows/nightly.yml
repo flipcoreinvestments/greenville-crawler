@@ -9,8 +9,12 @@ name: Nightly Greenville lead ingest
 
 on:
   schedule:
-    # 10:00 UTC ≈ 6:00 AM Eastern (5:00 AM during EST). Runs every night.
-    - cron: "0 10 * * *"
+    # 05:11 UTC = 12:11 AM Eastern in winter (1:11 AM in summer). Moved
+    # 2026-11-08 from 10:00 UTC: GitHub starts this repo's scheduled runs
+    # 5-7 hours late, so the 5 AM run was finishing around 12:30 PM. Starting
+    # just after midnight Eastern gets leads in before the morning on most
+    # days. When it finishes, the Morbius GHL sync starts automatically.
+    - cron: "11 5 * * *"
   workflow_dispatch:
     inputs:
       max_rows:

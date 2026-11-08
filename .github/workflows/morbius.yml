@@ -7,7 +7,14 @@ name: Morbius GHL sync
 # Every morning at 7:47am ET (after the 5am crawler and Morbius's 7:13am
 # stories) it runs LIVE with no limit on new leads. Logs show counts only.
 
+# 2026-11-08: GitHub starts this repo's scheduled runs 5-7 hours late, so the
+# sync now starts the moment the nightly crawler finishes (workflow_run). The
+# 7:47am schedule stays only as a backup in case the crawler doesn't run.
+# Morbius's 8:19am task also starts this sync itself if it hasn't run today.
 on:
+  workflow_run:
+    workflows: ["Nightly Greenville lead ingest"]
+    types: [completed]
   schedule:
     - cron: "47 12 * * *"
   workflow_dispatch:
@@ -43,6 +50,6 @@ jobs:
           GHL_LOCATION_ID: ${{ secrets.GHL_LOCATION_ID }}
         run: |
           cd scripts
-          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.live }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_run" ] || [ "${{ inputs.live }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
           LIMIT="${{ inputs.limit }}"; [ -z "$LIMIT" ] && LIMIT="-1"
           python morbius_sync.py $LIVE --limit "$LIMIT"
