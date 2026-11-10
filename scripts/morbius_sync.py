@@ -418,6 +418,9 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
         "next deadline": nxt,
         "heirs": heirs or "",
         "name 2": " ".join(x for x in (owner.get("first2"), owner.get("last2")) if x),
+        # 2026-11-10 (Tala): county parcel number + BatchData backup email on every card
+        "apn": (lead.get("pin") or "").strip(),
+        "email 2": (lead.get("email_2") or "").strip(),
     }
     for i, p in enumerate(phones[1:5], start=2):
         cf[f"phone {i}"] = p
@@ -496,6 +499,21 @@ def her_edits(contact, written, fields=None):
     return out
 
 
+def fill_email(api, cid, lead, contact, c):
+    """2026-11-10 (Tala): put the BatchData email (best/tested first) on the card, but only when
+    the GHL email box is empty, so her own typed email is never overwritten. Sent as its own
+    update: if GHL refuses it (same email already on another contact) the lead still syncs."""
+    em = (lead.get("email") or "").strip()
+    if not em or (contact or {}).get("email"):
+        return
+    try:
+        api.update_contact(cid, {"email": em})
+        c["emails_added"] += 1
+    except Exception as e:
+        c["email_skipped"] += 1
+        print(f"  email not added ({type(e).__name__}): {str(e)[:80]}")
+
+
 FIRST_STAGE_ID = None  # the Sellers pipeline's first stage, set in main()
 
 
@@ -565,7 +583,8 @@ def main():
     ok = clean_phones(conn)
     mapped = load_map(conn)
     c = dict(new=0, linked_existing=0, updated=0, kept_her_edit=0, retrace=0, deleted_dead=0,
-             deleted_tagged=0, protected_kept=0, skipped_no_clean_phone=0, readded=0, errors=0)
+             deleted_tagged=0, protected_kept=0, skipped_no_clean_phone=0, readded=0, errors=0,
+             emails_added=0, email_skipped=0)
     new_budget = a.limit if a.limit >= 0 else 10 ** 9
     edit_keys = {}
     # one owner, several properties -> one GHL contact: the first lead linked owns the card,
@@ -636,6 +655,8 @@ def main():
                 for k in edits:
                     edit_keys[k] = edit_keys.get(k, 0) + 1
                 api.update_contact(cid, upd)
+                if live_map:
+                    fill_email(api, cid, lead, contact, c)
                 api.add_tags(cid, tags)
                 stale = {"warm", "hot", "very hot", "verified 95+"} - set(tags)
                 api.remove_tags(cid, stale)
@@ -664,6 +685,8 @@ def main():
                 if readded:
                     c["readded"] += 1
                 opp = None
+                if not existed and a.live:
+                    fill_email(api, cid, lead, {}, c)
                 if not existed:
                     opp = api.create_opportunity(cid, f"{body['name']} - {body['address1']}", pipeline_id, stage_id)
                 if a.live:
