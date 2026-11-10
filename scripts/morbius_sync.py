@@ -28,6 +28,14 @@ Rules (Tala, 2026-11-07):
     and says so.
   - a backup of every deleted contact is kept in morbius_contacts.backup.
 
+Lead-flow safeguards (Tala, 2026-11-10; details in morbius_flow.py):
+  - every 50 leads called/updated releases the next 50 hottest leads for skip tracing.
+  - 100+ leads behind on follow-up -> no new non-urgent leads are released or added to GHL.
+  - urgent = 3+ independent sources AND Confidence 100; urgent leads always get through.
+  - 6+ no-answers and never reached -> tag "delete in 5 days"; removed 5 days later unless
+    she takes the tag off. Do Not Call contacts are never tagged or removed.
+  - First/Last Name = the deed owner exactly (middle names, Jr/Sr kept; trusts keep their name).
+
 Logs print COUNTS ONLY (the repo and its logs are public). No names, phones or
 addresses are ever printed.
 
@@ -49,7 +57,9 @@ import requests
 
 from export_call_lists import OPEN_ERRORS, clean_phones, lead_rows, load_tax_sale_info, needs_retrace, open_errors, to_csv
 from ghl_sync import good_phones
-from skiptrace_prep import compute_skiptrace_identity, owner_trace_names, probate_heirs
+from skiptrace_prep import compute_skiptrace_identity, probate_heirs
+import morbius_flow as flow
+from morbius_flow import deed_name
 
 BASE = "https://services.leadconnectorhq.com"
 TOKEN = os.environ.get("GHL_MORBIUS_TOKEN", "").strip()
@@ -98,15 +108,18 @@ class GHL:
         return {f["name"].strip().lower(): f["id"] for f in r.json().get("customFields", [])}
 
     def sellers_stage(self):
+        """-> (pipeline id, first stage id, ids of the 'offer' stage and every stage after it)."""
         r = self._req("GET", "/opportunities/pipelines", params={"locationId": LOC})
         r.raise_for_status()
         for p in r.json().get("pipelines", []):
             if p.get("name", "").strip().lower() == PIPELINE_NAME.lower():
-                stages = p.get("stages") or []
+                stages = sorted(p.get("stages") or [], key=lambda s: s.get("position") or 0)
                 first = next((s for s in stages if s.get("name", "").strip().lower() == FIRST_STAGE.lower()),
                              stages[0] if stages else None)
-                return p["id"], (first or {}).get("id")
-        return None, None
+                at = next((i for i, s in enumerate(stages) if "offer" in (s.get("name") or "").lower()), None)
+                offer_ids = {s.get("id") for s in stages[at:]} if at is not None else set()
+                return p["id"], (first or {}).get("id"), offer_ids
+        return None, None, set()
 
     def get_contact(self, cid):
         r = self._req("GET", f"/contacts/{cid}")
@@ -144,8 +157,50 @@ class GHL:
             self._req("DELETE", f"/contacts/{cid}/tags", write=True, json={"tags": sorted(set(tags))})
 
     def has_notes(self, cid):
+        return bool(self.notes(cid))
+
+    def notes(self, cid):
         r = self._req("GET", f"/contacts/{cid}/notes")
-        return bool(r is not None and r.status_code == 200 and r.json().get("notes"))
+        if r is None or r.status_code != 200:
+            return []
+        return r.json().get("notes") or []
+
+    call_log_ok = None  # True once a call log was read, False if the token can't read conversations
+
+    def call_log(self, cid):
+        """Outbound/inbound calls GHL logged for this contact (dialer or GHL app calls).
+        Calls Tala makes from her own cell aren't here -- her "no answer" notes cover those.
+        -> list of {direction, status, duration, date}; [] if none or not readable."""
+        if self.call_log_ok is False:
+            return []
+        r = self._req("GET", "/conversations/search", params={"locationId": LOC, "contactId": cid})
+        if r is None or r.status_code in (401, 403):
+            self.call_log_ok = False
+            return []
+        if r.status_code != 200:
+            return []
+        out = []
+        for conv in (r.json().get("conversations") or [])[:3]:
+            m = self._req("GET", f"/conversations/{conv.get('id')}/messages",
+                          params={"type": "TYPE_CALL", "limit": 100})
+            if m is None or m.status_code in (401, 403):
+                self.call_log_ok = False
+                return []
+            if m.status_code != 200:
+                continue
+            body = m.json().get("messages") or {}
+            msgs = body.get("messages") if isinstance(body, dict) else body
+            for x in msgs or []:
+                mt = str(x.get("messageType") or "").upper()
+                if mt and "CALL" not in mt:
+                    continue  # asked for calls only; skip anything else GHL sends back
+                call = ((x.get("meta") or {}).get("call") or {})
+                out.append({"direction": x.get("direction") or "outbound",
+                            "status": call.get("status") or x.get("status") or "",
+                            "duration": call.get("duration") or 0,
+                            "date": x.get("dateAdded")})
+        self.call_log_ok = True
+        return out
 
     def opportunities(self, cid):
         r = self._req("GET", "/opportunities/search", params={"location_id": LOC, "contact_id": cid})
@@ -213,6 +268,12 @@ def ensure_tables(conn):
         cur.execute("alter table morbius_worked enable row level security")
         cur.execute("alter table morbius_state enable row level security")
         cur.execute("revoke all on morbius_worked, morbius_state from anon, authenticated")
+        # 2026-11-10: "delete in 5 days" tags -- when each was added, and whether Tala kept the lead
+        cur.execute("""create table if not exists morbius_delete_watch (ghl_contact_id text primary key,
+                         tagged_at timestamptz not null default now(), kept_at timestamptz,
+                         deleted_at timestamptz)""")
+        cur.execute("alter table morbius_delete_watch enable row level security")
+        cur.execute("revoke all on morbius_delete_watch from anon, authenticated")
     conn.commit()
 
 
@@ -277,6 +338,18 @@ def past_deadline(raw, today=None):
         if dd and dd < today:
             return f"{label} {dd:%m/%d/%Y} already passed -- may be sold, verify before calling or tracing"
     return None
+
+
+def n_sources(lead):
+    """How many independent offices / data sources show this lead's situation."""
+    return len({SOURCE_OF[t] for t in (lead.get("source_tags") or []) if t in SOURCE_OF})
+
+
+def urgent_lead(lead, raw, today=None):
+    """Tala's rule (2026-11-10): urgent = 3+ independent sources AND Confidence 100
+    (fresh data, clean identity) AND no passed sale/redemption deadline."""
+    conf, _ = confidence(lead, raw)
+    return flow.is_urgent(conf, n_sources(lead), past_deadline(raw, today))
 
 
 def confidence(lead, raw):
@@ -373,7 +446,6 @@ BANKRUPT = {}  # lead id -> (chapter, date_filed, case_number), filled in main()
 
 def build(lead, d, phones, fields, readded=False, readd_reason=""):
     tags_src = set(lead.get("source_tags") or [])
-    owner = owner_trace_names(lead.get("owner_name"))
     probate = bool(tags_src & PROBATE_TAGS)
     raw = lead.get("raw") or {}
     if isinstance(raw, str):
@@ -417,7 +489,7 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
         "days on list": days,
         "next deadline": nxt,
         "heirs": heirs or "",
-        "name 2": " ".join(x for x in (owner.get("first2"), owner.get("last2")) if x),
+        "name 2": flow.second_owner(lead.get("owner_name"), deed_name(lead.get("owner_name"))[1]),
         # 2026-11-10 (Tala): county parcel number + BatchData backup email on every card
         "apn": (lead.get("pin") or "").strip(),
         "email 2": (lead.get("email_2") or "").strip(),
@@ -445,8 +517,9 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
     if any(isinstance(v, dict) and v.get("mls_status") for k, v in raw.items() if k.startswith("propstream")):
         tags.append("listed on mls")
 
-    first = (owner.get("first") or "").title()
-    last = (owner.get("last") or "").title()
+    # 2026-11-10 (Tala): the owner exactly as on the deed -- middle names/initials and Jr/Sr kept,
+    # a trust/estate/entity keeps its full name in First Name
+    first, last = deed_name(lead.get("owner_name"))
     body = {
         "firstName": first, "lastName": last,
         "name": f"{first} {last}".strip(),
@@ -556,7 +629,7 @@ def main():
     if missing:
         print(f"Missing custom fields in GHL: {', '.join(missing)} -- run Morbius setup first.")
         sys.exit(1)
-    pipeline_id, stage_id = api.sellers_stage()
+    pipeline_id, stage_id, offer_ids = api.sellers_stage()
     global FIRST_STAGE_ID
     FIRST_STAGE_ID = stage_id
     print(f"Sellers pipeline found: {bool(pipeline_id)}; first stage found: {bool(stage_id)}")
@@ -587,6 +660,36 @@ def main():
              emails_added=0, email_skipped=0)
     new_budget = a.limit if a.limit >= 0 else 10 ** 9
     edit_keys = {}
+
+    # ---------- FOLLOW-UP CHECK (2026-11-10, Tala's lead-flow safeguards; see morbius_flow.py)
+    # For every crawler contact in GHL: has she worked it, is its next call overdue, how many
+    # no-answers, did she ever talk to them, is it Do Not Call. Read-only.
+    now = datetime.now(timezone.utc)
+    activity = {}  # ghl contact id -> summary
+    for lid, m in mapped.items():
+        cid = m.get("ghl_contact_id")
+        if not cid or m.get("deleted_at") or cid in activity:
+            continue
+        try:
+            contact = api.get_contact(cid)
+            if contact is None:
+                continue
+            s = flow.summarize(contact, api.opportunities(cid), api.notes(cid), api.call_log(cid),
+                               offer_ids, stage_id)
+            s["added_at"] = m.get("created_at")
+            s["tags"] = {t.strip().lower() for t in contact.get("tags") or []}
+            s["lead_id"] = lid
+            activity[cid] = s
+        except Exception as e:
+            print(f"  follow-up check skipped one contact: {type(e).__name__}")
+    behind = sum(1 for s in activity.values() if flow.is_behind(s, s["added_at"], now))
+    paused = behind >= flow.BACKLOG_LIMIT
+    c["behind_on_follow_up"] = behind
+    c["new_leads_paused"] = paused
+    c["call_log"] = {True: "read", False: "not readable (token scope)", None: "no contacts"}[api.call_log_ok]
+    c["held_for_backlog"] = 0
+    print(f"Follow-up: {behind} of {len(activity)} crawler contacts behind; "
+          f"{'NEW LEADS PAUSED' if paused else 'new leads flowing'} (pause at {flow.BACKLOG_LIMIT})")
     # one owner, several properties -> one GHL contact: the first lead linked owns the card,
     # the others are listed under "Other Properties Owned" instead of overwriting it
     shared = {}
@@ -672,6 +775,14 @@ def main():
             else:
                 if new_budget <= 0:
                     continue
+                if paused:
+                    raw_ = lead.get("raw") or {}
+                    if isinstance(raw_, str):
+                        raw_ = json.loads(raw_)
+                    if not urgent_lead(lead, raw_, today):
+                        # 100+ leads behind on follow-up: it waits (traced and ready) until she catches up
+                        c["held_for_backlog"] += 1
+                        continue
                 new_budget -= 1
                 cid, existed = api.create_contact(dict(body, tags=tags))
                 if existed:
@@ -713,14 +824,7 @@ def main():
     # approve): Confidence 95+, on 3+ lists, or a hard deadline (foreclosure auction / tax-sale
     # redemption) within 60 days. Nothing is ever traced without her approval.
     # Every lead she has ever called/updated is remembered (deleting it later doesn't undo the count).
-    now_worked = []
-    for lid, m in mapped.items():
-        if m.get("ghl_contact_id") and not m.get("deleted_at"):
-            try:
-                if protected(api, m["ghl_contact_id"]):
-                    now_worked.append(m["ghl_contact_id"])
-            except Exception:
-                pass
+    now_worked = [cid_ for cid_, s in activity.items() if s["worked"]]
     with conn.cursor() as cur:
         if a.live:
             for cid_ in now_worked:
@@ -734,9 +838,11 @@ def main():
         cur.execute("select lead_id from morbius_skiptrace_queue where status in ('ready','approved')")
         already_ready = {x[0] for x in cur.fetchall()}
     c["called_or_updated"] = worked
-    # Tala's rule: every 50 leads called/updated releases the 100 hottest untraced leads.
-    earned = (worked // 50) * 100
-    to_release = max(0, earned - released)
+    # Tala's rule (2026-11-10): every 50 leads called/updated releases the next 50 hottest untraced
+    # leads -- but nothing is released while 100+ leads are behind on follow-up (urgent ones still are).
+    # Releases she earns during a pause aren't lost; they go out once she's caught up.
+    earned = flow.earned_release(worked)
+    to_release = 0 if paused else max(0, earned - released)
     queue = []
     for lead in rows:
         if lead.get("lead_status") or lead.get("skiptrace_status") in ("traced",) or not_worked(lead):
@@ -750,15 +856,16 @@ def main():
         days = days_on_list(lead)
         lc = lead.get("list_count") or 0
         why = []
+        urgent = urgent_lead(lead, raw, today)
         if past_deadline(raw, today):
             # may already be sold: hold it (purple), never urgent, until a source confirms it's still live
             lid = str(lead["id"])
             queue.append([lid, "ready" if lid in already_ready else "purple", None, conf, lc, days,
                           (2, 999, -conf, -lc, -days)])  # 2 = never auto-released in a batch
             continue
-        if conf >= 95:
-            why.append(f"Confidence {conf}%")
-        if lc >= 3:
+        if urgent:
+            why.append(f"Confidence {conf}%, confirmed by {n_sources(lead)} sources")
+        if urgent and lc >= 3:
             why.append(f"on {lc} lists")
         d = row_dict(lead, today)
         soon = None
@@ -769,12 +876,13 @@ def main():
             except ValueError:
                 dd = None
             if dd and today <= dd <= today + timedelta(days=60):
-                why.append(f"{label} {dd:%m/%d/%Y}")
+                if urgent:
+                    why.append(f"{label} {dd:%m/%d/%Y}")
                 soon = min(soon or dd, dd)
         lid = str(lead["id"])
-        status = "urgent" if why else ("ready" if lid in already_ready else "purple")
+        status = "urgent" if urgent else ("ready" if lid in already_ready else "purple")
         # hottest first: urgent, then the nearest deadline, Confidence, lists, days on list
-        rank = (0 if why else 1, (soon - today).days if soon else 999, -conf, -lc, -days)
+        rank = (0 if urgent else 1, (soon - today).days if soon else 999, -conf, -lc, -days)
         queue.append([lid, status, "; ".join(why) or None, conf, lc, days, rank])
     queue.sort(key=lambda q: q[6])
     for q in queue:
@@ -786,7 +894,7 @@ def main():
             released += 1
     queue = [tuple(q[:6]) for q in queue]
     c["released_total"] = released
-    c["next_batch_at"] = (worked // 50 + 1) * 50
+    c["next_batch_at"] = (worked // flow.RELEASE_PER + 1) * flow.RELEASE_PER
     c["skiptrace_urgent"] = sum(1 for q in queue if q[1] == "urgent")
     c["skiptrace_purple"] = sum(1 for q in queue if q[1] == "purple")
     c["skiptrace_ready"] = sum(1 for q in queue if q[1] == "ready")
@@ -870,6 +978,72 @@ def main():
                                              delete_reason, backup)
                                            values (gen_random_uuid(), %s, now(), %s, %s)""",
                                         (cid, why, json.dumps(contact)))
+                    conn.commit()
+
+    # ---------- DEAD WEIGHT (2026-11-10): 6+ no-answers, never talked -> "delete in 5 days" tag,
+    # removed 5 days later unless Tala took the tag off. Do Not Call / talked-to / offer-stage
+    # contacts are never tagged or removed.
+    with conn.cursor() as cur:
+        cur.execute("select ghl_contact_id, tagged_at, kept_at, deleted_at from morbius_delete_watch")
+        watch = {r[0]: r for r in cur.fetchall()}
+    c.update(tagged_delete_5d=0, kept_by_tala=0, untagged_now_safe=0, deleted_no_answer=0, due_delete=0)
+    due = []
+
+    def keep(cid_, tag_on):
+        if tag_on:
+            api.remove_tags(cid_, [flow.DELETE_TAG])
+        if a.live:
+            with conn.cursor() as cur:
+                cur.execute("""insert into morbius_delete_watch (ghl_contact_id, kept_at) values (%s, now())
+                               on conflict (ghl_contact_id) do update set kept_at = now()""", (cid_,))
+            conn.commit()
+
+    for cid, s in activity.items():
+        w = watch.get(cid)
+        tag_on = flow.DELETE_TAG in s["tags"]
+        if w and (w[2] or w[3]):
+            continue  # she kept it, or it's already gone
+        if s["dnc"] or s["talked"] or s["past_offer"]:
+            if tag_on or w:
+                keep(cid, tag_on)  # never delete a Do Not Call / talked-to / offer-stage contact
+                c["untagged_now_safe"] += 1
+            continue
+        if w:
+            if not tag_on:
+                keep(cid, False)  # Tala took the tag off: keep this lead for good
+                c["kept_by_tala"] += 1
+            elif (now - flow.parse_dt(w[1])).total_seconds() >= flow.DELETE_AFTER_DAYS * 86400:
+                due.append(cid)
+            continue
+        if tag_on or flow.dead_weight(s):
+            if not tag_on:
+                api.add_tags(cid, [flow.DELETE_TAG])
+            c["tagged_delete_5d"] += 1
+            if a.live:
+                with conn.cursor() as cur:
+                    cur.execute("insert into morbius_delete_watch (ghl_contact_id) values (%s) on conflict do nothing",
+                                (cid,))
+                conn.commit()
+    c["due_delete"] = len(due)
+    if due and len(to_delete) + len(due) > DELETE_BRAKE:
+        print(f"SAFETY BRAKE: {len(to_delete) + len(due)} deletes planned (limit {DELETE_BRAKE}). "
+              "No 'delete in 5 days' contacts removed -- Tala approves first.")
+        c["brake_held"] = c.get("brake_held", 0) + len(due)
+    else:
+        for cid in due:
+            contact = api.get_contact(cid)
+            if contact is None or flow.DELETE_TAG not in {t.strip().lower() for t in contact.get("tags") or []}:
+                continue  # gone already, or she removed the tag a moment ago
+            if api.delete_contact(cid):
+                c["deleted_no_answer"] += 1
+                if a.live:
+                    with conn.cursor() as cur:
+                        # "tagged delete..." = it stays gone unless it lands on a NEW list
+                        cur.execute("""update morbius_contacts set deleted_at=now(), backup=%s,
+                                         delete_reason='tagged delete in 5 days: 6+ no answers, never reached',
+                                         deleted_tags=(select source_tags from leads where id=morbius_contacts.lead_id)
+                                       where ghl_contact_id=%s and deleted_at is null""", (json.dumps(contact), cid))
+                        cur.execute("update morbius_delete_watch set deleted_at=now() where ghl_contact_id=%s", (cid,))
                     conn.commit()
 
     c["api_calls"] = api.calls
