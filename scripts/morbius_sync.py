@@ -57,7 +57,7 @@ import requests
 
 from export_call_lists import OPEN_ERRORS, clean_phones, lead_rows, load_tax_sale_info, needs_retrace, open_errors, to_csv
 from ghl_sync import good_phones
-from skiptrace_prep import compute_skiptrace_identity, probate_heirs
+from skiptrace_prep import compute_skiptrace_identity, owner_trace_names, probate_heirs
 import morbius_flow as flow
 from morbius_flow import deed_name
 
@@ -442,10 +442,15 @@ def years_owned(d):
 
 
 BANKRUPT = {}  # lead id -> (chapter, date_filed, case_number), filled in main()
+# 2026-11-10: the new lead-flow changes that touch GHL (deed names, holding new leads during a
+# backlog, "delete in 5 days" tags and removals) run REPORT-ONLY until Tala approves them after
+# seeing the first report. Approval = morbius_state key 'flow_live' set to 1.
+FLOW_LIVE = False
 
 
 def build(lead, d, phones, fields, readded=False, readd_reason=""):
     tags_src = set(lead.get("source_tags") or [])
+    owner = owner_trace_names(lead.get("owner_name"))
     probate = bool(tags_src & PROBATE_TAGS)
     raw = lead.get("raw") or {}
     if isinstance(raw, str):
@@ -489,7 +494,8 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
         "days on list": days,
         "next deadline": nxt,
         "heirs": heirs or "",
-        "name 2": flow.second_owner(lead.get("owner_name"), deed_name(lead.get("owner_name"))[1]),
+        "name 2": (flow.second_owner(lead.get("owner_name"), deed_name(lead.get("owner_name"))[1]) if FLOW_LIVE
+                   else " ".join(x for x in (owner.get("first2"), owner.get("last2")) if x)),
         # 2026-11-10 (Tala): county parcel number + BatchData backup email on every card
         "apn": (lead.get("pin") or "").strip(),
         "email 2": (lead.get("email_2") or "").strip(),
@@ -519,7 +525,10 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
 
     # 2026-11-10 (Tala): the owner exactly as on the deed -- middle names/initials and Jr/Sr kept,
     # a trust/estate/entity keeps its full name in First Name
-    first, last = deed_name(lead.get("owner_name"))
+    if FLOW_LIVE:
+        first, last = deed_name(lead.get("owner_name"))
+    else:
+        first, last = (owner.get("first") or "").title(), (owner.get("last") or "").title()
     body = {
         "firstName": first, "lastName": last,
         "name": f"{first} {last}".strip(),
@@ -620,6 +629,12 @@ def main():
 
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
     ensure_tables(conn)
+    global FLOW_LIVE
+    with conn.cursor() as cur:
+        cur.execute("select value from morbius_state where key='flow_live'")
+        r_ = cur.fetchone()
+    FLOW_LIVE = bool(r_ and r_[0] == 1)
+    print("Lead-flow changes: " + ("LIVE" if FLOW_LIVE else "REPORT-ONLY (waiting for Tala's okay)"))
     OPEN_ERRORS.clear()
     OPEN_ERRORS.update(open_errors(conn))
     load_tax_sale_info(conn)
@@ -737,6 +752,9 @@ def main():
                     written["cf:" + id_to_name[f["id"]]] = f["field_value"]
             if live_map:
                 cid = m["ghl_contact_id"]
+                prev_ = m.get("written") or {}
+                if (prev_.get("firstName"), prev_.get("lastName")) != deed_name(lead.get("owner_name")):
+                    c["names_to_fix"] = c.get("names_to_fix", 0) + 1
                 owners = shared.get(cid, [lid])
                 if owners[0] != lid:
                     continue  # second property of the same owner: shown on the first lead's card
@@ -775,7 +793,9 @@ def main():
             else:
                 if new_budget <= 0:
                     continue
-                if paused:
+                if paused and not FLOW_LIVE:
+                    c["held_for_backlog"] += 1  # report-only: counted, still added
+                elif paused:
                     raw_ = lead.get("raw") or {}
                     if isinstance(raw_, str):
                         raw_ = json.loads(raw_)
@@ -998,7 +1018,11 @@ def main():
                                on conflict (ghl_contact_id) do update set kept_at = now()""", (cid_,))
             conn.commit()
 
-    for cid, s in activity.items():
+    if not FLOW_LIVE:
+        # report-only: what the first live run would tag (nothing is tagged or removed yet)
+        c["would_tag_delete_5d"] = sum(1 for s in activity.values()
+                                       if flow.dead_weight(s) and flow.DELETE_TAG not in s["tags"])
+    for cid, s in (activity.items() if FLOW_LIVE else []):
         w = watch.get(cid)
         tag_on = flow.DELETE_TAG in s["tags"]
         if w and (w[2] or w[3]):
