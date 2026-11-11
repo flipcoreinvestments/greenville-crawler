@@ -352,10 +352,92 @@ def urgent_lead(lead, raw, today=None):
     return flow.is_urgent(conf, n_sources(lead), past_deadline(raw, today))
 
 
+AUTO_MAX = 90  # 2026-11-11 (Tala): 100 means "verified by hand, nothing left to check"
+
+
+def _owner_tokens(name):
+    return set(_re.findall(r"[A-Z]+", (name or "").upper()))
+
+
+def _probate_is_owner(lead, raw):
+    """2026-11-11 (training): probate only counts when the person who died is ON
+    THE DEED. The court file's address can be a relative's house (the PR lives
+    there), which made one of the top-10 leads a false lead."""
+    p = raw.get("probate") or {}
+    dec = p.get("decedent_name") or ""
+    if not dec or "," not in dec:
+        return True  # can't tell; keep the old behaviour
+    last, rest = [x.strip() for x in dec.split(",", 1)]
+    first = (rest.split() or [""])[0]
+    own = _owner_tokens(lead.get("owner_name"))
+    return bool(last) and last.upper() in own and (not first or first.upper() in own)
+
+
+def _tax_paid(raw):
+    """Delinquent tax year paid after it hit the tax-sale list (tax_paid_check.py)."""
+    tp = raw.get("tax_paid") or {}
+    return tp if tp.get("paid_on") else None
+
+
+def _recent_full_price(raw, today=None):
+    ao = raw.get("absentee_owner") or {}
+    try:
+        price = float(ao.get("sale_price") or 0)
+        d = datetime.strptime(str(ao.get("deed_date") or "")[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    today = today or datetime.now(timezone.utc).date()
+    if price >= 50000 and (today - d).days <= 3 * 365:
+        return f"bought {d:%m/%d/%Y} for ${price:,.0f} (recent full-price purchase, little margin)"
+    return None
+
+
 def confidence(lead, raw):
     """0-100: how sure we are this owner is really in this situation right now.
-    95+ needs 2+ independent live sources, a clean identity and fresh data.
+    2026-11-11 rules from Tala's hand-check of the top 10:
+      - 100 only when verified by hand (raw.morbius_override); automatic max is 90
+      - taxes paid after the sale -> the tax signal no longer counts
+      - probate counts only if the person who died is on the deed
+      - PropStream alone (pre-foreclosure / deceased / liens) is unconfirmed: max 40
+      - an expired permit / insurance flag alone is not distress: max 20
+      - a full-price purchase in the last 3 years: max 30
     A passed foreclosure-sale / redemption deadline caps it at 50 (see past_deadline)."""
+    ov = raw.get("morbius_override") or {}
+    if ov.get("confidence") is not None:
+        return int(ov["confidence"]), "hand-checked by Tala + Morbius: " + (ov.get("note") or "verified")
+    score, why = _confidence_auto(lead, raw)
+    notes = []
+    tags = set(lead.get("source_tags") or [])
+    paid = _tax_paid(raw)
+    srcs = {SOURCE_OF[t] for t in tags if t in SOURCE_OF}
+    if paid and "county tax collector" in srcs:
+        notes.append(f"taxes for {paid.get('tax_year')} were paid {paid['paid_on']}, so the tax sale is likely redeemed")
+        srcs.discard("county tax collector")
+    if "probate court" in srcs and not _probate_is_owner(lead, raw):
+        notes.append("the probate is for someone NOT on the deed (likely a relative), so it doesn't count")
+        srcs.discard("probate court")
+    if not srcs:
+        score = min(score, 10)
+        notes.append("no live distress left")
+    elif srcs == {"PropStream"}:
+        score = min(score, 40)
+        notes.append("PropStream only, not confirmed by the county or court; check who filed any lis pendens")
+    elif srcs == {"city permits"}:
+        score = min(score, 20)
+        notes.append("an expired permit alone is not distress")
+    elif srcs <= {"city permits", "PropStream"}:
+        score = min(score, 40)
+    rf = _recent_full_price(raw)
+    if rf:
+        score = min(score, 30)
+        notes.append(rf)
+    score = min(score, AUTO_MAX)
+    if notes:
+        why += "; " + "; ".join(notes)
+    return score, why
+
+
+def _confidence_auto(lead, raw):
     srcs = []
     for t in lead.get("source_tags") or []:
         s = SOURCE_OF.get(t)
