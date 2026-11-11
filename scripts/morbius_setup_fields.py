@@ -42,6 +42,7 @@ FIELDS = [
     ("Heirs", "LARGE_TEXT", "Additional Info"),
     ("Other Properties Owned", "LARGE_TEXT", "Additional Info"),
     # General Info
+    ("Sellers Name on Deed", "TEXT", "General Info"),
     ("ARV", "MONETORY", "General Info"),
     ("Rehab Estimate", "MONETORY", "General Info"),
     ("Rehab Description", "TEXT", "General Info"),

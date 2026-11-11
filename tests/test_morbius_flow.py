@@ -54,6 +54,11 @@ check("second owner", f.second_owner("SAMPLE JANE M & SAMPLE RICHARD T", "Sample
 check("second owner, no surname", f.second_owner("SAMPLE WILLIAM M & DAVID M", "Sample"), "David M Sample")
 check("second owner, cut off", f.second_owner("SAMPLE WILLIAM M & JENN", "Sample"), "")
 check("second owner, trust", f.second_owner("SAMPLE JANE & JOHN REVOCABLE TRUST", ""), "")
+# Sellers Name on Deed (2026-11-11): every deed owner, First Last order
+check("deed full name, two owners", f.deed_full_name("SAMPLE JANE M & SAMPLE RICHARD T"), "Jane M Sample & Richard T Sample")
+check("deed full name, one owner", f.deed_full_name("SAMPLE JOHN A JR"), " ".join(x for x in f.deed_name("SAMPLE JOHN A JR") if x))
+check("deed full name, trust", f.deed_full_name("SAMPLE FAMILY LIVING TRUST"), "Sample Family Living Trust")
+check("deed full name, empty", f.deed_full_name(""), "")
 
 # ---------------------------------------------------------------- behind on follow-up
 fresh = s()

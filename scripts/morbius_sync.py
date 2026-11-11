@@ -600,6 +600,8 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
                    else " ".join(x for x in (owner.get("first2"), owner.get("last2")) if x)),
         # 2026-11-10 (Tala): county parcel number + BatchData backup email on every card
         "apn": (lead.get("pin") or "").strip(),
+        # 2026-11-11 (Tala): every owner exactly as on the deed (General Info folder)
+        "sellers name on deed": flow.deed_full_name(lead.get("owner_name")),
         "email 2": (lead.get("email_2") or "").strip(),
     }
     for i, p in enumerate(phones[1:5], start=2):
@@ -645,6 +647,29 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
                          if k in fields and v not in (None, "")],
     }
     return body, tags, call_line
+
+
+def other_property_text(o):
+    """One owner, several distressed properties, one GHL card (2026-11-11, Tala): each extra
+    property gets its own score, signals, deadline and story under 'Other Properties Owned',
+    so nothing about the second house is lost when she calls."""
+    raw = o.get("raw") or {}
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    conf, why = confidence(o, raw)
+    rp = raw.get("redemption_period") or {}
+    fm = raw.get("foreclosure_mie") or {}
+    if fm.get("sale_date"):
+        nxt = f"foreclosure sale {fm['sale_date']}"
+    elif rp.get("redemption_deadline"):
+        nxt = f"tax sale buy-back deadline {rp['redemption_deadline']} (sold {rp.get('sale_date', '')})"
+    else:
+        nxt = "no hard deadline found yet"
+    signals = ", ".join(t.replace("_", " ") for t in (o.get("source_tags") or []))
+    head = (f"{o.get('address') or ''}, {o.get('city') or ''} | Confidence {conf}% | {signals or 'no list'} | "
+            f"{nxt}\nWhy: {why}.")
+    story = (o.get("story") or "").strip()
+    return f"{head}\n{story}" if story else head
 
 
 def _norm(k, v):
@@ -872,8 +897,8 @@ def main():
                 others = [by_id[x] for x in owners[1:] if x in by_id]
                 if others and "other properties owned" in fields:
                     body["customFields"] = [f for f in body["customFields"] if f["id"] != fields["other properties owned"]]
-                    body["customFields"].append({"id": fields["other properties owned"], "field_value": "\n".join(
-                        f"{o.get('address') or ''} (crawler: {', '.join(o.get('source_tags') or [])})" for o in others)})
+                    body["customFields"].append({"id": fields["other properties owned"],
+                                                 "field_value": "\n\n".join(other_property_text(o) for o in others)})
                 contact = api.get_contact(cid)
                 if contact is None:
                     continue  # she deleted it herself; it stays deleted
