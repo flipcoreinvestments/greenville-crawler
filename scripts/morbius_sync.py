@@ -374,9 +374,23 @@ def _probate_is_owner(lead, raw):
 
 
 def _tax_paid(raw):
-    """Delinquent tax year paid after it hit the tax-sale list (tax_paid_check.py)."""
+    """Delinquent tax year marked paid (tax_paid_check.py). Returns (record, before_sale).
+    Paid BEFORE the tax sale = the owner paid, the tax signal is resolved.
+    Paid AFTER the sale is ambiguous: the county also marks the year paid when the
+    tax-sale BUYER's money posts, so it may NOT mean the owner redeemed."""
     tp = raw.get("tax_paid") or {}
-    return tp if tp.get("paid_on") else None
+    if not tp.get("paid_on"):
+        return None, None
+    try:
+        paid = datetime.strptime(tp["paid_on"], "%m/%d/%Y").date()
+    except ValueError:
+        return None, None
+    sale = (raw.get("redemption_period") or {}).get("sale_date")
+    try:
+        sale_d = datetime.strptime(str(sale)[:10], "%Y-%m-%d").date() if sale else None
+    except ValueError:
+        sale_d = None
+    return tp, (sale_d is None or paid < sale_d)
 
 
 def _recent_full_price(raw, today=None):
@@ -408,11 +422,17 @@ def confidence(lead, raw):
     score, why = _confidence_auto(lead, raw)
     notes = []
     tags = set(lead.get("source_tags") or [])
-    paid = _tax_paid(raw)
+    paid, before_sale = _tax_paid(raw)
     srcs = {SOURCE_OF[t] for t in tags if t in SOURCE_OF}
     if paid and "county tax collector" in srcs:
-        notes.append(f"taxes for {paid.get('tax_year')} were paid {paid['paid_on']}, so the tax sale is likely redeemed")
-        srcs.discard("county tax collector")
+        if before_sale:
+            notes.append(f"taxes for {paid.get('tax_year')} were paid {paid['paid_on']}, before any sale, so the tax signal is gone")
+            srcs.discard("county tax collector")
+        else:
+            notes.append(f"county shows {paid.get('tax_year')} taxes paid {paid['paid_on']}, AFTER the tax sale: "
+                         "that can be the owner redeeming OR the tax-sale buyer's payment, so ask the Tax Collector "
+                         "whether it was redeemed")
+            score = min(score, 60)
     if "probate court" in srcs and not _probate_is_owner(lead, raw):
         notes.append("the probate is for someone NOT on the deed (likely a relative), so it doesn't count")
         srcs.discard("probate court")

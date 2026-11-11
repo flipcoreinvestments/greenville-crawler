@@ -44,6 +44,11 @@ check("override sets the score", s == 25 and "hand-checked" in why)
 # taxes paid after the sale -> tax signal gone
 s, why = conf(["tax_sale"], dict(tax_raw, tax_paid={"tax_year": 2025, "paid_on": "10/23/2026"}))
 check("paid taxes drop the tax signal", s <= 10 and "paid" in why)
+sold = dict(tax_raw, redemption_period=dict(tax_raw["redemption_period"], sale_date="2026-09-25"))
+s, why = conf(["tax_sale"], dict(sold, tax_paid={"tax_year": 2025, "paid_on": "10/23/2026"}))
+check("paid after the sale is ambiguous, not resolved", 10 < s <= 60 and "AFTER the tax sale" in why)
+s, why = conf(["tax_sale"], dict(sold, tax_paid={"tax_year": 2025, "paid_on": "09/01/2026"}))
+check("paid before the sale resolves it", s <= 10)
 s2, _ = conf(["tax_sale"], dict(tax_raw, tax_paid={"tax_year": 2025, "paid_on": None}))
 check("unpaid taxes still count", s2 > 10)
 
