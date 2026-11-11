@@ -158,6 +158,17 @@ def second_owner(owner_name, first_last):
     return "" if full == " ".join(x for x in deed_name(owner_name) if x) else full
 
 
+def deed_full_name(owner_name):
+    """Everyone on the deed for the 'Sellers Name on Deed' field (Tala, 2026-11-11), First Last order:
+    'SAMPLE JANE M & SAMPLE RICHARD T' -> 'Jane M Sample & Richard T Sample';
+    a trust/estate/LLC keeps its full name. Written whether or not flow_live is on: it never
+    touches First/Last Name, it only shows the deed owners on the card."""
+    first, last = deed_name(owner_name)
+    primary = " ".join(x for x in (first, last) if x)
+    second = second_owner(owner_name, last)
+    return f"{primary} & {second}" if primary and second else primary
+
+
 # ------------------------------------------------------------------ activity
 def parse_dt(v):
     if v in (None, ""):
