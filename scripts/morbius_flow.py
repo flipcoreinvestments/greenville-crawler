@@ -6,14 +6,19 @@ morbius_sync.py calls them.
 
   RELEASE      every 50 crawler leads Tala calls/updates releases the next 50
                hottest leads (was 100).
-  BACKLOG      a lead is "behind" when its next call is overdue on the dialer
-               rhythm (a call every 3 days for the first 6 attempts, then every
-               10 days). If 100+ leads are behind, no new non-urgent leads are
-               released or added to GHL, no matter how many calls she makes.
+  BACKLOG      a lead is "behind" when its next call is overdue on the Power
+               Dialer's own rhythm: the dialer re-queues a lead 2 days after the
+               last call (Confidence 100) or 3 days (everyone else), so a lead
+               untouched longer than that is behind. Leads the dialer finished
+               with (tag "nurture") are not behind. If 100+ leads are behind, no
+               new non-urgent leads are released or added to GHL.
   URGENT       only when 3+ independent sources confirm the situation AND
                Confidence is 100. Urgent leads always get through, all at once,
                even during a backlog pause.
-  DEAD WEIGHT  6+ no-answer attempts and she never talked to them -> GHL tag
+  DEAD WEIGHT  6+ no-answer attempts and she never talked to them (the Power
+               Dialer marks this with the tag "nurture" after 6 calls never
+               reached; Morbius also counts GHL call logs, the "Call attempts"
+               field and her "no answer" notes) -> GHL tag
                "delete in 5 days". If she removes the tag, the lead is kept for
                good. If the tag is still there after 5 days, the contact is
                backed up and removed from GHL.
@@ -37,9 +42,9 @@ from skiptrace_prep import _ORG_RE, _PARTICLES, _SUFFIXES, _TAG_RE
 RELEASE_PER = 50            # leads called/updated per release
 RELEASE_SIZE = 50           # leads released each time
 BACKLOG_LIMIT = 100         # behind leads that pause new leads
-FIRST_ROUND_CALLS = 6       # attempts on the 3-day rhythm
-FIRST_ROUND_DAYS = 3
-LATER_DAYS = 10
+HOT_DAYS = 2                # Power Dialer re-queue wait for Confidence 100
+REQUEUE_DAYS = 3            # Power Dialer re-queue wait for everyone else
+NURTURE_TAG = "nurture"     # the dialer stops calling and tags this
 DEAD_NO_ANSWERS = 6
 DELETE_TAG = "delete in 5 days"
 DELETE_AFTER_DAYS = 5
@@ -169,10 +174,11 @@ def parse_dt(v):
         return None
 
 
-def summarize(contact, opps, notes, calls, offer_stage_ids, first_stage_id):
+def summarize(contact, opps, notes, calls, offer_stage_ids, first_stage_id, confidence=0, call_attempts=0):
     """One GHL contact -> what Morbius needs to know about Tala's follow-up.
     calls: list of dicts {direction, status, duration, date} (outbound call log).
-    Returns dict(worked, open, past_offer, dnc, talked, attempts, no_answers, last_touch)."""
+    confidence / call_attempts: the contact's Confidence and Power Dialer "Call attempts" fields.
+    Returns dict(worked, open, past_offer, dnc, talked, nurture, hot, attempts, no_answers, last_touch)."""
     tags = {t.strip().lower() for t in (contact or {}).get("tags") or []}
     dnc = bool((contact or {}).get("dnd")) or bool(tags & DNC_TAGS)
     open_card = any((o.get("status") or "open") == "open" for o in opps) if opps else False
@@ -202,25 +208,31 @@ def summarize(contact, opps, notes, calls, offer_stage_ids, first_stage_id):
         d = parse_dt(o.get("lastStageChangeAt") or o.get("lastStatusChangeAt"))
         if d and moved:
             touches.append(d)
-    return dict(worked=moved or bool(notes), open=open_card, past_offer=past_offer, dnc=dnc, talked=talked,
-                attempts=len(out_calls) + len(notes), no_answers=no_ans,
-                last_touch=max(touches) if touches else None)
+    attempts = max(len(out_calls) + len(notes), int(call_attempts or 0))
+    if not talked:
+        # never reached: every dialer attempt so far was a no-answer
+        no_ans = max(no_ans, int(call_attempts or 0))
+    return dict(worked=moved or bool(notes) or attempts > 0, open=open_card, past_offer=past_offer, dnc=dnc,
+                talked=talked, nurture=NURTURE_TAG in tags, hot=int(confidence or 0) >= 100,
+                attempts=attempts, no_answers=no_ans, last_touch=max(touches) if touches else None)
 
 
 def is_behind(s, added_at, now):
-    """Overdue for the next call on the dialer rhythm (3 days x 6 attempts, then 10 days)."""
-    if not s["open"] or s["dnc"] or s["past_offer"]:
+    """Overdue for the next call on the Power Dialer rhythm: 2 days (Confidence 100) or 3 days since
+    the last call / note / stage move, or since it was added if never touched. Done with = not behind."""
+    if not s["open"] or s["dnc"] or s["past_offer"] or s.get("nurture"):
         return False
     since = s["last_touch"] or parse_dt(added_at)
     if since is None:
         return False
-    gap = FIRST_ROUND_DAYS if s["attempts"] < FIRST_ROUND_CALLS else LATER_DAYS
+    gap = HOT_DAYS if s.get("hot") else REQUEUE_DAYS
     return (now - since).total_seconds() > gap * 86400
 
 
 def dead_weight(s):
-    """6+ no-answers, never talked, not Do Not Call, not at an offer stage."""
-    return (s["no_answers"] >= DEAD_NO_ANSWERS and not s["talked"] and not s["dnc"] and not s["past_offer"])
+    """6+ no-answers (or the dialer's "nurture" tag) and never talked, not Do Not Call, not at an offer stage."""
+    never_reached = s["no_answers"] >= DEAD_NO_ANSWERS or s.get("nurture")
+    return bool(never_reached and not s["talked"] and not s["dnc"] and not s["past_offer"])
 
 
 def is_urgent(conf, n_sources, past_deadline_reason):

@@ -689,8 +689,17 @@ def main():
             contact = api.get_contact(cid)
             if contact is None:
                 continue
+            have_ = {f.get("id"): f.get("value", f.get("field_value")) for f in (contact.get("customFields") or [])}
+
+            def num_(name):
+                try:
+                    return float(str(have_.get(fields.get(name)) or 0).replace(",", ""))
+                except ValueError:
+                    return 0
+            # the Power Dialer keeps its own count in "Call attempts"; Confidence sets its wait (2 or 3 days)
             s = flow.summarize(contact, api.opportunities(cid), api.notes(cid), api.call_log(cid),
-                               offer_ids, stage_id)
+                               offer_ids, stage_id, confidence=num_("confidence"),
+                               call_attempts=num_("call attempts"))
             s["added_at"] = m.get("created_at")
             s["tags"] = {t.strip().lower() for t in contact.get("tags") or []}
             s["lead_id"] = lid

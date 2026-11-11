@@ -32,9 +32,9 @@ def card(stage=FIRST, status="open"):
     return [{"pipelineStageId": stage, "status": status, "lastStageChangeAt": ago(1)}]
 
 
-def s(contact=None, opps=None, notes=(), calls=()):
+def s(contact=None, opps=None, notes=(), calls=(), conf=50, attempts=0):
     return f.summarize(contact or {"tags": []}, card() if opps is None else opps, list(notes), list(calls),
-                       {OFFER}, FIRST)
+                       {OFFER}, FIRST, confidence=conf, call_attempts=attempts)
 
 
 # ---------------------------------------------------------------- names
@@ -61,8 +61,12 @@ check("never called, added 2 days ago: not behind", f.is_behind(dict(fresh, last
 check("never called, added 4 days ago: behind", f.is_behind(dict(fresh, last_touch=None), ago(4), NOW), True)
 three = s(notes=[{"body": "no answer", "dateAdded": ago(4)}], opps=[{"pipelineStageId": FIRST, "status": "open"}])
 check("1 attempt, last touch 4 days ago: behind", f.is_behind(three, ago(10), NOW), True)
-six = s(notes=[{"body": "NA", "dateAdded": ago(5)}] * 6, opps=[{"pipelineStageId": FIRST, "status": "open"}])
-check("6 attempts, last 5 days ago: on the 10-day rhythm, not behind", f.is_behind(six, ago(30), NOW), False)
+hot = s(notes=[{"body": "NA", "dateAdded": ago(2.5)}], opps=[{"pipelineStageId": FIRST, "status": "open"}], conf=100)
+check("Confidence 100, last touch 2.5 days ago: behind (2-day rhythm)", f.is_behind(hot, ago(10), NOW), True)
+warm = s(notes=[{"body": "NA", "dateAdded": ago(2.5)}], opps=[{"pipelineStageId": FIRST, "status": "open"}])
+check("Confidence 50, last touch 2.5 days ago: not behind (3-day rhythm)", f.is_behind(warm, ago(10), NOW), False)
+nur = s({"tags": ["nurture"]}, opps=[{"pipelineStageId": FIRST, "status": "open"}])
+check("dialer finished (nurture): never behind", f.is_behind(nur, ago(30), NOW), False)
 check("closed card never behind", f.is_behind(s(opps=card(status="lost")), ago(30), NOW), False)
 check("offer stage never behind", f.is_behind(s(opps=card(OFFER)), ago(30), NOW), False)
 check("Do Not Call never behind", f.is_behind(s({"tags": ["DNC"]}), ago(30), NOW), False)
@@ -79,6 +83,10 @@ check("'talked' tag: never tagged", f.dead_weight(s({"tags": ["talked"]}, calls=
 check("Do Not Call: never tagged", f.dead_weight(s({"tags": ["dnc"]}, calls=na_calls)), False)
 check("GHL DND on: never tagged", f.dead_weight(s({"tags": [], "dnd": True}, calls=na_calls)), False)
 check("offer stage: never tagged", f.dead_weight(s(opps=card(OFFER), calls=na_calls)), False)
+check("dialer 'nurture' tag, never talked: tag", f.dead_weight(s({"tags": ["nurture"]})), True)
+check("dialer 'nurture' after talking: never tagged", f.dead_weight(s({"tags": ["nurture", "talked"]})), False)
+check("6 dialer Call attempts, never talked: tag", f.dead_weight(s(attempts=6)), True)
+check("dialer Call attempts count as worked", s(opps=[{"pipelineStageId": FIRST, "status": "open"}], attempts=1)["worked"], True)
 check("inbound calls don't count",
       f.dead_weight(s(calls=[dict(x, direction="inbound") for x in na_calls])), False)
 
