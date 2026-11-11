@@ -56,11 +56,37 @@ FIELDS = [
 ]
 
 
+def _folder_ids(fields):
+    """GHL folder ids by name (2026-11-11). A folder shows up either as its own entry
+    (documentType 'folder') or as the parentId most of its known fields share."""
+    ids = {}
+    for f in fields:
+        if str(f.get("documentType", "")).lower() == "folder" and f.get("name"):
+            ids[f["name"].strip().lower()] = f.get("id")
+    by_name = {f.get("name", "").strip().lower(): f.get("parentId") for f in fields}
+    for folder in {fo for _, _, fo in FIELDS}:
+        if folder.lower() in ids:
+            continue
+        votes = {}
+        for name, _, fo in FIELDS:
+            pid = by_name.get(name.lower())
+            if fo == folder and pid:
+                votes[pid] = votes.get(pid, 0) + 1
+        if votes:
+            ids[folder.lower()] = max(votes, key=votes.get)
+    return ids
+
+
+def _all_fields():
+    r = requests.get(f"{BASE}/locations/{LOC}/customFields", headers=HEAD, params={"model": "contact"}, timeout=30)
+    return r, (r.json().get("customFields", []) if r.status_code == 200 else [])
+
+
 def main():
     if not TOKEN or not LOC:
         print("Missing GHL_MORBIUS_TOKEN or GHL_LOCATION_ID secret.")
         sys.exit(1)
-    r = requests.get(f"{BASE}/locations/{LOC}/customFields", headers=HEAD, params={"model": "contact"}, timeout=30)
+    r, current = _all_fields()
     if r.status_code != 200:
         print("GHL said:", r.text[:300].replace(TOKEN, "***"))
         c = requests.get(f"{BASE}/contacts/", headers=HEAD, params={"locationId": LOC, "limit": 1}, timeout=30)
@@ -68,14 +94,22 @@ def main():
         print(f"Could not read existing custom fields: HTTP {r.status_code}. "
               "Check that the Morbius key has View Custom Fields + Edit Custom Fields.")
         sys.exit(1)
-    existing = {f.get("name", "").strip().lower() for f in r.json().get("customFields", [])}
+    folders = _folder_ids(current)
+    print("Folders found:", ", ".join(f"{k} = {'yes' if v else 'no'}" for k, v in sorted(folders.items())) or "none")
+    existing = {f.get("name", "").strip().lower(): f for f in current}
     made, skipped, failed = [], [], []
     for name, dtype, folder in FIELDS:
         if name.lower() in existing:
             skipped.append(name)
             continue
         body = {"name": name, "dataType": dtype, "model": "contact"}
-        resp = requests.post(f"{BASE}/locations/{LOC}/customFields", headers=HEAD, json=body, timeout=30)
+        pid = folders.get(folder.lower())
+        resp = None
+        if pid:
+            resp = requests.post(f"{BASE}/locations/{LOC}/customFields", headers=HEAD,
+                                 json=dict(body, parentId=pid), timeout=30)
+        if resp is None or resp.status_code not in (200, 201):
+            resp = requests.post(f"{BASE}/locations/{LOC}/customFields", headers=HEAD, json=body, timeout=30)
         if resp.status_code in (200, 201):
             made.append(f"{name} ({folder})")
         else:
@@ -83,6 +117,34 @@ def main():
         time.sleep(0.4)
     print(f"Created {len(made)}:", *made, sep="\n  ")
     print(f"Already existed {len(skipped)}:", *skipped, sep="\n  ")
+    # verify: every field exists, and say which folder it sits in
+    _, after = _all_fields()
+    now = {f.get("name", "").strip().lower(): f for f in after}
+    wrong = []
+    for name, _, folder in FIELDS:
+        f = now.get(name.lower())
+        if f is None:
+            failed.append(f"{name}: not found after setup")
+            continue
+        pid = folders.get(folder.lower())
+        # only move a field this run created (or the new deed-name field); never re-file
+        # a field Tala may have placed somewhere on purpose
+        mine = any(m_.startswith(name + " (") for m_ in made) or name == "Sellers Name on Deed"
+        if mine and pid and f.get("parentId") != pid:
+            put = requests.put(f"{BASE}/locations/{LOC}/customFields/{f['id']}", headers=HEAD,
+                               json={"name": f.get("name"), "parentId": pid}, timeout=30)
+            time.sleep(0.4)
+            _, again = _all_fields()
+            f2 = next((x for x in again if x.get("id") == f["id"]), {})
+            if f2.get("parentId") != pid:
+                wrong.append(f"{name} (should be in {folder}; move answered HTTP {put.status_code})")
+    print("VERIFY Sellers Name on Deed:",
+          "exists" if "sellers name on deed" in now else "MISSING",
+          "| in General Info:", "unknown" if not folders.get("general info") else
+          ("yes" if (now.get("sellers name on deed") or {}).get("parentId") == folders.get("general info")
+           or not any(w.startswith("Sellers Name on Deed") for w in wrong) else "no"))
+    if wrong:
+        print(f"In the wrong folder {len(wrong)} (drag them in GHL Settings > Custom Fields):", *wrong, sep="\n  ")
     if failed:
         print(f"FAILED {len(failed)}:", *failed, sep="\n  ")
         sys.exit(1)
