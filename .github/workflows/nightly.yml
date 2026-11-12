@@ -37,7 +37,23 @@ jobs:
     # 2026-10-19: write access lets the last step publish the watchdog status file
     permissions:
       contents: write
+      actions: read
     steps:
+      # 2026-11-12 (Tala's call): if a Morbius GHL sync is writing the leads
+      # table right now, wait for it (a sync takes about 15 minutes) so the two
+      # never overlap again (Nov 11 deadlock). Gives up waiting after 45 minutes.
+      - name: Wait for a running Morbius sync to finish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          for i in $(seq 1 45); do
+            busy=$(gh run list -R "$REPO" -w morbius.yml -L 5 --json status \
+                   --jq '[.[] | select(.status=="in_progress")] | length' || echo 0)
+            [ "${busy:-0}" -eq 0 ] && { echo "No Morbius sync running."; exit 0; }
+            echo "Morbius sync is running; waiting (minute $i of 45)..."; sleep 60
+          done
+          echo "Still running after 45 minutes; starting anyway."
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -55,70 +71,70 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MAX_ROWS: ${{ github.event.inputs.max_rows }}
-        run: python scripts/tax_sale_ingest.py
+        run: python scripts/run_step.py scripts/tax_sale_ingest.py
 
       - name: Run tax sale redemption period ingest
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MAX_ROWS: ${{ github.event.inputs.max_rows }}
-        run: python scripts/redemption_period_ingest.py
+        run: python scripts/run_step.py scripts/redemption_period_ingest.py
 
       - name: Run building permits (expired/demolition) ingest
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/building_permits_ingest.py
+        run: python scripts/run_step.py scripts/building_permits_ingest.py
 
       - name: Run absentee owner + tired landlord ingest
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/absentee_owner_ingest.py
+        run: python scripts/run_step.py scripts/absentee_owner_ingest.py
 
       - name: Backfill land_use for every lead (property type filter coverage)
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/backfill_land_use.py
+        run: python scripts/run_step.py scripts/backfill_land_use.py
 
       - name: Run probate ingest
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MAX_ROWS: ${{ github.event.inputs.max_rows }}
-        run: python scripts/probate_ingest.py
+        run: python scripts/run_step.py scripts/probate_ingest.py
 
       - name: Run code enforcement (unfit structures) ingest
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/code_enforcement_ingest.py
+        run: python scripts/run_step.py scripts/code_enforcement_ingest.py
 
       - name: Import PropStream exports (private Supabase bucket)
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python scripts/propstream_import.py
+        run: python scripts/run_step.py scripts/propstream_import.py
 
       - name: Fill property city/zip (U.S. Census geocoder, for skip tracing)
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/fill_city_zip.py
+        run: python scripts/run_step.py scripts/fill_city_zip.py
 
       - name: Merge duplicate-address leads (one name per list)
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/merge_duplicate_addresses.py
+        run: python scripts/run_step.py scripts/merge_duplicate_addresses.py
 
       - name: Alert on leads newly stacked on 2+ lists
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/alert_stacked_leads.py
+        run: python scripts/run_step.py scripts/alert_stacked_leads.py
 
       # 2026-10-11: reads the skip-trace result files she uploads to the
       # private skiptrace-results bucket and marks each lead traced / not traced.
@@ -127,11 +143,20 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python scripts/skiptrace_intake.py
+        run: python scripts/run_step.py scripts/skiptrace_intake.py
 
       # 2026-11-07: the old "GHL sync" step (read Restart Homes' GHL contact exports from the
       # ghl-sync bucket) was removed. Nothing in this system reads from or writes to Restart
       # Homes. Unstuck's GHL is kept in sync by Morbius (morbius.yml).
+
+      # 2026-11-12: moves cold rows (on no list, never traced or sent to GHL,
+      # 45+ days old) to leads_archive so the nightly steps work on the ~3,300
+      # real leads instead of 107k rows. Nothing is deleted for good.
+      - name: Archive cold rows (not on any list) to leads_archive
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/run_step.py scripts/archive_cold_leads.py
 
       # 2026-10-11: re-checks the last 1,000 leads + every skip-traced lead;
       # marks sold/off-list leads DEAD and bad-data leads WRONG INFORMATION
@@ -140,7 +165,7 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/qa_check.py
+        run: python scripts/run_step.py scripts/qa_check.py
 
       # 2026-10-11: second QA on not-traced leads (fixed vs needs a person),
       # errors on already-pulled leads (count-only warning for the watchdog),
@@ -149,7 +174,7 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/skiptrace_followup.py | tee followup.log
+        run: python scripts/run_step.py scripts/skiptrace_followup.py | tee followup.log
 
       # 2026-10-13: checks every skip-traced phone against the Do Not Call
       # registry files she uploads monthly (private bucket dnc-registry) and
@@ -159,14 +184,14 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python scripts/dnc_scrub.py
+        run: python scripts/run_step.py scripts/dnc_scrub.py
 
       - name: Write call lists + system health (private Supabase bucket lead-exports)
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python scripts/export_call_lists.py
+        run: python scripts/run_step.py scripts/export_call_lists.py
 
       # 2026-10-10: fails the run (red X + GitHub failure email/push) if any
       # source didn't finish, probate is stuck, or the call lists are stale.
@@ -174,7 +199,7 @@ jobs:
         if: ${{ always() }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/health_gate.py
+        run: python scripts/run_step.py scripts/health_gate.py
 
       # 2026-10-19: publishes a tiny status file (pass/fail + how many pulled
       # leads changed, count only) to the watchdog-status branch. Claude's

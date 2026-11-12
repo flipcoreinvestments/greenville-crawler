@@ -607,10 +607,23 @@ def enrich_existing_leads(conn, parcels, owner_counts, tired_owners):
             from parcel_attrs p
             where address_core(l.address) = p.core
               and l.is_sold = false and l.is_duplicate = false and l.list_count > 0
+              -- 2026-11-12: only touch a lead when a county fact actually
+              -- changed. It used to re-save every lead every night just to
+              -- refresh fetched_at, which loaded the database and made every
+              -- lead look "updated" to Morbius's story check.
+              and (l.owner_name is distinct from coalesce(p.owner_name, l.owner_name)
+                   or l.mailing_address is distinct from coalesce(p.mailing_address, l.mailing_address)
+                   or l.is_absentee is distinct from coalesce(p.is_absentee, l.is_absentee)
+                   or l.is_tired_landlord is distinct from p.is_tired
+                   or l.is_long_term_owner is distinct from p.is_long_term
+                   or l.owner_parcel_count is distinct from p.owner_parcel_count
+                   or l.pin is distinct from coalesce(l.pin, p.pin)
+                   or (coalesce(l.raw->'absentee_owner', '{}'::jsonb) - 'fetched_at')
+                      is distinct from (p.extra - 'fetched_at'))
             """
         )
         n = cur.rowcount
-    print(f"  enriched {n} existing lead(s) with county owner facts")
+    print(f"  enriched {n} existing lead(s) with changed county owner facts (unchanged leads left alone)")
     return n
 
 

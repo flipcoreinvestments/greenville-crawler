@@ -25,6 +25,7 @@ import time
 from datetime import datetime, timezone
 
 import psycopg2
+import lead_common  # noqa: F401  database safety: login retry, 20-min timeout, no-op schema checks never lock
 import requests
 
 GEOCODER = "https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress"

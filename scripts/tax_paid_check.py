@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
+import lead_common  # noqa: F401  database safety: login retry, 20-min timeout, no-op schema checks never lock
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 

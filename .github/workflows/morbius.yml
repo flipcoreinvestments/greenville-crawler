@@ -32,30 +32,59 @@ concurrency:
   group: morbius
   cancel-in-progress: false
 
+# 2026-11-12: the job reads the Actions list to see whether the crawler is running.
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
+      # 2026-11-12 (Tala's call): never write the leads table while the nightly
+      # crawler is running -- that overlap caused the Nov 11 deadlock. If the
+      # crawler is queued or running, this sync stops here; a fresh sync starts
+      # on its own the moment the crawler finishes (workflow_run above).
+      - name: Skip if the nightly crawler is running
+        id: crawler
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          busy=$(gh run list -R "$REPO" -w nightly.yml -L 5 --json status \
+                 --jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting")] | length' || echo 0)
+          if [ "${busy:-0}" -gt 0 ]; then
+            echo "Nightly crawler is running -- skipping this sync; it starts again when the crawler finishes."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v4
+        if: steps.crawler.outputs.skip != 'true'
       - uses: actions/setup-python@v5
+        if: steps.crawler.outputs.skip != 'true'
         with:
           python-version: "3.11"
       - name: Install dependencies
+        if: steps.crawler.outputs.skip != 'true'
         run: |
           pip install -r requirements.txt
           pip install requests==2.32.3 psycopg2-binary==2.9.9 openpyxl==3.1.5
       # 2026-11-11 (Tala's training): before scoring, check whether each tax-sale
       # lead's delinquent year has been PAID since the sale (likely redeemed).
       - name: Install headless browser
+        if: steps.crawler.outputs.skip != 'true'
         run: playwright install --with-deps chromium
       - name: Tax paid check
+        if: steps.crawler.outputs.skip != 'true'
         continue-on-error: true
         timeout-minutes: 15
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/tax_paid_check.py
       - name: Morbius sync
+        if: steps.crawler.outputs.skip != 'true'
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           GHL_MORBIUS_TOKEN: ${{ secrets.GHL_MORBIUS_TOKEN }}

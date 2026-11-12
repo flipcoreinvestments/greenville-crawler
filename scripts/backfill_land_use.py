@@ -77,6 +77,7 @@ import sys
 
 import psycopg2
 from psycopg2.extras import execute_values
+import lead_common  # noqa: F401  database safety: login retry, 20-min timeout, no-op schema checks never lock
 
 # Verified 2026-09-22 against the county's own Real Property Search detail
 # page (https://www.greenvillecounty.org/appsas400/RealProperty/Details.aspx),
@@ -208,23 +209,31 @@ def main():
     try:
         cur.execute("alter table leads add column if not exists land_use text")
 
-        # 1. Verified codes -> decoded description. One UPDATE per code
-        #    (23 total) keeps each statement simple and cheap to reason
-        #    about, and lets us log a per-code row count.
-        verified_total = 0
-        for code, description in VERIFIED_CODES.items():
-            cur.execute(
-                """
-                update leads
-                   set land_use = %s
-                 where land_use is null
-                   and raw->'absentee_owner'->>'landuse' = %s
-                """,
-                (description, code),
-            )
-            if cur.rowcount:
-                print(f"  verified  {code:>6}  ->  {description:<40}  {cur.rowcount:>6} rows")
-            verified_total += cur.rowcount
+        # 1. Verified codes -> decoded description. 2026-11-12: ONE update for
+        #    all codes (it used to be one full-table pass per code, ~100 passes
+        #    over 107k rows, and on Nov 2 and Nov 4 that ran past the database's
+        #    time limit). Only rows still missing a land use are touched, and the
+        #    partial index idx_leads_land_use_missing finds them instantly.
+        cur.execute("create index if not exists idx_leads_land_use_missing on leads (id) "
+                    "where land_use is null")
+        values = ",".join(cur.mogrify("(%s,%s)", (code, desc)).decode()
+                          for code, desc in VERIFIED_CODES.items())
+        cur.execute(
+            f"""
+            update leads l
+               set land_use = v.description
+              from (values {values}) as v(code, description)
+             where l.land_use is null
+               and l.raw->'absentee_owner'->>'landuse' = v.code
+            returning v.code
+            """
+        )
+        per_code = {}
+        for (code,) in cur.fetchall():
+            per_code[code] = per_code.get(code, 0) + 1
+        for code, n in sorted(per_code.items()):
+            print(f"  verified  {code:>6}  ->  {VERIFIED_CODES[code]:<40}  {n:>6} rows")
+        verified_total = sum(per_code.values())
 
         # 2. Any other raw code present but not in VERIFIED_CODES (long-tail
         #    codes, plus the literal "0") -> honest "not decoded yet" label,

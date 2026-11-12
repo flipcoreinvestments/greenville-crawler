@@ -480,10 +480,93 @@ except ImportError:
 
 DB_LOGIN_WINDOW_SECONDS = 120
 
+# ---------------------------------------------------------------------------
+# Database safety (added 2026-11-12, Tala's call after the November failures)
+# Every November crawler failure came from the database, not the county sites:
+#   Nov 2, 4, 7   statements cut off by Supabase's default 2-minute statement
+#                 timeout (backfill_land_use, PropStream vacant import, qa_check,
+#                 dnc_scrub) -- several were tiny queries stuck in line behind
+#                 an "alter table leads add column if not exists", which takes
+#                 the strongest table lock even when the column already exists
+#   Nov 6         no free database connection (fixed Nov 7 by the login retry)
+#   Nov 11        deadlock with a Morbius sync started while the crawler ran
+# So every connection made after importing this file now:
+#   1. retries the login for up to 2 minutes (unchanged from Nov 7),
+#   2. gets a 20-minute statement timeout instead of the 2-minute default
+#      (a script that sets its own timeout still wins),
+#   3. skips "alter table ... add column if not exists" and
+#      "create index if not exists" when the column / index already exists,
+#      so the nightly no-op schema checks never lock the leads table.
+# ---------------------------------------------------------------------------
+DEFAULT_STATEMENT_TIMEOUT = "20min"
+
+_ADD_COLUMN_RE = re.compile(
+    r"^\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)\s+"
+    r"add\s+column\s+if\s+not\s+exists\s+\"?(\w+)\"?\s", re.I | re.S)
+_CREATE_INDEX_RE = re.compile(
+    r"^\s*create\s+(?:unique\s+)?index\s+(?:concurrently\s+)?if\s+not\s+exists\s+"
+    r"\"?(\w+)\"?\s+on\s", re.I | re.S)
+
+
+def _schema_change_already_done(conn, query):
+    """True when `query` is a single no-op 'add column if not exists' /
+    'create index if not exists' whose column / index is already there."""
+    if not isinstance(query, str):
+        return False
+    m = _ADD_COLUMN_RE.match(query)
+    if m and len(re.findall(r"\badd\s+column\b", query, re.I)) == 1:
+        table, column = m.group(1).replace('"', ''), m.group(2)
+        with _pg.extensions.cursor(conn) as c:
+            _pg.extensions.cursor.execute(
+                c, "select 1 from pg_attribute where attrelid = to_regclass(%s) "
+                   "and attname = %s and not attisdropped", (table, column))
+            return c.fetchone() is not None
+    m = _CREATE_INDEX_RE.match(query)
+    if m:
+        with _pg.extensions.cursor(conn) as c:
+            _pg.extensions.cursor.execute(c, "select to_regclass(%s) is not null", (m.group(1),))
+            return bool(c.fetchone()[0])
+    return False
+
+
+_safe_cursor_classes = {}
+
+
+def _safe_cursor_class(base):
+    cls = _safe_cursor_classes.get(base)
+    if cls is None:
+        def execute(self, query, vars=None):
+            if _schema_change_already_done(self.connection, query):
+                return None
+            return base.execute(self, query, vars)
+        cls = type("Safe" + base.__name__, (base,), {"execute": execute})
+        _safe_cursor_classes[base] = cls
+    return cls
+
+
+if _pg is not None:
+    import psycopg2.extensions as _pg_ext  # noqa: F401  (makes _pg.extensions available)
+
+    class SafeConnection(_pg.extensions.connection):
+        def cursor(self, *args, **kwargs):
+            base = kwargs.get("cursor_factory") or self.cursor_factory or _pg.extensions.cursor
+            kwargs["cursor_factory"] = _safe_cursor_class(base)
+            return super().cursor(*args, **kwargs)
+
+
+def _with_timeout_option(kwargs):
+    opts = kwargs.get("options") or ""
+    if "statement_timeout" not in opts:
+        kwargs["options"] = (opts + f" -c statement_timeout={DEFAULT_STATEMENT_TIMEOUT}").strip()
+    return kwargs
+
+
 if _pg is not None and not getattr(_pg.connect, "_retry_wrapped", False):
     _original_connect = _pg.connect
 
     def _connect_with_retry(*args, **kwargs):
+        kwargs = _with_timeout_option(dict(kwargs))
+        kwargs.setdefault("connection_factory", SafeConnection)
         deadline = _time.monotonic() + DB_LOGIN_WINDOW_SECONDS
         attempt = 0
         while True:
@@ -502,3 +585,62 @@ if _pg is not None and not getattr(_pg.connect, "_retry_wrapped", False):
 
     _connect_with_retry._retry_wrapped = True
     _pg.connect = _connect_with_retry
+
+
+# ---------------------------------------------------------------------------
+# Cold-row archive (added 2026-11-12, see archive_cold_leads.py)
+# ---------------------------------------------------------------------------
+def leads_columns(conn):
+    """The leads table's real (non-generated) columns, in table order."""
+    with conn.cursor() as cur:
+        cur.execute("select column_name from information_schema.columns "
+                    "where table_schema = 'public' and table_name = 'leads' "
+                    "and is_generated = 'NEVER' order by ordinal_position")
+        return [r[0] for r in cur.fetchall()]
+
+
+def ensure_archive_table(conn):
+    """Create leads_archive (same columns as leads + archived_at, no indexes
+    except id) and add any column leads has gained since. Returns the shared
+    column list."""
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('public.leads_archive') is not null")
+        if not cur.fetchone()[0]:
+            cur.execute("create table leads_archive (like leads including defaults)")
+            cur.execute("alter table leads_archive add column archived_at timestamptz")
+            cur.execute("alter table leads_archive add primary key (id)")
+            cur.execute("alter table leads_archive enable row level security")
+            cur.execute("revoke all on leads_archive from anon, authenticated")
+        cur.execute("select column_name from information_schema.columns "
+                    "where table_schema = 'public' and table_name = 'leads_archive'")
+        have = {r[0] for r in cur.fetchall()}
+        cur.execute("select column_name, format_type(a.atttypid, a.atttypmod) "
+                    "from information_schema.columns c join pg_attribute a "
+                    "on a.attrelid = 'public.leads'::regclass and a.attname = c.column_name "
+                    "where c.table_schema = 'public' and c.table_name = 'leads' "
+                    "and c.is_generated = 'NEVER'")
+        for col, typ in cur.fetchall():
+            if col not in have:
+                cur.execute(f'alter table leads_archive add column "{col}" {typ}')
+    conn.commit()
+    return leads_columns(conn)
+
+
+def restore_archived_lead(conn, lead_id):
+    """Move one archived row back into leads. Returns the lead id now in
+    leads (the archived id, or an existing lead at the same address)."""
+    cols = ensure_archive_table(conn)
+    col_list = ", ".join(f'"{c}"' for c in cols)
+    with conn.cursor() as cur:
+        cur.execute("select l.id::text from leads l join leads_archive a "
+                    "on lower(l.address) = lower(a.address) where a.id::text = %s", (str(lead_id),))
+        row = cur.fetchone()
+        if row:
+            return row[0]
+        cur.execute(f"""
+            with moved as (delete from leads_archive where id::text = %s returning *)
+            insert into leads ({col_list}) select {col_list} from moved returning id::text
+        """, (str(lead_id),))
+        row = cur.fetchone()
+    conn.commit()
+    return row[0] if row else None

@@ -32,6 +32,7 @@ from datetime import date, timedelta
 
 import psycopg2
 import psycopg2.extras
+import lead_common  # noqa: F401  database safety: login retry, 20-min timeout, no-op schema checks never lock
 import requests
 
 from skiptrace_prep import owner_trace_names
@@ -191,7 +192,13 @@ def main():
                          office text, matched_lead_id text, seen_at timestamptz default now())""")
         cur.execute("alter table bankruptcy_filings enable row level security")
         cur.execute("revoke all on bankruptcy_filings from anon, authenticated")
+        # 2026-11-12: also search owners whose rows were moved to leads_archive
+        # (cold, not on any list); a match moves that row back into leads.
+        lead_common.ensure_archive_table(conn)
         cur.execute("""select id::text, owner_name from leads
+                       where coalesce(is_duplicate,false)=false and owner_name is not null
+                       union all
+                       select id::text, owner_name from leads_archive
                        where coalesce(is_duplicate,false)=false and owner_name is not null""")
         owners = [(lid, owner_people(on)) for lid, on in cur.fetchall()]
     by_name = {}
@@ -211,6 +218,9 @@ def main():
                 if len(set(cands)) == 1:
                     hit = cands[0]
                     break
+            if hit:
+                # a match on an archived (cold) owner moves that row back into leads
+                hit = lead_common.restore_archived_lead(conn, hit) or hit
             matched += bool(hit)
             cur.execute("""insert into bankruptcy_filings (case_number, title, chapter, date_filed, office, matched_lead_id)
                            values (%s,%s,%s,%s,%s,%s)

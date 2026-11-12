@@ -53,6 +53,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import psycopg2
 import psycopg2.extras
+import lead_common  # noqa: F401  database safety: login retry, 20-min timeout, no-op schema checks never lock
 import requests
 
 from export_call_lists import OPEN_ERRORS, clean_phones, lead_rows, load_tax_sale_info, needs_retrace, open_errors, to_csv

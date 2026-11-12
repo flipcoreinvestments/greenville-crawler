@@ -21,6 +21,7 @@ import re
 import sys
 
 import psycopg2
+import lead_common  # noqa: F401  database safety: login retry, 20-min timeout, no-op schema checks never lock
 
 NIGHTLY_SOURCES = {
     "tax_sale": "Tax sale",

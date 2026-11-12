@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
+import lead_common  # noqa: F401  database safety: login retry, 20-min timeout, no-op schema checks never lock
 
 ALERT_THRESHOLD = 2  # "shows up on multiple lists" = 2 or more
 
