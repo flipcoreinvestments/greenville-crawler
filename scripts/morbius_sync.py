@@ -125,7 +125,8 @@ class GHL:
 
     def get_contact(self, cid):
         r = self._req("GET", f"/contacts/{cid}")
-        if r is None or r.status_code == 404:
+        # 400/404/422: the card is gone (already deleted, or merged away) -- treat as missing, never crash.
+        if r is None or r.status_code in (400, 404, 422):
             return None
         r.raise_for_status()
         return r.json().get("contact")
@@ -1264,9 +1265,13 @@ def main():
             c["protected_kept"] += 1
             continue
         to_delete.append((lid, cid, why, "deleted_dead"))
-    for lid, cid in litigator_cards:
-        to_delete.append((lid, cid, "litigator (BatchData): never in GHL -- Tala's rule", "deleted_litigator"))
     seen = {x[1] for x in to_delete}
+    for lid, cid in litigator_cards:
+        # Two leads (same owner) can share one merged card: delete the card once, mark both leads.
+        if cid in seen:
+            continue
+        seen.add(cid)
+        to_delete.append((lid, cid, "litigator (BatchData): never in GHL -- Tala's rule", "deleted_litigator"))
     for cid in tagged:
         if cid not in seen:
             to_delete.append((by_contact.get(cid), cid, "tagged delete by Tala", "deleted_tagged"))
@@ -1278,6 +1283,13 @@ def main():
         for lid, cid, why, key in to_delete:
             contact = api.get_contact(cid)
             if contact is None:
+                # Card already gone from GHL: record it so no lead keeps pointing at a missing card.
+                if a.live:
+                    with conn.cursor() as cur:
+                        cur.execute("""update morbius_contacts set deleted_at=now(), delete_reason=%s
+                                       where ghl_contact_id=%s and deleted_at is null""",
+                                    (why + " (card already gone)", cid))
+                    conn.commit()
                 continue
             if api.delete_contact(cid):
                 c[key] += 1
@@ -1287,6 +1299,9 @@ def main():
                             src = list((by_id.get(lid) or {}).get("source_tags") or [])
                             cur.execute("""update morbius_contacts set deleted_at=now(), delete_reason=%s, backup=%s,
                                            deleted_tags=%s where lead_id=%s""", (why, json.dumps(contact), src, lid))
+                            # Other leads sharing this merged card are gone from GHL too.
+                            cur.execute("""update morbius_contacts set deleted_at=now(), delete_reason=%s
+                                           where ghl_contact_id=%s and deleted_at is null""", (why, cid))
                         else:
                             cur.execute("""insert into morbius_contacts (lead_id, ghl_contact_id, deleted_at,
                                              delete_reason, backup)
