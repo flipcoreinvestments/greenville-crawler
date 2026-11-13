@@ -754,7 +754,8 @@ def fill_email(api, cid, lead, contact, c):
         c["emails_added"] += 1
     except Exception as e:
         c["email_skipped"] += 1
-        print(f"  email not added ({type(e).__name__}): {str(e)[:80]}")
+        # Card id only (the run log is public): enough to find the card in GHL.
+        print(f"  email not added to card {cid} ({type(e).__name__}): {str(e)[:80]}")
 
 
 FIRST_STAGE_ID = None  # the Sellers pipeline's first stage, set in main()
