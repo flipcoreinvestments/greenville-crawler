@@ -1,7 +1,17 @@
-name: Verify distress signals (3+ list leads)
+name: Verify distress signals (weekly re-check of GHL leads)
 
+# 2026-11-13 (Tala): every lead in GHL and every lead waiting on a skip trace is
+# re-checked against the live county/court sources every week (Sunday night, so
+# Monday's calls start clean). scope=all3 runs the old 3+ list sweep (slow).
 on:
-  workflow_dispatch: {}
+  schedule:
+    - cron: "37 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "ghl (GHL + skip-trace queue) or all3 (every 3+ list lead, slow)"
+        required: false
+        default: "ghl"
 
 # Only one workflow touches the database at a time (added 2026-10-01): the
 # Sep 28 weekly foreclosure run started while the nightly run held the leads
@@ -34,4 +44,5 @@ jobs:
       - name: Cross-verify distress signals against live sources
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          VERIFY_SCOPE: ${{ inputs.scope || 'ghl' }}
         run: python scripts/verify_distress_signals.py
