@@ -60,6 +60,7 @@ from export_call_lists import OPEN_ERRORS, clean_phones, lead_rows, load_tax_sal
 from ghl_sync import good_phones
 from skiptrace_prep import compute_skiptrace_identity, owner_trace_names, probate_heirs
 import morbius_flow as flow
+import phone_grade as pg
 from morbius_flow import deed_name
 
 BASE = "https://services.leadconnectorhq.com"
@@ -257,10 +258,18 @@ def ensure_tables(conn):
         cur.execute("alter table morbius_runs enable row level security")
         cur.execute("alter table leads add column if not exists story text")
         cur.execute("alter table morbius_contacts add column if not exists deleted_tags text[]")
+        # 2026-11-12 (phone_grade.py): phone details, litigator / deceased flags, every name traced,
+        # and where a lead stands after every number failed ('idicore search' / 'unreachable')
+        for col, typ in (("phone_meta", "jsonb"), ("litigator", "boolean"), ("trace_deceased", "boolean"),
+                         ("trace_history", "jsonb"), ("bad_phones", "text[]"), ("ghl_feedback", "text[]"),
+                         ("retrace_reason", "text"), ("reach_status", "text")):
+            cur.execute(f"alter table leads add column if not exists {col} {typ}")
         cur.execute("""create table if not exists morbius_skiptrace_queue (
                          lead_id text primary key, status text not null, reason text, confidence int,
                          list_count int, days_on_list int, updated_at timestamptz default now(),
                          alerted_at timestamptz, approved_at timestamptz)""")
+        cur.execute("alter table morbius_skiptrace_queue add column if not exists retrace_first text")
+        cur.execute("alter table morbius_skiptrace_queue add column if not exists retrace_last text")
         cur.execute("alter table morbius_skiptrace_queue enable row level security")
         cur.execute("revoke all on morbius_skiptrace_queue from anon, authenticated")
         cur.execute("""create table if not exists morbius_worked (ghl_contact_id text primary key,
@@ -452,6 +461,14 @@ def confidence(lead, raw):
     if rf:
         score = min(score, 30)
         notes.append(rf)
+    # 2026-11-12 (Tala): how reachable the best number is counts too, so the freshest,
+    # most reachable leads sit at the top. Only traced leads (sync attaches "_callable").
+    if lead.get("skiptrace_status") == "traced" and "_callable" in lead:
+        pen, reason = pg.confidence_penalty(lead["_callable"], lead.get("phone_meta") or {},
+                                            traced_deceased=bool(lead.get("trace_deceased")))
+        if pen:
+            score = max(0, score - pen)
+        notes.append(reason)
     score = min(score, AUTO_MAX)
     if notes:
         why += "; " + "; ".join(notes)
@@ -571,6 +588,16 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
     else:
         call_line = "Call: owner"
     info.append(f"Traced: {str(d.get('Last Skip-Traced') or '').strip() or 'yes'}")
+    # 2026-11-12: every number with its grade (A best .. D worst), best first
+    meta = lead.get("phone_meta") or {}
+    dec = bool(lead.get("trace_deceased"))
+    for p_, g_ in pg.graded(phones, meta, traced_deceased=dec):
+        info.append(pg.describe(p_, meta.get(p_), g_))
+    if lead.get("_best_dnc"):
+        info.append("CAUTION: the best number for this person is on the Do Not Call registry, so it is not "
+                    "listed. Mail or door knock (Larry is reviewing whether it can be called).")
+    if lead.get("_bad_note"):
+        info.append(lead["_bad_note"])
 
     rp = raw.get("redemption_period") or {}
     if d.get("Foreclosure Auction Date"):
@@ -627,6 +654,11 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
         tags.append("bankruptcy")
     if any(isinstance(v, dict) and v.get("mls_status") for k, v in raw.items() if k.startswith("propstream")):
         tags.append("listed on mls")
+    if lead.get("_best_dnc"):
+        tags.append(pg.BEST_DNC_TAG)
+    # 2026-11-12 (Tala): the best properties also go into the email campaign (Margaret segments them)
+    if (lead.get("email") or "").strip() and conf >= pg.EMAIL_MIN_CONF:
+        tags.append(pg.EMAIL_TAG)
 
     # 2026-11-10 (Tala): the owner exactly as on the deed -- middle names/initials and Jr/Sr kept,
     # a trust/estate/entity keeps its full name in First Name
@@ -797,10 +829,32 @@ def main():
     print(f"Bankruptcy matches on file: {c_bk}")
     by_id = {str(r["id"]): r for r in rows}
     ok = clean_phones(conn)
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('public.phone_dnc') is not null")
+        if cur.fetchone()[0]:
+            cur.execute("select phone from phone_dnc where on_dnc")
+            on_dnc = {x[0] for x in cur.fetchall()}
+        else:
+            on_dnc = set()
+    # 2026-11-12: phone details, litigator / deceased flags and call feedback live on the leads table
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""select id::text, phone_meta, litigator, trace_deceased, trace_history, bad_phones,
+                              retrace_reason, reach_status, skiptrace_input from leads
+                       where skiptrace_status = 'traced'""")
+        extra = {x["id"]: x for x in cur.fetchall()}
+    for r in rows:
+        x = extra.get(str(r["id"]))
+        if x:
+            for k in ("phone_meta", "litigator", "trace_deceased", "trace_history", "bad_phones",
+                      "retrace_reason", "reach_status", "skiptrace_input"):
+                r[k] = x[k]
+            r["_callable"] = [p for p in good_phones(r) if ok.get(p)]
     mapped = load_map(conn)
     c = dict(new=0, linked_existing=0, updated=0, kept_her_edit=0, retrace=0, deleted_dead=0,
              deleted_tagged=0, protected_kept=0, skipped_no_clean_phone=0, readded=0, errors=0,
-             emails_added=0, email_skipped=0)
+             emails_added=0, email_skipped=0, litigators_blocked=0, deleted_litigator=0, held_best_dnc=0,
+             bad_numbers_found=0, retrace_next_name=0, idicore_search=0, unreachable=0)
+    litigator_cards = []
     new_budget = a.limit if a.limit >= 0 else 10 ** 9
     edit_keys = {}
 
@@ -825,9 +879,14 @@ def main():
                 except ValueError:
                     return 0
             # the Power Dialer keeps its own count in "Call attempts"; Confidence sets its wait (2 or 3 days)
-            s = flow.summarize(contact, api.opportunities(cid), api.notes(cid), api.call_log(cid),
+            notes_ = api.notes(cid)
+            s = flow.summarize(contact, api.opportunities(cid), notes_, api.call_log(cid),
                                offer_ids, stage_id, confidence=num_("confidence"),
                                call_attempts=num_("call attempts"))
+            # 2026-11-12: what her Call Result / Call Outcome / Working Numbers / notes say about the numbers
+            id_name_ = {v: k for k, v in fields.items()}
+            cf_ = {id_name_.get(fid, ""): val for fid, val in have_.items()}
+            s["numbers"] = pg.bad_numbers(contact, cf_, notes_)
             s["added_at"] = m.get("created_at")
             s["tags"] = {t.strip().lower() for t in contact.get("tags") or []}
             s["lead_id"] = lid
@@ -842,6 +901,64 @@ def main():
     c["held_for_backlog"] = 0
     print(f"Follow-up: {behind} of {len(activity)} crawler contacts behind; "
           f"{'NEW LEADS PAUSED' if paused else 'new leads flowing'} (pause at {flow.BACKLOG_LIMIT})")
+    # ---------- BAD NUMBERS (2026-11-12, Tala): a wrong / disconnected / bad number never deletes a
+    # lead. The number is marked dead; if no good number is left (or she reached the wrong person),
+    # the next person tied to the property is queued for a re-trace (her yes first, as always);
+    # when every name has been traced and nothing works -> "idicore search" (hot) / "unreachable".
+    retrace_rows = []
+    for cid, s in activity.items():
+        fb = s.get("numbers") or {}
+        lead = by_id.get(s["lead_id"])
+        if not lead or not fb.get("bad"):
+            continue
+        new_bad = set(fb["bad"]) - set(lead.get("bad_phones") or [])
+        if not new_bad and not fb.get("wrong_person"):
+            continue
+        c["bad_numbers_found"] += len(new_bad)
+        lead["bad_phones"] = sorted(set(lead.get("bad_phones") or []) | set(fb["bad"]))
+        lead["_callable"] = [p for p in good_phones(lead) if ok.get(p)]
+        api.add_tags(cid, [pg.BAD_NUMBER_TAG])
+        reason = "; ".join(fb.get("reasons") or [])[:200]
+        status_ = None
+        retrace_ = None
+        if fb.get("wrong_person") or not lead["_callable"]:
+            tags_ = set(lead.get("source_tags") or [])
+            raw_ = lead.get("raw") or {}
+            if isinstance(raw_, str):
+                raw_ = json.loads(raw_)
+            sf, sl, _, _ = compute_skiptrace_identity(lead, list(tags_))
+            own = owner_trace_names(lead.get("owner_name"))
+            prob = raw_.get("probate") or {}
+            heirs_ = probate_heirs(prob, prob.get("pr_name"), lead.get("owner_name")) if prob else ""
+            cands = pg.trace_candidates((sf, sl), heirs_, (own.get("first2"), own.get("last2")),
+                                        (own.get("first"), own.get("last")),
+                                        bool(tags_ & PROBATE_TAGS) or bool(lead.get("trace_deceased")))
+            tried = [(h.get("first"), h.get("last")) for h in (lead.get("trace_history") or [])]
+            inp_ = lead.get("skiptrace_input") or {}
+            tried.append((inp_.get("first"), inp_.get("last")))
+            nxt_ = pg.next_trace_target(cands, tried)
+            if nxt_:
+                retrace_ = (f"Numbers didn't reach the right person ({reason}). Next: trace "
+                            f"{nxt_[0]} {nxt_[1]} ({nxt_[2]}).")
+                retrace_rows.append((s["lead_id"], nxt_[0], nxt_[1], retrace_))
+                c["retrace_next_name"] += 1
+            else:
+                conf_, _ = confidence(lead, raw_)
+                status_ = pg.IDICORE_TAG if conf_ >= pg.IDICORE_MIN_CONF else pg.UNREACHABLE_TAG
+                api.add_tags(cid, [status_])
+                c["idicore_search" if status_ == pg.IDICORE_TAG else "unreachable"] += 1
+        lead["retrace_reason"] = retrace_ or lead.get("retrace_reason")
+        lead["_bad_note"] = f"Marked bad from your calls: {', '.join(sorted(new_bad)) or 'none new'} ({reason})"
+        if a.live:
+            with conn.cursor() as cur:
+                cur.execute("""update leads set bad_phones = %s,
+                                      ghl_feedback = coalesce(ghl_feedback, '{}') || %s::text[],
+                                      retrace_reason = coalesce(%s, retrace_reason),
+                                      reach_status = coalesce(%s, reach_status)
+                               where id = %s""",
+                            (lead["bad_phones"], [f"{today:%Y-%m-%d}: {reason}"], retrace_, status_, s["lead_id"]))
+            conn.commit()
+
     # one owner, several properties -> one GHL contact: the first lead linked owns the card,
     # the others are listed under "Other Properties Owned" instead of overwriting it
     shared = {}
@@ -854,8 +971,18 @@ def main():
         lid = str(lead["id"])
         if lead.get("lead_status") or lead.get("skiptrace_status") != "traced" or not_worked(lead):
             continue
-        phones = [p for p in good_phones(lead) if ok.get(p)]
         m = mapped.get(lid)
+        # 2026-11-12 (Tala): litigators never go into GHL; one already there is removed below
+        if lead.get("litigator"):
+            c["litigators_blocked"] += 1
+            if m and m.get("ghl_contact_id") and not m.get("deleted_at"):
+                litigator_cards.append((lid, m["ghl_contact_id"]))
+            continue
+        meta_ = lead.get("phone_meta") or {}
+        dec_ = bool(lead.get("trace_deceased"))
+        # best graded number first (A..D), only numbers clean on Do Not Call and never reported wrong
+        phones = [p for p, _g in pg.graded([p for p in good_phones(lead) if ok.get(p)], meta_, traced_deceased=dec_)]
+        lead["_best_dnc"] = pg.best_is_dnc(good_phones(lead), meta_, ok, on_dnc, traced_deceased=dec_)
         readd_reason = ""
         if m and m.get("deleted_at"):
             src = set(lead.get("source_tags") or [])
@@ -916,7 +1043,7 @@ def main():
                 if live_map:
                     fill_email(api, cid, lead, contact, c)
                 api.add_tags(cid, tags)
-                stale = {"warm", "hot", "very hot", "verified 95+"} - set(tags)
+                stale = {"warm", "hot", "very hot", "verified 95+", pg.BEST_DNC_TAG, pg.EMAIL_TAG} - set(tags)
                 api.remove_tags(cid, stale)
                 have = {f.get("id"): f.get("value", f.get("field_value")) for f in (contact.get("customFields") or [])}
                 for k in edits:
@@ -929,6 +1056,10 @@ def main():
                                     (json.dumps(written), lid))
             else:
                 if new_budget <= 0:
+                    continue
+                if lead.get("_best_dnc"):
+                    # her best number is on Do Not Call: no worse number gets dialed instead (mail / door knock)
+                    c["held_best_dnc"] += 1
                     continue
                 if paused and not FLOW_LIVE:
                     c["held_for_backlog"] += 1  # report-only: counted, still added
@@ -1050,6 +1181,26 @@ def main():
             to_release -= 1
             released += 1
     queue = [tuple(q[:6]) for q in queue]
+    # 2026-11-12: leads whose numbers failed, waiting for her yes to trace the next person
+    retrace_names = {}
+    for lid_, f_, l_, why_ in retrace_rows:
+        lead_ = by_id.get(lid_) or {}
+        raw_ = lead_.get("raw") or {}
+        if isinstance(raw_, str):
+            raw_ = json.loads(raw_)
+        conf_, _ = confidence(lead_, raw_)
+        queue.append((lid_, "retrace", why_, conf_, lead_.get("list_count") or 0, days_on_list(lead_)))
+        retrace_names[lid_] = (f_, l_)
+    with conn.cursor() as cur:
+        cur.execute("""select q.lead_id, q.retrace_first, q.retrace_last, q.reason, q.confidence, q.list_count,
+                              q.days_on_list from morbius_skiptrace_queue q join leads l on l.id::text = q.lead_id
+                       where q.status in ('retrace', 'approved') and q.retrace_first is not null
+                         and l.retrace_reason is not null""")
+        for row_ in cur.fetchall():
+            if row_[0] not in retrace_names:
+                queue.append((row_[0], "retrace", row_[3], row_[4], row_[5], row_[6]))
+                retrace_names[row_[0]] = (row_[1], row_[2])
+    c["skiptrace_retrace"] = len(retrace_names)
     c["released_total"] = released
     c["next_batch_at"] = (worked // flow.RELEASE_PER + 1) * flow.RELEASE_PER
     c["skiptrace_urgent"] = sum(1 for q in queue if q[1] == "urgent")
@@ -1069,7 +1220,11 @@ def main():
                                                else excluded.status end,
                                  reason=excluded.reason, confidence=excluded.confidence,
                                  list_count=excluded.list_count, days_on_list=excluded.days_on_list, updated_at=now(),
-                                 alerted_at = case when excluded.status='urgent' then morbius_skiptrace_queue.alerted_at end""", q)
+                                 alerted_at = case when excluded.status in ('urgent', 'retrace')
+                                                   then morbius_skiptrace_queue.alerted_at end""", q)
+            for lid_, (f_, l_) in retrace_names.items():
+                cur.execute("update morbius_skiptrace_queue set retrace_first=%s, retrace_last=%s where lead_id=%s",
+                            (f_, l_, lid_))
         conn.commit()
 
     # ---------- VERIFY: read back up to 10 GHL cards whose lead has a Morbius story
@@ -1109,6 +1264,8 @@ def main():
             c["protected_kept"] += 1
             continue
         to_delete.append((lid, cid, why, "deleted_dead"))
+    for lid, cid in litigator_cards:
+        to_delete.append((lid, cid, "litigator (BatchData): never in GHL -- Tala's rule", "deleted_litigator"))
     seen = {x[1] for x in to_delete}
     for cid in tagged:
         if cid not in seen:
@@ -1164,7 +1321,8 @@ def main():
         tag_on = flow.DELETE_TAG in s["tags"]
         if w and (w[2] or w[3]):
             continue  # she kept it, or it's already gone
-        if s["dnc"] or s["talked"] or s["past_offer"]:
+        if s["dnc"] or s["talked"] or s["past_offer"] or (s["tags"] & {pg.BAD_NUMBER_TAG, pg.IDICORE_TAG,
+                                                                         pg.UNREACHABLE_TAG, pg.BEST_DNC_TAG}):
             if tag_on or w:
                 keep(cid, tag_on)  # never delete a Do Not Call / talked-to / offer-stage contact
                 c["untagged_now_safe"] += 1

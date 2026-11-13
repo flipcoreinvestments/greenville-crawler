@@ -36,6 +36,7 @@ import psycopg2
 
 from lead_common import ensure_schema
 from skiptrace_prep import compute_skiptrace_identity
+from phone_grade import row_person_flags, row_phone_meta
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://izxqrskybwtqzbbbzlux.supabase.co")
 BUCKET = "skiptrace-results"
@@ -67,7 +68,12 @@ def ensure_columns(conn):
                          # 2026-10-16: GHL sync (ghl_sync.py)
                          ("ghl_phone", "text"), ("ghl_in_crm", "boolean"), ("retrace_reason", "text"),
                          ("ghl_contact_id", "text"), ("ghl_seen_at", "timestamptz"), ("ghl_tags", "text[]"),
-                         ("ghl_reset_at", "timestamptz"), ("trace_offers", "jsonb")]:
+                         ("ghl_reset_at", "timestamptz"), ("trace_offers", "jsonb"),
+                         # 2026-11-12 (Tala): BatchData's details on every number (cell/landline,
+                         # reachable, last tied to the person, DNC), the litigator / deceased flags
+                         # on the person traced, and every name ever traced (phone_grade.py)
+                         ("phone_meta", "jsonb"), ("litigator", "boolean"), ("trace_deceased", "boolean"),
+                         ("trace_history", "jsonb")]:
             cur.execute(f"alter table leads add column if not exists {col} {typ}")
         cur.execute("""create table if not exists skiptrace_files (
                          name text primary key, rows_read int, matched int, traced int, failed int,
@@ -203,7 +209,8 @@ def mark_row(cur, row, status, when_label):
         # retrace reason are forgotten too (ghl_sync.py columns).
         cur.execute("""update leads set skiptrace_phones = null, skiptrace_status = null,
                               ghl_phone = null, ghl_in_crm = null, ghl_contact_id = null, ghl_seen_at = null,
-                              ghl_tags = null, retrace_reason = null, ghl_reset_at = now() where id = %s""",
+                              ghl_tags = null, retrace_reason = null, ghl_reset_at = now(),
+                              phone_meta = null, litigator = null, trace_deceased = null where id = %s""",
                     (hit[0],))
     # a lead already marked traced stays traced (a later empty re-run of the
     # same lead never erases phones she already has)
@@ -217,7 +224,34 @@ def mark_row(cur, row, status, when_label):
            where id = %s""",
         (status, json.dumps(inp), hit[0]))
     save_phones(cur, hit[0], row_phones(row))
+    save_meta(cur, hit[0], row, inp)
     return hit[0]
+
+
+def save_meta(cur, lead_id, row, inp=None):
+    """2026-11-12: keep BatchData's details on each number and its flags on the person
+    traced, and remember every name traced (so a retrace never searches the same person).
+    A litigator flag sticks: once flagged, never called (Tala)."""
+    meta = row_phone_meta(row)
+    flags = row_person_flags(row)
+    cur.execute("select coalesce(phone_meta, '{}'::jsonb), coalesce(trace_history, '[]'::jsonb) from leads where id = %s",
+                (lead_id,))
+    old_meta, hist = cur.fetchone() or ({}, [])
+    merged = dict(old_meta or {})
+    merged.update(meta)
+    hist = list(hist or [])
+    if inp and (inp.get("first") or inp.get("last")):
+        k = ((inp.get("first") or "").lower()[:3], (inp.get("last") or "").lower())
+        if not any(((h.get("first") or "").lower()[:3], (h.get("last") or "").lower()) == k for h in hist):
+            hist.append({"first": inp.get("first") or "", "last": inp.get("last") or "",
+                         "file": inp.get("file") or "", "litigator": flags.get("litigator"),
+                         "deceased": flags.get("deceased")})
+    cur.execute("""update leads set phone_meta = %s::jsonb, trace_history = %s::jsonb,
+                          litigator = case when %s is null then litigator else (coalesce(litigator, false) or %s) end,
+                          trace_deceased = coalesce(%s, trace_deceased)
+                   where id = %s""",
+                (json.dumps(merged), json.dumps(hist), flags.get("litigator"), flags.get("litigator"),
+                 flags.get("deceased"), lead_id))
 
 
 def save_phones(cur, lead_id, phones):
@@ -272,6 +306,57 @@ def backfill_phones(conn, key):
                     "on conflict do nothing")
     conn.commit()
     print(f"  phones backfilled from earlier result files: {n} rows")
+    return n
+
+
+def meta_backfill(conn, key):
+    """2026-11-12: BatchData result files put in skiptrace-results/meta/ are read ONCE for
+    the phone details and person flags only -- the lead's trace status, phones and
+    history of what was searched don't change (Tala re-uploaded the Oct 2026 files)."""
+    import requests
+    s = requests.Session()
+    h = {"Authorization": f"Bearer {key}", "apikey": key}
+    r = s.post(f"{SUPABASE_URL}/storage/v1/object/list/{BUCKET}", headers=h,
+               json={"prefix": "meta/", "limit": 1000, "sortBy": {"column": "name", "order": "asc"}}, timeout=60)
+    if r.status_code != 200:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("select name from skiptrace_files")
+        done = {x[0] for x in cur.fetchall()}
+    n = 0
+    for obj in r.json():
+        name = "meta/" + (obj.get("name") or "")
+        if not obj.get("id") or name in done or not name.lower().endswith((".csv", ".xlsx")):
+            continue
+        g = s.get(f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{name}", headers=h, timeout=120)
+        if g.status_code != 200:
+            continue
+        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(name)[1]) as tmp:
+            tmp.write(g.content)
+            tmp.flush()
+            rows = read_rows(tmp.name)
+        m = 0
+        with conn.cursor() as cur:
+            for row in rows:
+                if not row_phone_meta(row) and not row_person_flags(row):
+                    continue
+                addr = re.sub(r"^[^0-9A-Za-z]+", "", _first(row, ADDR_COLS))
+                if not addr:
+                    continue
+                z = re.sub(r"\D", "", _first(row, ZIP_COLS))[:5]
+                cur.execute("""select id from leads where address_core(address) = address_core(%s)
+                                 and (%s = '' or coalesce(zip, '') = '' or zip = %s)
+                               order by is_duplicate, is_sold, list_count desc limit 1""", (addr, z, z))
+                hit = cur.fetchone()
+                if hit:
+                    save_meta(cur, hit[0], row, {"first": _first(row, FIRST_COLS), "last": _first(row, LAST_COLS),
+                                                 "file": name})
+                    m += 1
+            cur.execute("insert into skiptrace_files (name, rows_read, matched, traced, failed) "
+                        "values (%s,%s,%s,0,0) on conflict (name) do nothing", (name, len(rows), m))
+        conn.commit()
+        n += m
+        print(f"  {name}: phone details saved for {m} lead(s)")
     return n
 
 
@@ -341,6 +426,7 @@ def main():
         print("SUPABASE_SERVICE_KEY is not set -- can't read the skiptrace-results bucket")
         return
     backfill_phones(conn, key)
+    meta_backfill(conn, key)
     totals, unmatched = intake(conn, key)
     with conn.cursor() as cur:
         cur.execute("insert into source_runs (source_name, records_found, records_new, notes) "

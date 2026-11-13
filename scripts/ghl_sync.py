@@ -217,6 +217,9 @@ ACTION_ORDER = {"DELETE": 0, "RETRACE": 1, "UPDATE": 2, "NEW": 3}
 
 
 def good_phones(r):
+    # 2026-11-12 (Tala): a litigator (BatchData flag) is never called or put on any list
+    if r.get("litigator"):
+        return []
     bad = set(r.get("bad_phones") or [])
     return [p for p in (r.get("skiptrace_phones") or []) if p and p not in bad]
 

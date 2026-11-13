@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""
+Checks for phone grades, litigators and the bad-number loop (Tala, 2026-11-12).
+Synthetic names and numbers only (the repo is public). No network, no database.
+
+    python tests/test_phone_grade.py
+"""
+import os
+import sys
+from datetime import date
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
+
+import phone_grade as pg  # noqa: E402
+
+fails = []
+TODAY = date(2026, 11, 12)
+
+
+def check(label, cond):
+    if not cond:
+        fails.append(label)
+
+
+row = {
+    "Skiptrace:litigator": "false", "Skiptrace:death.deceased": "true",
+    "Skiptrace:phoneNumbers.0.number": "5550000001", "Skiptrace:phoneNumbers.0.type": "Mobile",
+    "Skiptrace:phoneNumbers.0.reachable": "true", "Skiptrace:phoneNumbers.0.lastReportedDate": "2026-05-01",
+    "Skiptrace:phoneNumbers.0.dnc": "false",
+    "Skiptrace:phoneNumbers.1.number": "(555) 000-0002", "Skiptrace:phoneNumbers.1.type": "Land Line",
+    "Skiptrace:phoneNumbers.1.reachable": "true", "Skiptrace:phoneNumbers.1.lastReportedDate": "2025-01-01",
+    "Skiptrace:phoneNumbers.2.number": "15550000003", "Skiptrace:phoneNumbers.2.type": "Land Line",
+    "Skiptrace:phoneNumbers.2.reachable": "false", "Skiptrace:phoneNumbers.2.lastReportedDate": "2012-03-01",
+    "Skiptrace:phoneNumbers.3.number": "5550000004", "Skiptrace:phoneNumbers.3.type": "Mobile",
+    "Skiptrace:phoneNumbers.3.reachable": "false", "Skiptrace:phoneNumbers.3.lastReportedDate": "2026-01-01",
+}
+meta = pg.row_phone_meta(row)
+check("all four numbers read", set(meta) == {"5550000001", "5550000002", "5550000003", "5550000004"})
+check("rank kept", meta["5550000001"]["rank"] == 1 and meta["5550000004"]["rank"] == 4)
+check("person flags", pg.row_person_flags(row) == {"litigator": False, "deceased": True})
+check("no batchdata columns -> no meta", pg.row_phone_meta({"phone": "5550000001"}) == {})
+
+g = {p: pg.grade(meta[p], TODAY) for p in meta}
+check("fresh reachable cell = A", g["5550000001"] == "A")
+check("reachable landline 2 years = B", g["5550000002"] == "B")
+check("2012 number = D", g["5550000003"] == "D")
+check("unreachable cell = C", g["5550000004"] == "C")
+check("no details = ?", pg.grade({}, TODAY) == "?")
+check("person traced died = D", pg.grade(meta["5550000001"], TODAY, traced_deceased=True) == "D")
+
+order = [p for p, _ in pg.graded(["5550000003", "5550000004", "5550000002", "5550000001"], meta, TODAY)]
+check("best grade first", order == ["5550000001", "5550000002", "5550000004", "5550000003"])
+
+pen, why = pg.confidence_penalty(["5550000001"], meta, TODAY)
+check("A costs nothing", pen == 0)
+pen, why = pg.confidence_penalty(["5550000003"], meta, TODAY)
+check("D costs 35", pen == 35 and "D" in why)
+pen, _ = pg.confidence_penalty([], meta, TODAY)
+check("no callable number costs the most", pen == pg.NO_PHONE_PENALTY)
+
+clean = {"5550000002": True, "5550000004": True}
+check("best number on DNC flagged",
+      pg.best_is_dnc(list(meta), meta, clean, {"5550000001"}, TODAY))
+check("best number clean -> not flagged",
+      not pg.best_is_dnc(list(meta), meta, {"5550000001": True}, set(), TODAY))
+check("best number unchecked (not on registry) -> not flagged",
+      not pg.best_is_dnc(list(meta), meta, clean, set(), TODAY))
+
+contact = {"phone": "+1 555-000-0001"}
+cf = {"phone 2": "5550000002", "phone 3": "5550000004"}
+fb = pg.bad_numbers(contact, dict(cf, **{"call result": "All numbers bad"}), [])
+check("all numbers bad", fb["all_bad"] and fb["bad"] == {"5550000001", "5550000002", "5550000004"})
+fb = pg.bad_numbers(contact, dict(cf, **{"call result": "Wrong person", "working numbers": ["Phone 2"]}), [])
+check("wrong person: unticked numbers bad, ticked kept",
+      fb["wrong_person"] and fb["bad"] == {"5550000001", "5550000004"})
+fb = pg.bad_numbers(contact, dict(cf, **{"call outcome": "Wrong number"}), [])
+check("wrong number outcome, nothing ticked -> Phone 1", fb["bad"] == {"5550000001"})
+fb = pg.bad_numbers(contact, cf, [{"body": "disconnected (555) 000-0004"}])
+check("note naming a number marks that number", fb["bad"] == {"5550000004"})
+fb = pg.bad_numbers(contact, cf, [{"body": "wrong number"}])
+check("plain wrong-number note -> Phone 1", fb["bad"] == {"5550000001"})
+fb = pg.bad_numbers(contact, cf, [{"body": "all numbers disconnected"}])
+check("'all' in a note -> every number", fb["all_bad"])
+fb = pg.bad_numbers(contact, cf, [{"body": "no answer, left vm"}])
+check("no answer is not a bad number", not fb["bad"])
+fb = pg.bad_numbers(contact, dict(cf, **{"working numbers": "Phone 1"}), [{"body": "dropped call on the others"}])
+check("ticked working number never marked bad", "5550000001" not in fb["bad"] and fb["bad"])
+
+cands = pg.trace_candidates(("Pat", "Sample"), "SAMPLE, ROBIN (Applicant); SAMPLE, PAT (Respondent)",
+                            ("Lee", "Sample"), ("Dale", "Sample"), owner_deceased=True)
+check("candidates in order, no dupes, no dead owner",
+      [(f, l) for f, l, _ in cands] == [("Pat", "Sample"), ("Robin", "Sample"), ("Lee", "Sample")])
+nxt = pg.next_trace_target(cands, [("Pat", "Sample")])
+check("next name after the one tried", nxt[:2] == ("Robin", "Sample"))
+check("everyone tried -> None", pg.next_trace_target(cands, [(f, l) for f, l, _ in cands]) is None)
+
+if fails:
+    print("FAILED:\n  " + "\n  ".join(fails))
+    sys.exit(1)
+print("all phone-grade checks passed")
