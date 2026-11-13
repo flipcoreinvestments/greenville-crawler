@@ -569,6 +569,9 @@ BANKRUPT = {}  # lead id -> (chapter, date_filed, case_number), filled in main()
 FLOW_LIVE = False
 
 
+RECHECK_TAG = "check: distress may be gone"
+
+
 def build(lead, d, phones, fields, readded=False, readd_reason=""):
     tags_src = set(lead.get("source_tags") or [])
     owner = owner_trace_names(lead.get("owner_name"))
@@ -657,6 +660,9 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
         tags.append("listed on mls")
     if lead.get("_best_dnc"):
         tags.append(pg.BEST_DNC_TAG)
+    # 2026-11-13 (Tala): the weekly live re-check found at least one problem already gone
+    if lead.get("distress_any_stale"):
+        tags.append(RECHECK_TAG)
     # 2026-11-12 (Tala): the best properties also go into the email campaign (Margaret segments them)
     if (lead.get("email") or "").strip() and conf >= pg.EMAIL_MIN_CONF:
         tags.append(pg.EMAIL_TAG)
@@ -1045,7 +1051,7 @@ def main():
                 if live_map:
                     fill_email(api, cid, lead, contact, c)
                 api.add_tags(cid, tags)
-                stale = {"warm", "hot", "very hot", "verified 95+", pg.BEST_DNC_TAG, pg.EMAIL_TAG} - set(tags)
+                stale = {"warm", "hot", "very hot", "verified 95+", pg.BEST_DNC_TAG, pg.EMAIL_TAG, RECHECK_TAG} - set(tags)
                 api.remove_tags(cid, stale)
                 have = {f.get("id"): f.get("value", f.get("field_value")) for f in (contact.get("customFields") or [])}
                 for k in edits:

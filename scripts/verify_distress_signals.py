@@ -87,15 +87,31 @@ def ensure_columns(conn):
         cur.execute("alter table leads add column if not exists distress_any_stale boolean")
 
 
+# 2026-11-13 (Tala): every lead in GHL and every lead waiting on a skip trace is re-checked
+# against the live county/court sources every week, so she never calls on a problem that's
+# already gone. VERIFY_SCOPE=ghl (default, weekly) or all3 (the old 3+ list sweep, slow).
+SCOPE_SQL = {
+    "ghl": """
+        select l.id, l.address, l.source_tags, l.raw
+        from leads l
+        where coalesce(l.is_sold, false) = false
+          and coalesce(l.is_duplicate, false) = false
+          and (l.id::text in (select lead_id::text from morbius_contacts where deleted_at is null)
+               or l.id::text in (select lead_id from morbius_skiptrace_queue
+                                 where status in ('urgent', 'ready', 'approved', 'retrace')))
+    """,
+    "all3": """
+        select id, address, source_tags, raw
+        from leads
+        where is_sold = false and list_count >= 3
+    """,
+}
+
+
 def get_target_leads(conn):
+    scope = (os.environ.get("VERIFY_SCOPE") or "ghl").strip().lower()
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            """
-            select id, address, source_tags, raw
-            from leads
-            where is_sold = false and list_count >= 3
-            """
-        )
+        cur.execute(SCOPE_SQL.get(scope, SCOPE_SQL["ghl"]))
         return cur.fetchall()
 
 
@@ -198,7 +214,12 @@ def check_probate_case_live(session, case_number):
         return None
     if parsed is None:
         return None
-    return not bool(parsed.get("closed_date"))
+    closed = str(parsed.get("closed_date") or "").strip()
+    # only a real date counts as closed; page text that leaks into the field
+    # (e.g. "Parties Involved ( 2 )") means we couldn't tell
+    if closed and not re.search(r"\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}", closed):
+        return None
+    return not bool(closed)
 
 
 def main():
@@ -213,7 +234,7 @@ def main():
 
     leads = get_target_leads(conn)
     print(f"[{datetime.now(timezone.utc).isoformat()}] Verifying distress signals for "
-          f"{len(leads)} leads on 3+ lists...")
+          f"{len(leads)} leads (scope {os.environ.get('VERIFY_SCOPE') or 'ghl'})...")
 
     print("Pulling live tax sale list...")
     tax_sale_live = build_tax_sale_live_set()
@@ -372,7 +393,7 @@ def main():
     conn.close()
 
     print("=" * 60)
-    print(f"DONE. {len(leads)} leads on 3+ lists checked.")
+    print(f"DONE. {len(leads)} leads checked.")
     print(f"  Fully live (every checkable tag confirmed still active): {all_live}")
     print(f"  At least one stale tag (signal may already be resolved): {any_stale}")
     print(f"  No tag could be checked against a live source:           {could_not_verify}")
