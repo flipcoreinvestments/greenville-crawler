@@ -118,6 +118,20 @@ check("same person, earlier address unknown -> None (can't prove it changed)",
 check("corrected last name -> traced",
       (pg.next_trace_target(pg.trace_candidates(("Pat", "Sampson"), "", None, None, True), [("Pat", "Sample", "x")]) or ("",))[1] == "Sampson")
 
+# Tala 2026-11-14: no PR named -> the heir (family, same last name as the person who died) comes first
+from skiptrace_prep import probate_contact
+_pc = probate_contact({"decedent_name": "SAMPLE , PAT", "parties":
+    "( 2 ) Name: OTHERS , KIM Party Type: Applicant Address: 1 A ST GREER SC 29651 "
+    "Name: SAMPLE , ROBIN Party Type: Respondent Address: 2 B ST TAYLORS SC 29687"})
+check("heir before non-family applicant", _pc[0] == "SAMPLE, ROBIN" and "2 B ST" in _pc[2])
+_pc = probate_contact({"decedent_name": "SAMPLE , PAT", "pr_name": "OTHERS, KIM", "pr_address": "1 A ST GREER SC 29651",
+    "parties": "( 2 ) Name: OTHERS , KIM Party Type: Personal Representative Address: 1 A ST GREER SC 29651 "
+    "Name: SAMPLE , ROBIN Party Type: Respondent Address: 2 B ST TAYLORS SC 29687"})
+check("named PR still first", _pc[0] == "OTHERS, KIM")
+_pc = probate_contact({"decedent_name": "SAMPLE , PAT", "parties":
+    "( 1 ) Name: OTHERS , KIM Party Type: Applicant Address: 1 A ST GREER SC 29651"})
+check("no heir on file -> applicant", _pc[0] == "OTHERS, KIM")
+
 if fails:
     print("FAILED:\n  " + "\n  ".join(fails))
     sys.exit(1)

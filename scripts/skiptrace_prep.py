@@ -156,6 +156,15 @@ def parse_parties(parties_text):
     return out
 
 
+def _decedent_last(name):
+    """Last name from a court-file name ('DOE , JOHN' or 'John Doe')."""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    last = name.split(",")[0] if "," in name else name.split()[-1]
+    return re.sub(r"[^a-z]", "", last.lower())
+
+
 def probate_contact(probate):
     """The person to skip trace on a probate lead: (name, role_label, address)
     or (None, None, None). Uses the parsed PR first (raw.probate.pr_name), then
@@ -163,6 +172,18 @@ def probate_contact(probate):
     applicant / petitioner."""
     probate = probate or {}
     parties = parse_parties(probate.get("parties"))
+    # Tala, 2026-11-14: with no Personal Representative named, the HEIR comes first -- a
+    # family member on the court file (same last name as the person who died) beats a
+    # non-family applicant/affiant.
+    has_pr = probate.get("pr_name") or any(
+        p["role"] in ("personal representative", "successor personal representative") for p in parties)
+    dec_last = _decedent_last(probate.get("decedent_name"))
+    if not has_pr and dec_last:
+        for role in CONTACT_ROLES + ["respondent", "other"]:
+            for p in parties:
+                if (p["role"] == role and not owner_is_entity(p["name"])
+                        and _decedent_last(p["name"]) == dec_last):
+                    return p["name"], ROLE_LABELS[role], p["address"]
     for role in CONTACT_ROLES:
         for p in parties:
             if p["role"] == role and not owner_is_entity(p["name"]):
