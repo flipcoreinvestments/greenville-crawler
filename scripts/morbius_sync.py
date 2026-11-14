@@ -59,7 +59,7 @@ import requests
 from export_call_lists import OPEN_ERRORS, clean_phones, lead_rows, load_tax_sale_info, needs_retrace, open_errors, to_csv
 from ghl_sync import good_phones
 from skiptrace_prep import (NO_PR_NOTE, PR_NO_ADDRESS_NOTE, PRE_PROBATE_NOTE, compute_skiptrace_identity, owner_trace_names,
-                            probate_heirs)
+                            probate_contact, probate_heirs)
 from lead_common import owner_is_entity
 import morbius_flow as flow
 import phone_grade as pg
@@ -585,6 +585,32 @@ FLOW_LIVE = False
 RECHECK_TAG = "check: distress may be gone"
 
 
+def _fmt_phone(p):
+    digits = "".join(ch for ch in str(p or "") if ch.isdigit())[-10:]
+    return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}" if len(digits) == 10 else str(p or "")
+
+
+def who_to_call_line(lead, raw, probate, owner, call_first, call_last, phones, meta, dec):
+    """Tala, 2026-11-14: when the person to call isn't the name on the contact card, the story
+    opens with who to call, how they're tied to the property, and their best number."""
+    if not (call_first or call_last):
+        return ""
+    if (pg._key(call_first, call_last) == pg._key(owner.get("first"), owner.get("last"))):
+        return ""
+    who = nice_name(f"{call_first} {call_last}".strip())
+    if probate:
+        _, role, _ = probate_contact(raw.get("probate") or {})
+        dec_name = nice_name((raw.get("probate") or {}).get("decedent_name") or lead.get("owner_name") or "")
+        rel = f"{role or 'family contact'} on the estate of {dec_name}"
+        if (call_last or "").lower() == (owner.get("last") or "").lower():
+            rel += " (same last name, likely family)"
+    else:
+        rel = "tied to the property on the deed"
+    best = next((p_ for p_, _g in pg.graded(phones, meta, traced_deceased=dec)), None)
+    num = _fmt_phone(best) if best else "no number yet"
+    return f"WHO TO CALL: {who}, {rel}. Best number: {num}."
+
+
 def build(lead, d, phones, fields, readded=False, readd_reason=""):
     tags_src = set(lead.get("source_tags") or [])
     owner = owner_trace_names(lead.get("owner_name"))
@@ -627,6 +653,9 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
 
     conf, why = confidence(lead, raw)
     story = (lead.get("story") or d.get("Call Brief") or "").strip()
+    who = who_to_call_line(lead, raw, probate, owner, call_first, call_last, phones, meta, dec)
+    if who:
+        story = who + "\n\n" + story
     cf = {
         "crawler id": str(lead["id"]),
         "confidence": conf,
