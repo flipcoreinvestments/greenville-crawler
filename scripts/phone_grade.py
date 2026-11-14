@@ -8,11 +8,15 @@ last tied to that person -- and flags known TCPA litigators and owners who have
 died. The intake used to keep only the digits, so Morbius could not tell a
 2010 landline from a live cell. Her rules:
 
-  1. Every number gets a grade for how likely it is to reach the person:
-       A  cell, reachable, tied to the person in the last 18 months
-       B  reachable and tied to the person in the last 3 years
-       C  not reachable lately, or BatchData gave no details
-       D  last tied to the person more than 3 years ago, or the person traced has died
+  1. Every number gets a grade for how likely it is to reach the person
+     (re-weighted 2026-11-13, Tala: "if they answered it this year it's an A and every
+     year after that it goes down"):
+       by the year BatchData last saw the number with that person
+         this year = A, last year = B, two years ago = C, three or more = D
+       then: not reachable lately -> one grade lower; a landline can't be an A;
+       the person traced has died -> D; no date at all -> ? (unknown).
+     A grade only says the line is likely live. A number that reached the WRONG person
+     is marked bad from her call results and never used again, whatever its grade.
      The best grade is Phone 1. The grade feeds Confidence so the freshest,
      most reachable leads sit at the top.
   2. Litigators (people who sue over calls) never go into GHL, never on a list.
@@ -35,8 +39,6 @@ GRADE_SCORE = {"A": 100, "B": 70, "C": 40, "?": 40, "D": 10}
 # what the best callable number's grade takes off Confidence
 CONF_PENALTY = {"A": 0, "B": 10, "C": 20, "?": 20, "D": 35}
 NO_PHONE_PENALTY = 35
-FRESH_DAYS = 548        # 18 months
-OK_DAYS = 3 * 365
 
 IDICORE_TAG = "idicore search"
 UNREACHABLE_TAG = "unreachable"
@@ -114,16 +116,33 @@ def grade(meta, today=None, traced_deceased=False):
         return "?"
     today = today or date.today()
     d = _date(meta.get("last_reported"))
-    age = (today - d).days if d else None
-    if age is not None and age > OK_DAYS:
-        return "D"
-    mobile = (meta.get("type") or "").lower().startswith("mobile") or (meta.get("type") or "").lower() == "wireless"
-    reach = meta.get("reachable")
-    if mobile and reach is True and age is not None and age <= FRESH_DAYS:
-        return "A"
-    if reach is True and age is not None and age <= OK_DAYS:
-        return "B"
-    return "C"
+    if d is None:
+        return "?"
+    years = max(0, today.year - d.year)
+    g = min(years, 3)                       # 0=A 1=B 2=C 3=D
+    if meta.get("reachable") is False:
+        g = min(g + 1, 3)
+    t = (meta.get("type") or "").lower()
+    landline = bool(t) and not (t.startswith("mobile") or t in ("wireless", "cell"))
+    if landline and g == 0:
+        g = 1
+    return "ABCD"[g]
+
+
+def deleted_numbers(written, card):
+    """Numbers Morbius put on the card that are no longer anywhere on it = Tala deleted them
+    (2026-11-13: she deletes bad numbers by hand). written: what Morbius last wrote
+    ({"phone": ..., "cf:phone 2": ...}); card: set of digits on the card now."""
+    had = {_norm_phone((written or {}).get("phone"))}
+    for k, v in (written or {}).items():
+        if k.lower().startswith("cf:phone "):
+            had.add(_norm_phone(v))
+    return {p for p in had if p} - set(card or ())
+
+
+def has_phone_digits(name):
+    """A name field holding a phone number (7+ digits) -- a bad import, never a real name."""
+    return len(re.sub(r"\D", "", str(name or ""))) >= 7
 
 
 def graded(phones, meta, today=None, traced_deceased=False):
