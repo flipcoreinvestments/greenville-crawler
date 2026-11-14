@@ -642,6 +642,9 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
     }
     for i, p in enumerate(phones[1:5], start=2):
         cf[f"phone {i}"] = p
+    # 2026-11-13 (Tala): probate court details into the Probate folder (Flo Rida's fields)
+    if probate:
+        cf.update(probate_fields(raw.get("probate") or {}, d, phones))
     yo = years_owned(d)
     if yo is not None:
         cf["years owned"] = yo
@@ -693,6 +696,31 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
     return body, tags, call_line
 
 
+def _iso(v):
+    try:
+        return datetime.strptime(str(v or "").strip(), "%m/%d/%Y").date().isoformat()
+    except ValueError:
+        return ""
+
+
+def probate_fields(pr, d, phones):
+    """Probate case -> the GHL Probate folder fields. Only facts from the court record:
+    PR relationship and creditor deadline stay blank (the case file doesn't give them).
+    PR Phone = Phone 1 only when the number was traced for the Personal Representative."""
+    sub = (pr.get("case_subtype") or "").lower()
+    will = "Will" if "testate" in sub and "intestate" not in sub else ("No will" if "intestate" in sub else "Unknown")
+    pr_name = d.get("Personal Representative") or pr.get("pr_name") or ""
+    out = {
+        "personal representative": nice_name(pr_name) if pr_name else "",
+        "probate case number": (pr.get("case_number") or "").strip(),
+        "will": will,
+        "date of death": _iso(pr.get("date_of_death")),
+    }
+    if pr_name and phones:
+        out["pr phone"] = phones[0]
+    return {k: v for k, v in out.items() if v}
+
+
 def other_property_text(o):
     """One owner, several distressed properties, one GHL card (2026-11-11, Tala): each extra
     property gets its own score, signals, deadline and story under 'Other Properties Owned',
@@ -720,8 +748,13 @@ def _norm(k, v):
     if isinstance(v, list):
         v = ", ".join(str(x) for x in v)
     v = str(v if v is not None else "").strip()
-    if k == "phone" or k.startswith("phone "):
+    if k == "phone" or k.startswith("phone ") or k == "pr phone":
         return "".join(ch for ch in v if ch.isdigit())[-10:]
+    if k in ("date of death", "creditor deadline"):
+        # GHL hands date fields back as epoch milliseconds or ISO text: compare the day
+        if v.isdigit() and len(v) >= 12:
+            return datetime.fromtimestamp(int(v) / 1000, tz=timezone.utc).date().isoformat()
+        return v[:10]
     try:
         f = float(v.replace(",", "").replace("$", ""))
         return str(int(f)) if f == int(f) else str(f)
@@ -812,6 +845,14 @@ def main():
     load_tax_sale_info(conn)
     api = GHL(a.live)
     fields = api.custom_fields()
+    if "probate case number" not in fields:  # Flo Rida's label may be "Probate Case #" etc.
+        alt_ = next((n for n in fields if "case" in n and ("probate" in n or "#" in n)), None)
+        if alt_:
+            fields["probate case number"] = fields[alt_]
+            print(f"Probate case number field found as '{alt_}'")
+    miss_ = [n for n in ("personal representative", "pr phone", "probate case number", "will", "date of death")
+             if n not in fields]
+    print("Probate fields in GHL: " + ("all found" if not miss_ else "MISSING " + ", ".join(miss_)))
     missing = [n for n in ("crawler id", "their story", "skip trace info") if n not in fields]
     if missing:
         print(f"Missing custom fields in GHL: {', '.join(missing)} -- run Morbius setup first.")
@@ -901,6 +942,14 @@ def main():
             cf_ = {id_name_.get(fid, ""): val for fid, val in have_.items()}
             s["numbers"] = pg.bad_numbers(contact, cf_, notes_)
             s["card_numbers"] = set(pg.card_numbers(contact, cf_).values())
+            # 2026-11-13 (Tala): she deletes bad numbers off the card by hand -- a number Morbius
+            # wrote that's gone from the card is bad for good (never re-added in another slot)
+            gone_ = pg.deleted_numbers(m.get("written"), s["card_numbers"])
+            if gone_:
+                fb_ = s["numbers"]
+                fb_["bad"] = set(fb_.get("bad") or set()) | gone_
+                fb_.setdefault("reasons", []).append("you deleted " + ", ".join(sorted(gone_)) + " from the card")
+                c["deleted_by_tala"] = c.get("deleted_by_tala", 0) + len(gone_)
             s["added_at"] = m.get("created_at")
             s["tags"] = {t.strip().lower() for t in contact.get("tags") or []}
             s["lead_id"] = lid
@@ -1047,6 +1096,12 @@ def main():
                 prev = m.get("written") or {}
                 # once Tala edits a field it stays hers forever (locked), not just for one run
                 edits = her_edits(contact, prev, fields) | set(prev.get("_locked") or [])
+                # 2026-11-13 (Tala): a phone number in a name field is a bad import, never her edit --
+                # put the deed name back
+                for k_ in ("firstName", "lastName"):
+                    if pg.has_phone_digits(contact.get(k_)) and not pg.has_phone_digits(body.get(k_)):
+                        edits.discard(k_)
+                        c["names_with_number_fixed"] = c.get("names_with_number_fixed", 0) + 1
                 upd = {k: v for k, v in body.items() if k not in edits and k != "source"}
                 upd["customFields"] = [f for f in body["customFields"]
                                        if "cf:" + id_to_name.get(f["id"], "") not in edits]

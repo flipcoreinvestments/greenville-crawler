@@ -42,15 +42,27 @@ check("person flags", pg.row_person_flags(row) == {"litigator": False, "deceased
 check("no batchdata columns -> no meta", pg.row_phone_meta({"phone": "5550000001"}) == {})
 
 g = {p: pg.grade(meta[p], TODAY) for p in meta}
-check("fresh reachable cell = A", g["5550000001"] == "A")
-check("reachable landline 2 years = B", g["5550000002"] == "B")
+check("seen this year, reachable cell = A", g["5550000001"] == "A")
+check("landline seen last year = B", g["5550000002"] == "B")
 check("2012 number = D", g["5550000003"] == "D")
-check("unreachable cell = C", g["5550000004"] == "C")
+check("cell seen this year but not reachable = B (one lower)", g["5550000004"] == "B")
 check("no details = ?", pg.grade({}, TODAY) == "?")
+check("no date = ?", pg.grade({"type": "Mobile", "reachable": True}, TODAY) == "?")
 check("person traced died = D", pg.grade(meta["5550000001"], TODAY, traced_deceased=True) == "D")
+check("landline seen this year can't be A", pg.grade({"type": "Land Line", "reachable": True,
+                                                      "last_reported": "2026-09-22"}, TODAY) == "B")
+check("2024 = C", pg.grade({"type": "Mobile", "reachable": True, "last_reported": "2024-12-31"}, TODAY) == "C")
+check("2023 = D", pg.grade({"type": "Mobile", "reachable": True, "last_reported": "2023-12-31"}, TODAY) == "D")
+check("2025 not reachable = C", pg.grade({"type": "Mobile", "reachable": False,
+                                         "last_reported": "2025-06-01"}, TODAY) == "C")
 
 order = [p for p, _ in pg.graded(["5550000003", "5550000004", "5550000002", "5550000001"], meta, TODAY)]
-check("best grade first", order == ["5550000001", "5550000002", "5550000004", "5550000003"])
+check("best grade first, ties by BatchData rank", order == ["5550000001", "5550000002", "5550000004", "5550000003"])
+
+check("deleted numbers found", pg.deleted_numbers({"phone": "+15550000001", "cf:phone 2": "(555) 000-0002"},
+                                                  {"5550000002"}) == {"5550000001"})
+check("nothing deleted", pg.deleted_numbers({"phone": "5550000001"}, {"5550000001"}) == set())
+check("phone in a name field", pg.has_phone_digits("864-555-0101") and not pg.has_phone_digits("Mary Jo"))
 
 pen, why = pg.confidence_penalty(["5550000001"], meta, TODAY)
 check("A costs nothing", pen == 0)
