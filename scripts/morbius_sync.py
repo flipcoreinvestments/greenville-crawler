@@ -58,7 +58,9 @@ import requests
 
 from export_call_lists import OPEN_ERRORS, clean_phones, lead_rows, load_tax_sale_info, needs_retrace, open_errors, to_csv
 from ghl_sync import good_phones
-from skiptrace_prep import compute_skiptrace_identity, owner_trace_names, probate_heirs
+from skiptrace_prep import (NO_PR_NOTE, PR_NO_ADDRESS_NOTE, PRE_PROBATE_NOTE, compute_skiptrace_identity, owner_trace_names,
+                            probate_heirs)
+from lead_common import owner_is_entity
 import morbius_flow as flow
 import phone_grade as pg
 import never_call
@@ -1005,16 +1007,19 @@ def main():
             raw_ = lead.get("raw") or {}
             if isinstance(raw_, str):
                 raw_ = json.loads(raw_)
-            sf, sl, _, _ = compute_skiptrace_identity(lead, list(tags_))
+            sf, sl, sa, _ = compute_skiptrace_identity(lead, list(tags_))
             own = owner_trace_names(lead.get("owner_name"))
             prob = raw_.get("probate") or {}
             heirs_ = probate_heirs(prob, prob.get("pr_name"), lead.get("owner_name")) if prob else ""
             cands = pg.trace_candidates((sf, sl), heirs_, (own.get("first2"), own.get("last2")),
                                         (own.get("first"), own.get("last")),
-                                        bool(tags_ & PROBATE_TAGS) or bool(lead.get("trace_deceased")))
-            tried = [(h.get("first"), h.get("last")) for h in (lead.get("trace_history") or [])]
+                                        bool(tags_ & PROBATE_TAGS) or bool(lead.get("trace_deceased")),
+                                        system_address=sa)
+            # Tala, 2026-11-14: never re-trace the same information -- a name already searched
+            # comes back only with a corrected name or a new address
+            tried = [(h.get("first"), h.get("last"), h.get("address")) for h in (lead.get("trace_history") or [])]
             inp_ = lead.get("skiptrace_input") or {}
-            tried.append((inp_.get("first"), inp_.get("last")))
+            tried.append((inp_.get("first"), inp_.get("last"), inp_.get("address")))
             nxt_ = pg.next_trace_target(cands, tried)
             if nxt_:
                 retrace_ = (f"Numbers didn't reach the right person ({reason}). Next: trace "
@@ -1266,8 +1271,10 @@ def main():
         cur.execute("select value from morbius_state where key='released'")
         r_ = cur.fetchone()
         released = r_[0] if r_ else 0
-        cur.execute("select lead_id from morbius_skiptrace_queue where status in ('ready','approved')")
-        already_ready = {x[0] for x in cur.fetchall()}
+        cur.execute("select lead_id, status from morbius_skiptrace_queue where status in ('ready','approved')")
+        q_rows_ = cur.fetchall()
+        already_ready = {x[0] for x in q_rows_}
+        only_ready = {x[0] for x in q_rows_ if x[1] == "ready"}
     c["called_or_updated"] = worked
     # Tala's rule (2026-11-10): every 50 leads called/updated releases the next 50 hottest untraced
     # leads -- but nothing is released while 100+ leads are behind on follow-up (urgent ones still are).
@@ -1311,6 +1318,26 @@ def main():
                     why.append(f"{label} {dd:%m/%d/%Y}")
                 soon = min(soon or dd, dd)
         lid = str(lead["id"])
+        # 2026-11-14 (Tala, Team Brain section 13): only a lead with a living person and a clean
+        # First + Last name can be released or asked about; the rest wait (purple) with the reason.
+        tags_r = list(lead.get("source_tags") or [])
+        tf_, tl_, _, note_ = compute_skiptrace_identity(lead, tags_r)
+        prob_r = raw.get("probate") or {}
+        block = flow.trace_block_reason(
+            first=tf_, last=tl_, owner_name=lead.get("owner_name"), address=lead.get("address"),
+            owner_is_entity=owner_is_entity(lead.get("owner_name")),
+            no_pr=note_ == NO_PR_NOTE, pre_probate=note_ == PRE_PROBATE_NOTE,
+            deceased=bool(lead.get("trace_deceased")) and "probate" not in tags_r,
+            estate_closed=bool(prob_r.get("closed_date")), contact_no_address=note_ == PR_NO_ADDRESS_NOTE)
+        if block:
+            c["held_not_traceable"] = c.get("held_not_traceable", 0) + 1
+            if lid in only_ready and not paused:
+                # released earlier but can't be traced: back on hold, and its slot goes to a traceable lead
+                released = max(0, released - 1)
+                to_release += 1
+            queue.append([lid, "purple", f"Not traceable yet: {block}",
+                          conf, lc, days, (2, 999, -conf, -lc, -days)])  # 2 = never auto-released
+            continue
         status = "urgent" if urgent else ("ready" if lid in already_ready else "purple")
         # hottest first: urgent, then the nearest deadline, Confidence, lists, days on list
         rank = (0 if urgent else 1, (soon - today).days if soon else 999, -conf, -lc, -days)

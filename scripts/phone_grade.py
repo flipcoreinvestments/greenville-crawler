@@ -297,7 +297,7 @@ def split_person(name):
     return parts[0].title(), parts[-1].title()
 
 
-def trace_candidates(system_person, heirs_text, co_owner, owner, owner_deceased):
+def trace_candidates(system_person, heirs_text, co_owner, owner, owner_deceased, system_address=None):
     """Everyone tied to the property, in the order Tala wants them traced:
     the system's person (Personal Representative on a probate), each heir on the
     court file, a co-owner on the deed, then the owner (only if not deceased).
@@ -315,6 +315,8 @@ def trace_candidates(system_person, heirs_text, co_owner, owner, owner_deceased)
 
     if system_person:
         add(system_person[0], system_person[1], "the person to call")
+        if out and system_address:
+            out[0] = out[0] + (system_address,)
     for chunk in (heirs_text or "").split(";"):
         f, l = split_person(chunk)
         add(f, l, "heir on the probate file")
@@ -325,10 +327,31 @@ def trace_candidates(system_person, heirs_text, co_owner, owner, owner_deceased)
     return out
 
 
+def _addr_key(addr):
+    return re.sub(r"[^a-z0-9]", "", (addr or "").lower())
+
+
 def next_trace_target(candidates, tried):
-    """First candidate not traced yet. tried: [(first, last)]. None = everyone tried."""
-    done = {_key(f, l) for f, l in tried}
-    for f, l, why in candidates:
-        if _key(f, l) not in done:
+    """First candidate whose search would be NEW information.
+
+    Tala, 2026-11-14: never re-trace the same information twice. A person already
+    traced comes back only when something changed -- a corrected name (a different
+    name key) or a different address than every address already searched for them.
+    candidates: (first, last, why) or (first, last, why, address).
+    tried: (first, last) or (first, last, address). Returns (first, last, why) or None."""
+    seen = {}
+    for t in tried:
+        f, l = t[0], t[1]
+        a = t[2] if len(t) > 2 else None
+        seen.setdefault(_key(f, l), set()).add(_addr_key(a) if a else None)
+    for c in candidates:
+        f, l, why = c[0], c[1], c[2]
+        a = c[3] if len(c) > 3 else None
+        k = _key(f, l)
+        if k not in seen:
             return f, l, why
+        addrs = seen[k]
+        # same person: only if we have a new address AND we know every address used before
+        if a and None not in addrs and _addr_key(a) not in addrs:
+            return f, l, why + " (new address)"
     return None

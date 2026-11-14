@@ -252,3 +252,35 @@ def is_urgent(conf, n_sources, past_deadline_reason):
 
 def earned_release(worked):
     return (worked // RELEASE_PER) * RELEASE_SIZE
+
+
+# 2026-11-14 (Tala, Team Brain section 13): the release only hands out leads that can
+# actually be traced -- a living person with a clean First + Last name. The Nov 14 release
+# picked 50 by Confidence and 43 of them had no Personal Representative named.
+_UNIT_RE = re.compile(r"(\bUNIT\b|\bAPT\b|\bAPARTMENT\b|\bSTE\b|\bSUITE\b|#\s*\w)", re.I)
+_TRUST_RE = re.compile(r"\b(TRUST|TRUSTEES?|TRS)\b|\bL[/-]E(ST)?\b|\bLIFE\s+ESTATE\b", re.I)  # not "LE": a real surname
+_NAME_OK = re.compile(r"^[A-Za-z][A-Za-z'\-]+$")
+
+
+def trace_block_reason(*, first, last, owner_name, address, owner_is_entity,
+                       no_pr, pre_probate, deceased, estate_closed, contact_no_address=False):
+    """None when the lead may be released for tracing, else a short plain reason.
+    Probate: the court file's contact person (PR, or the applicant/affiant who filed) is
+    traced at the address on the court file -- never the dead owner, never a guess."""
+    if no_pr:
+        return "probate with no living contact named on the court file yet"
+    if contact_no_address:
+        return "court file names a contact but no address for them"
+    if estate_closed:
+        return "estate already closed"
+    if pre_probate or deceased:
+        return "owner has died and no Personal Representative is named"
+    if owner_is_entity:
+        return "owned by a business, church or bank"
+    if _TRUST_RE.search(owner_name or ""):
+        return "owned by a trust or life estate"
+    if _UNIT_RE.search(address or ""):
+        return "condo or apartment unit"
+    if not (first and last and _NAME_OK.match(first) and _NAME_OK.match(last)):
+        return "no clean First + Last name to trace"
+    return None
