@@ -107,6 +107,17 @@ nxt = pg.next_trace_target(cands, [("Pat", "Sample")])
 check("next name after the one tried", nxt[:2] == ("Robin", "Sample"))
 check("everyone tried -> None", pg.next_trace_target(cands, [(f, l) for f, l, _ in cands]) is None)
 
+# Tala 2026-11-14: never re-trace the same information; a person comes back only with a new address
+c2 = pg.trace_candidates(("Pat", "Sample"), "", None, None, owner_deceased=True, system_address="12 Court Rd, Greer SC")
+check("same person, same address -> None",
+      pg.next_trace_target(c2, [("Pat", "Sample", "12 COURT RD, GREER SC")]) is None)
+check("same person, new address -> traced again",
+      (pg.next_trace_target(c2, [("Pat", "Sample", "5 Old House Ln, Greenville SC")]) or ("",))[0] == "Pat")
+check("same person, earlier address unknown -> None (can't prove it changed)",
+      pg.next_trace_target(c2, [("Pat", "Sample")]) is None)
+check("corrected last name -> traced",
+      (pg.next_trace_target(pg.trace_candidates(("Pat", "Sampson"), "", None, None, True), [("Pat", "Sample", "x")]) or ("",))[1] == "Sampson")
+
 if fails:
     print("FAILED:\n  " + "\n  ".join(fails))
     sys.exit(1)

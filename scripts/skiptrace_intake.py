@@ -241,9 +241,14 @@ def save_meta(cur, lead_id, row, inp=None):
     merged.update(meta)
     hist = list(hist or [])
     if inp and (inp.get("first") or inp.get("last")):
-        k = ((inp.get("first") or "").lower()[:3], (inp.get("last") or "").lower())
-        if not any(((h.get("first") or "").lower()[:3], (h.get("last") or "").lower()) == k for h in hist):
+        # 2026-11-14: the address searched is remembered too, so the same person is only
+        # traced again when the address (or the name) actually changed
+        k = ((inp.get("first") or "").lower()[:3], (inp.get("last") or "").lower(),
+             re.sub(r"[^a-z0-9]", "", (inp.get("address") or "").lower()))
+        if not any(((h.get("first") or "").lower()[:3], (h.get("last") or "").lower(),
+                    re.sub(r"[^a-z0-9]", "", (h.get("address") or "").lower())) == k for h in hist):
             hist.append({"first": inp.get("first") or "", "last": inp.get("last") or "",
+                         "address": inp.get("address") or "",
                          "file": inp.get("file") or "", "litigator": flags.get("litigator"),
                          "deceased": flags.get("deceased")})
     cur.execute("""update leads set phone_meta = %s::jsonb, trace_history = %s::jsonb,

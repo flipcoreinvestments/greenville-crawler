@@ -108,6 +108,27 @@ check("not urgent: deadline passed", f.is_urgent(100, 3, "sale date passed"), Fa
 for worked, want in [(0, 0), (49, 0), (50, 50), (99, 50), (100, 100), (230, 200)]:
     check(f"release at {worked} worked", f.earned_release(worked), want)
 
+# ---------------------------------------------------------------- traceable (Tala, Nov 14, section 13)
+def tb(**kw):
+    base = dict(first="Mary", last="Sample", owner_name="SAMPLE MARY", address="12 Test St",
+                owner_is_entity=False, no_pr=False, pre_probate=False, deceased=False, estate_closed=False)
+    base.update(kw)
+    return f.trace_block_reason(**base)
+check("clean living owner -> releasable", tb(), None)
+check("probate, no PR -> held", bool(tb(no_pr=True)), True)
+check("court contact with no address -> held", bool(tb(contact_no_address=True)), True)
+check("pre-probate -> held", bool(tb(pre_probate=True)), True)
+check("closed estate -> held", bool(tb(estate_closed=True)), True)
+check("LLC owner -> held", bool(tb(owner_is_entity=True)), True)
+check("trust owner -> held", bool(tb(owner_name="SAMPLE MARY TRUST")), True)
+check("county 'L-EST' life estate -> held", bool(tb(owner_name="SAMPLE ARTHUR (L-EST)")), True)
+check("life estate -> held", bool(tb(owner_name="SAMPLE MARY L/E")), True)
+check("condo unit -> held", bool(tb(address="400 Test Ave Unit 12")), True)
+check("blank last name -> held", bool(tb(last="")), True)
+check("garbled name -> held", bool(tb(first="M.", last="S")), True)
+check("surname Le is a person, not a life estate", tb(last="Le", owner_name="LE MARY"), None)
+check("hyphenated last name ok", tb(last="Sample-Jones"), None)
+
 if fails:
     print("FAILED:\n  " + "\n  ".join(fails))
     sys.exit(1)
