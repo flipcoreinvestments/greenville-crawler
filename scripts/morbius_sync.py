@@ -108,7 +108,14 @@ class GHL:
     def custom_fields(self):
         r = self._req("GET", f"/locations/{LOC}/customFields", params={"model": "contact"})
         r.raise_for_status()
-        return {f["name"].strip().lower(): f["id"] for f in r.json().get("customFields", [])}
+        out, self.ids_by_name = {}, {}
+        for f in r.json().get("customFields", []):
+            n = f["name"].strip().lower()
+            out[n] = f["id"]
+            # two fields can share a name once lowercased ("Call attempts" from the Power Dialer and
+            # "Call Attempts" from her Manual Calls box) -- keep every id so neither is lost
+            self.ids_by_name.setdefault(n, []).append(f["id"])
+        return out
 
     def sellers_stage(self):
         """-> (pipeline id, first stage id, ids of the 'offer' stage and every stage after it)."""
@@ -928,10 +935,13 @@ def main():
             have_ = {f.get("id"): f.get("value", f.get("field_value")) for f in (contact.get("customFields") or [])}
 
             def num_(name):
-                try:
-                    return float(str(have_.get(fields.get(name)) or 0).replace(",", ""))
-                except ValueError:
-                    return 0
+                best = 0
+                for fid in getattr(api, "ids_by_name", {}).get(name) or [fields.get(name)]:
+                    try:
+                        best = max(best, float(str(have_.get(fid) or 0).replace(",", "")))
+                    except ValueError:
+                        pass
+                return best
             # the Power Dialer keeps its own count in "Call attempts"; Confidence sets its wait (2 or 3 days)
             notes_ = api.notes(cid)
             s = flow.summarize(contact, api.opportunities(cid), notes_, api.call_log(cid),
@@ -950,6 +960,12 @@ def main():
                 fb_["bad"] = set(fb_.get("bad") or set()) | gone_
                 fb_.setdefault("reasons", []).append("you deleted " + ", ".join(sorted(gone_)) + " from the card")
                 c["deleted_by_tala"] = c.get("deleted_by_tala", 0) + len(gone_)
+            # 2026-11-14 (Tala): she hand-dials from her own phone, so those calls never reach GHL's
+            # call log. A Call Result or Last Called on the card, or a number she deleted from it,
+            # means she worked this lead -- count it toward the next release.
+            if (str(cf_.get("call result") or "").strip() or str(cf_.get("call outcome") or "").strip()
+                    or cf_.get("last called") or gone_):
+                s["worked"] = True
             s["added_at"] = m.get("created_at")
             s["tags"] = {t.strip().lower() for t in contact.get("tags") or []}
             s["lead_id"] = lid
