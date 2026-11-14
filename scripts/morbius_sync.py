@@ -61,6 +61,7 @@ from ghl_sync import good_phones
 from skiptrace_prep import compute_skiptrace_identity, owner_trace_names, probate_heirs
 import morbius_flow as flow
 import phone_grade as pg
+import never_call
 from morbius_flow import deed_name
 
 BASE = "https://services.leadconnectorhq.com"
@@ -158,6 +159,9 @@ class GHL:
     def remove_tags(self, cid, tags):
         if tags:
             self._req("DELETE", f"/contacts/{cid}/tags", write=True, json={"tags": sorted(set(tags))})
+
+    def add_note(self, cid, body):
+        self._req("POST", f"/contacts/{cid}/notes", write=True, json={"body": body})
 
     def has_notes(self, cid):
         return bool(self.notes(cid))
@@ -861,7 +865,8 @@ def main():
     c = dict(new=0, linked_existing=0, updated=0, kept_her_edit=0, retrace=0, deleted_dead=0,
              deleted_tagged=0, protected_kept=0, skipped_no_clean_phone=0, readded=0, errors=0,
              emails_added=0, email_skipped=0, litigators_blocked=0, deleted_litigator=0, held_best_dnc=0,
-             bad_numbers_found=0, retrace_next_name=0, idicore_search=0, unreachable=0)
+             bad_numbers_found=0, retrace_next_name=0, idicore_search=0, unreachable=0,
+             never_call_removed=0, never_call_dnd=0)
     litigator_cards = []
     new_budget = a.limit if a.limit >= 0 else 10 ** 9
     edit_keys = {}
@@ -895,6 +900,7 @@ def main():
             id_name_ = {v: k for k, v in fields.items()}
             cf_ = {id_name_.get(fid, ""): val for fid, val in have_.items()}
             s["numbers"] = pg.bad_numbers(contact, cf_, notes_)
+            s["card_numbers"] = set(pg.card_numbers(contact, cf_).values())
             s["added_at"] = m.get("created_at")
             s["tags"] = {t.strip().lower() for t in contact.get("tags") or []}
             s["lead_id"] = lid
@@ -1112,6 +1118,64 @@ def main():
             conn.rollback()
             c["errors"] += 1
             print(f"  lead skipped: {type(e).__name__}: {str(e)[:120]}")
+
+    # ---------- NEVER-CALL NUMBERS (2026-11-14, Tala): a number on phone_suppression (STOP replies,
+    # "wrong number" texts, anything she says must never be called) comes off every card. Phone 2-5 are
+    # cleared, Phone 1 is replaced by the best good number, and a card with no good number left gets
+    # Do Not Disturb. This overrides her own edits to those phone fields: it's a safety rule.
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('public.phone_suppression') is not null")
+        if cur.fetchone()[0]:
+            cur.execute("select phone from phone_suppression")
+            blocked = {x[0] for x in cur.fetchall()}
+        else:
+            blocked = set()
+    for cid, s in activity.items():
+        if not (s.get("card_numbers") or set()) & blocked:
+            continue
+        try:
+            contact = api.get_contact(cid)
+            if contact is None:
+                continue
+            id_name_ = {v: k for k, v in fields.items()}
+            cf_ = {id_name_.get(f.get("id"), ""): f.get("value", f.get("field_value"))
+                   for f in (contact.get("customFields") or [])}
+            lead = by_id.get(s["lead_id"]) or {}
+            good_ = [p for p, _g in pg.graded([p for p in good_phones(lead) if ok.get(p)],
+                                               lead.get("phone_meta") or {},
+                                               traced_deceased=bool(lead.get("trace_deceased")))]
+            p_ = never_call.plan(contact, cf_, blocked, good_)
+            if not p_:
+                continue
+            body_ = never_call.update_body(p_, fields)
+            if body_:
+                api.update_contact(cid, body_)
+            api.add_tags(cid, [never_call.NEVER_CALL_TAG])
+            api.add_note(cid, never_call.note_text(p_))
+            c["never_call_removed"] += len(p_["removed"])
+            c["never_call_dnd"] += 1 if p_["dnd"] else 0
+            if a.live:
+                # keep `written` in step so these changes are never mistaken for her edits
+                patch_ = {"cf:" + name: "" for name in p_["clear"]}
+                unlock_ = ["cf:" + name for name in p_["clear"]]
+                if p_["phone"]:
+                    patch_["phone"] = p_["phone"]
+                    unlock_.append("phone")
+                with conn.cursor() as cur:
+                    # read fresh (the update loop above may have rewritten `written` this run)
+                    cur.execute("select lead_id, written from morbius_contacts where ghl_contact_id=%s", (cid,))
+                    for lid_, w_ in cur.fetchall():
+                        w_ = dict(w_ or {})
+                        w_.update(patch_)
+                        w_["_locked"] = [k for k in (w_.get("_locked") or []) if k not in unlock_]
+                        cur.execute("update morbius_contacts set written=%s, updated_at=now() where lead_id=%s",
+                                    (json.dumps(w_), lid_))
+                conn.commit()
+        except Exception as e:
+            conn.rollback()
+            c["errors"] += 1
+            print(f"  never-call cleanup skipped one card: {type(e).__name__}")
+    print(f"Never-call numbers: {c['never_call_removed']} removed from cards, {c['never_call_dnd']} cards set to DND")
 
     # ---------- SKIP-TRACE QUEUE (purple = on hold)
     # Tala's rule (Nov 7 2026): no skip tracing until at least 50 crawler leads in GHL have
