@@ -845,6 +845,11 @@ def main():
     load_tax_sale_info(conn)
     api = GHL(a.live)
     fields = api.custom_fields()
+    if "probate case number" not in fields:  # Flo Rida's label may be "Probate Case #" etc.
+        alt_ = next((n for n in fields if "case" in n and ("probate" in n or "#" in n)), None)
+        if alt_:
+            fields["probate case number"] = fields[alt_]
+            print(f"Probate case number field found as '{alt_}'")
     miss_ = [n for n in ("personal representative", "pr phone", "probate case number", "will", "date of death")
              if n not in fields]
     print("Probate fields in GHL: " + ("all found" if not miss_ else "MISSING " + ", ".join(miss_)))
