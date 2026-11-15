@@ -100,7 +100,15 @@ class GHL:
             return None
         for attempt in range(4):
             self.calls += 1
-            r = self.s.request(method, BASE + path, timeout=45, **kw)
+            try:
+                r = self.s.request(method, BASE + path, timeout=45, **kw)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                # 2026-11-15: one GHL read timeout crashed the whole live run. Reads are safe to retry;
+                # a write might already have landed, so a write is never re-sent (no duplicate cards).
+                if method != "GET" or attempt == 3:
+                    raise
+                time.sleep(3 * (attempt + 1))
+                continue
             if r.status_code == 429 or r.status_code >= 500:
                 time.sleep(2 * (attempt + 1))
                 continue
@@ -1230,10 +1238,9 @@ def main():
             else:
                 if new_budget <= 0:
                     continue
-                # 2026-11-15 (Tala): only verified leads with an A-C number go in -- no weak or dead ones
-                ok_new, _why = cc.callable_status(pg.graded(phones, meta_, traced_deceased=dec_),
-                                                  lead_conf(lead), dead=lead.get("lead_status") == "dead")
-                if not ok_new:
+                # 2026-11-15 (Tala): NO Confidence or phone-grade floor on new leads -- the Power Dialer
+                # workflows order them. Only dead leads stay out (rows are already best-first).
+                if lead.get("lead_status") == "dead":
                     c["held_not_verified"] += 1
                     continue
                 if amount_left is not None:
@@ -1608,7 +1615,11 @@ def main():
                 continue
             if "cf:their story" in ((m.get("written") or {}).get("_locked") or []):
                 continue
-            contact = api.get_contact(m["ghl_contact_id"])
+            try:
+                contact = api.get_contact(m["ghl_contact_id"])
+            except Exception as e:  # a read-back check must never crash the run after the work is done
+                print(f"verify skipped one card: {e.__class__.__name__}")
+                continue
             if contact is None:
                 continue
             checked += 1
