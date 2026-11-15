@@ -7,8 +7,8 @@ Tala's orders:
     that is marked bad (her call results, numbers she deleted, earlier feedback), on the
     National Do Not Call list, or on the never-call list comes OFF the card, even when she
     typed it in herself. Phone 1 becomes the best good number left.
-  - No dead or weak leads added: a NEW card goes into GHL only when its lead is verified
-    (Confidence >= CALLABLE_MIN_CONF, not dead) and its best good number is graded A, B or C.
+  - No floor on Confidence or phone grade for new leads (Tala, Nov 15: the Power Dialer
+    workflows order them); only dead leads stay out. callable_status() is used for counts only.
     Rule 19: when she asks for an amount, it is that many NEW leads, best call rating and
     Confidence first (morbius_sync ranks them and counts the amount down).
   - No "bad number" tags on cards (her Nov 14 order).

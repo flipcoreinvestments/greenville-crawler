@@ -1230,10 +1230,9 @@ def main():
             else:
                 if new_budget <= 0:
                     continue
-                # 2026-11-15 (Tala): only verified leads with an A-C number go in -- no weak or dead ones
-                ok_new, _why = cc.callable_status(pg.graded(phones, meta_, traced_deceased=dec_),
-                                                  lead_conf(lead), dead=lead.get("lead_status") == "dead")
-                if not ok_new:
+                # 2026-11-15 (Tala): NO Confidence or phone-grade floor on new leads -- the Power Dialer
+                # workflows order them. Only dead leads stay out (rows are already best-first).
+                if lead.get("lead_status") == "dead":
                     c["held_not_verified"] += 1
                     continue
                 if amount_left is not None:
