@@ -64,6 +64,7 @@ from lead_common import owner_is_entity
 import morbius_flow as flow
 import phone_grade as pg
 import never_call
+import card_cleanup as cc
 from morbius_flow import deed_name
 
 BASE = "https://services.leadconnectorhq.com"
@@ -583,6 +584,7 @@ FLOW_LIVE = False
 
 
 RECHECK_TAG = "check: distress may be gone"
+NO_PHONE_TAG = "no phone - mail email"  # 2026-11-15 (Tala): own smart list, never in the Power Dialer
 
 
 def _fmt_phone(p):
@@ -721,7 +723,7 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
     body = {
         "firstName": first, "lastName": last,
         "name": f"{first} {last}".strip(),
-        "phone": phones[0],
+        "phone": phones[0] if phones else None,
         "address1": d.get("Property Address") or lead.get("address") or "",
         "city": d.get("Property City") or "",
         "state": d.get("Property State") or "SC",
@@ -731,6 +733,8 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
         "customFields": [{"id": fields[k], "field_value": v} for k, v in cf.items()
                          if k in fields and v not in (None, "")],
     }
+    if not body["phone"]:
+        body.pop("phone")  # 2026-11-15: no-phone leads go in for mail / email only
     return body, tags, call_line
 
 
@@ -945,7 +949,9 @@ def main():
              deleted_tagged=0, protected_kept=0, skipped_no_clean_phone=0, readded=0, errors=0,
              emails_added=0, email_skipped=0, litigators_blocked=0, deleted_litigator=0, held_best_dnc=0,
              bad_numbers_found=0, retrace_next_name=0, idicore_search=0, unreachable=0,
-             never_call_removed=0, never_call_dnd=0)
+             never_call_removed=0, never_call_dnd=0, held_not_verified=0, callable=0,
+             removed_bad_numbers=0, removed_dnc_numbers=0, phone1_cleared=0,
+             bad_number_tags_removed=0, deleted_national_dnc=0)
     litigator_cards = []
     new_budget = a.limit if a.limit >= 0 else 10 ** 9
     edit_keys = {}
@@ -1027,7 +1033,7 @@ def main():
         c["bad_numbers_found"] += len(new_bad)
         lead["bad_phones"] = sorted(set(lead.get("bad_phones") or []) | set(fb["bad"]))
         lead["_callable"] = [p for p in good_phones(lead) if ok.get(p)]
-        api.add_tags(cid, [pg.BAD_NUMBER_TAG])
+        # 2026-11-15 (Tala): no "bad number" tags on cards (card cleanup below removes old ones)
         reason = "; ".join(fb.get("reasons") or [])[:200]
         status_ = None
         retrace_ = None
@@ -1078,6 +1084,54 @@ def main():
     for lid_, m_ in sorted(mapped.items(), key=lambda x: (x[1].get("created_at") is None, str(x[1].get("created_at")))):
         if m_.get("ghl_contact_id") and not m_.get("deleted_at"):
             shared.setdefault(m_["ghl_contact_id"], []).append(lid_)
+
+    # ---------- CALLABLE COUNT (2026-11-15, Tala: exactly 150 callable leads in GHL)
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('public.phone_suppression') is not null")
+        if cur.fetchone()[0]:
+            cur.execute("select phone from phone_suppression")
+            blocked = {x[0] for x in cur.fetchall()}
+        else:
+            blocked = set()
+        # Rule 23 (Tala, Nov 15): the master "Phone Numbers - Bad Numbers" list
+        cur.execute("select to_regclass('public.phone_bad_numbers') is not null")
+        if cur.fetchone()[0]:
+            cur.execute("select phone from phone_bad_numbers")
+            listed_bad = {x[0] for x in cur.fetchall()}
+        else:
+            listed_bad = set()
+    print(f"Bad Numbers list: {len(listed_bad)} numbers")
+
+    def good_graded(lead_, extra_bad=()):
+        bad_ = set(extra_bad) | blocked | listed_bad
+        return pg.graded([p for p in good_phones(lead_) if ok.get(p) and p not in bad_],
+                         lead_.get("phone_meta") or {}, traced_deceased=bool(lead_.get("trace_deceased")))
+
+    def lead_conf(lead_):
+        raw_ = lead_.get("raw") or {}
+        if isinstance(raw_, str):
+            raw_ = json.loads(raw_)
+        return confidence(lead_, raw_)[0]
+
+    # Rule 19 (Tala, Nov 15): when she asks for an amount of leads, that number is the total of
+    # NEW leads, the ones with the highest call rating and/or Confidence. Morbius stores her number
+    # in morbius_state 'new_lead_amount'; each new card added counts it down. No number stored =
+    # no amount set (the run's --limit applies, as before).
+    amount_left = None
+    with conn.cursor() as cur:
+        cur.execute("select value from morbius_state where key='new_lead_amount'")
+        r_ = cur.fetchone()
+        if r_ is not None and r_[0] is not None:
+            amount_left = max(0, int(r_[0]))
+            new_budget = min(new_budget, amount_left)
+    c["new_lead_amount_left"] = amount_left
+    # best first: highest call rating (grade of the best good number), then highest Confidence
+    rank_ = {}
+    for r in rows:
+        if r.get("skiptrace_status") == "traced":
+            gg_ = good_graded(r)
+            rank_[str(r["id"])] = (pg.GRADE_ORDER.get(gg_[0][1], 9) if gg_ else 9, -lead_conf(r))
+    rows.sort(key=lambda r: rank_.get(str(r["id"]), (10, 0)))
 
     # ---------- GREEN / YELLOW / ORANGE
     for lead in rows:
@@ -1176,6 +1230,14 @@ def main():
             else:
                 if new_budget <= 0:
                     continue
+                # 2026-11-15 (Tala): only verified leads with an A-C number go in -- no weak or dead ones
+                ok_new, _why = cc.callable_status(pg.graded(phones, meta_, traced_deceased=dec_),
+                                                  lead_conf(lead), dead=lead.get("lead_status") == "dead")
+                if not ok_new:
+                    c["held_not_verified"] += 1
+                    continue
+                if amount_left is not None:
+                    amount_left -= 1
                 if lead.get("_best_dnc"):
                     # her best number is on Do Not Call: no worse number gets dialed instead (mail / door knock)
                     c["held_best_dnc"] += 1
@@ -1224,17 +1286,54 @@ def main():
             c["errors"] += 1
             print(f"  lead skipped: {type(e).__name__}: {str(e)[:120]}")
 
+
+    # ---------- NO PHONE -> MAIL / EMAIL LIST (2026-11-15, Tala option "a"): a lead whose skip trace
+    # came back with no phone number goes into GHL anyway, tagged "no phone - mail email" (its own smart
+    # list, never in the Power Dialer), with its mailing address and any email, for the future email
+    # and direct-mail campaigns. Dead leads and litigators never go in. Not counted in rule 19 amounts.
+    c.update(no_phone_added=0, no_phone_updated=0)
+    for lead in rows:
+        lid = str(lead["id"])
+        if (lead.get("skiptrace_status") != "failed" or lead.get("lead_status") or lead.get("litigator")
+                or not_worked(lead)):
+            continue
+        m = mapped.get(lid)
+        if m and m.get("deleted_at"):
+            continue  # removed on purpose: stays out
+        try:
+            d = row_dict(lead, today)
+            body, tags, _ = build(lead, d, [], fields)
+            tags = sorted(set(tags) | {NO_PHONE_TAG})
+            written = {k: body.get(k) for k in TRACKED}
+            if m and m.get("ghl_contact_id"):
+                api.add_tags(m["ghl_contact_id"], [NO_PHONE_TAG])
+                c["no_phone_updated"] += 1
+                continue
+            cid, existed = api.create_contact(dict(body, tags=tags))
+            if existed:
+                api.add_tags(cid, tags)
+                written["_locked"] = list(TRACKED)
+            if not existed and a.live:
+                fill_email(api, cid, lead, {}, c)
+            c["no_phone_added"] += 0 if existed else 1
+            if a.live:
+                with conn.cursor() as cur:
+                    cur.execute("""insert into morbius_contacts (lead_id, ghl_contact_id, written, updated_at)
+                                   values (%s,%s,%s,now())
+                                   on conflict (lead_id) do update set ghl_contact_id=excluded.ghl_contact_id,
+                                     written=excluded.written, updated_at=now()""",
+                                (lid, cid, json.dumps(written)))
+                conn.commit()
+        except Exception as e:
+            conn.rollback()
+            c["errors"] += 1
+            print(f"  no-phone lead skipped: {type(e).__name__}: {str(e)[:120]}")
+    print(f"No-phone mail/email list: {c['no_phone_added']} added, {c['no_phone_updated']} already in GHL")
+
     # ---------- NEVER-CALL NUMBERS (2026-11-14, Tala): a number on phone_suppression (STOP replies,
     # "wrong number" texts, anything she says must never be called) comes off every card. Phone 2-5 are
     # cleared, Phone 1 is replaced by the best good number, and a card with no good number left gets
     # Do Not Disturb. This overrides her own edits to those phone fields: it's a safety rule.
-    with conn.cursor() as cur:
-        cur.execute("select to_regclass('public.phone_suppression') is not null")
-        if cur.fetchone()[0]:
-            cur.execute("select phone from phone_suppression")
-            blocked = {x[0] for x in cur.fetchall()}
-        else:
-            blocked = set()
     for cid, s in activity.items():
         if not (s.get("card_numbers") or set()) & blocked:
             continue
@@ -1281,6 +1380,80 @@ def main():
             c["errors"] += 1
             print(f"  never-call cleanup skipped one card: {type(e).__name__}")
     print(f"Never-call numbers: {c['never_call_removed']} removed from cards, {c['never_call_dnd']} cards set to DND")
+
+    # ---------- CARD CLEANUP + CALLABLE LIST (2026-11-15, Tala; see card_cleanup.py)
+    # Every bad / Do Not Call / never-call number comes off every card (her own edits too: safety
+    # rule), Phone 1 = best good number, "bad number" tags go, and callable cards are counted.
+    # Leads whose only numbers are on the
+    # National DNC list, who never asked us themselves, are removed from GHL (DNC rule).
+    dnc_only_cards = []
+    id_name_ = {v: k for k, v in fields.items()}
+    for cid, s in activity.items():
+        lead = by_id.get(s["lead_id"])
+        if not lead or s["dnc"]:
+            continue  # not a crawler lead, or a personal opt-out (stays as Do Not Contact)
+        try:
+            contact = api.get_contact(cid)
+            if contact is None:
+                continue
+            cf_ = {id_name_.get(f.get("id"), ""): f.get("value", f.get("field_value"))
+                   for f in (contact.get("customFields") or [])}
+            card = pg.card_numbers(contact, cf_)
+            bad_ = (set(lead.get("bad_phones") or []) | set((s.get("numbers") or {}).get("bad") or ())
+                    | listed_bad)
+            remove = cc.remove_set(card, bad_, on_dnc, blocked)
+            clean_on_card = [n for n in card.values() if n not in remove and n not in on_dnc]
+            if not clean_on_card and cc.national_dnc_only(good_phones(lead), on_dnc, s["dnc"], s["talked"]):
+                dnc_only_cards.append((s["lead_id"], cid))
+                continue
+            gg = good_graded(lead, bad_)
+            p_ = cc.plan(contact, cf_, remove, [p for p, _g in gg])
+            if p_:
+                body_ = cc.update_body(p_, fields)
+                if body_:
+                    api.update_contact(cid, body_)
+                if cc.phone_clear(p_):
+                    try:
+                        api.update_contact(cid, {"phone": None})
+                        c["phone1_cleared"] += 1
+                    except Exception as e:
+                        print(f"  could not empty Phone 1 on one card: {type(e).__name__}")
+                if p_["removed"]:
+                    api.add_note(cid, cc.note_text(p_))
+                c["removed_bad_numbers"] += sum(1 for r in p_["removed"].values() if r != "dnc")
+                c["removed_dnc_numbers"] += sum(1 for r in p_["removed"].values() if r == "dnc")
+                if a.live:
+                    # keep `written` in step so these changes are never mistaken for her edits
+                    patch_ = {"cf:" + name: "" for name in p_["clear"]}
+                    unlock_ = ["cf:" + name for name in p_["clear"]]
+                    if p_["phone"] is not None:
+                        patch_["phone"] = p_["phone"]
+                        unlock_.append("phone")
+                    with conn.cursor() as cur:
+                        cur.execute("select lead_id, written from morbius_contacts where ghl_contact_id=%s", (cid,))
+                        for lid_, w_ in cur.fetchall():
+                            w_ = dict(w_ or {})
+                            w_.update(patch_)
+                            w_["_locked"] = [k for k in (w_.get("_locked") or []) if k not in unlock_]
+                            cur.execute("update morbius_contacts set written=%s, updated_at=now() where lead_id=%s",
+                                        (json.dumps(w_), lid_))
+                    conn.commit()
+            ok_, _why = cc.callable_status(gg, lead_conf(lead), dead=lead.get("lead_status") == "dead")
+            tags_now = {t.strip().lower() for t in contact.get("tags") or []}
+            if pg.BAD_NUMBER_TAG in tags_now:
+                api.remove_tags(cid, [pg.BAD_NUMBER_TAG])
+                c["bad_number_tags_removed"] += 1
+            if ok_:
+                c["callable"] += 1
+            else:
+                c["not_callable"] = c.get("not_callable", 0) + 1
+        except Exception as e:
+            conn.rollback()
+            c["errors"] += 1
+            print(f"  card cleanup skipped one card: {type(e).__name__}")
+    print(f"Card cleanup: {c['removed_bad_numbers']} bad + {c['removed_dnc_numbers']} DNC numbers removed; "
+          f"{c['callable']} callable, {c.get('not_callable', 0)} not callable yet; "
+          f"{len(dnc_only_cards)} national-DNC-only cards to remove")
 
     # ---------- SKIP-TRACE QUEUE (purple = on hold)
     # Tala's rule (Nov 7 2026): no skip tracing until at least 50 crawler leads in GHL have
@@ -1470,6 +1643,11 @@ def main():
             continue
         seen.add(cid)
         to_delete.append((lid, cid, "litigator (BatchData): never in GHL -- Tala's rule", "deleted_litigator"))
+    for lid, cid in dnc_only_cards:
+        if cid in seen:
+            continue
+        seen.add(cid)
+        to_delete.append((lid, cid, cc.NATIONAL_DNC_REASON, "deleted_national_dnc"))
     for cid in tagged:
         if cid not in seen:
             to_delete.append((by_contact.get(cid), cid, "tagged delete by Tala", "deleted_tagged"))
@@ -1579,6 +1757,11 @@ def main():
                     conn.commit()
 
     c["api_calls"] = api.calls
+    if a.live and amount_left is not None:
+        with conn.cursor() as cur:
+            cur.execute("update morbius_state set value=%s where key='new_lead_amount'", (max(0, amount_left),))
+        conn.commit()
+    c["new_lead_amount_left"] = amount_left
     if a.live:
         with conn.cursor() as cur:
             cur.execute("insert into morbius_runs (mode, counts) values (%s,%s)", ("live", json.dumps(c)))
