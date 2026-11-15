@@ -100,7 +100,15 @@ class GHL:
             return None
         for attempt in range(4):
             self.calls += 1
-            r = self.s.request(method, BASE + path, timeout=45, **kw)
+            try:
+                r = self.s.request(method, BASE + path, timeout=45, **kw)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                # 2026-11-15: one GHL read timeout crashed the whole live run. Reads are safe to retry;
+                # a write might already have landed, so a write is never re-sent (no duplicate cards).
+                if method != "GET" or attempt == 3:
+                    raise
+                time.sleep(3 * (attempt + 1))
+                continue
             if r.status_code == 429 or r.status_code >= 500:
                 time.sleep(2 * (attempt + 1))
                 continue
@@ -1607,7 +1615,11 @@ def main():
                 continue
             if "cf:their story" in ((m.get("written") or {}).get("_locked") or []):
                 continue
-            contact = api.get_contact(m["ghl_contact_id"])
+            try:
+                contact = api.get_contact(m["ghl_contact_id"])
+            except Exception as e:  # a read-back check must never crash the run after the work is done
+                print(f"verify skipped one card: {e.__class__.__name__}")
+                continue
             if contact is None:
                 continue
             checked += 1
