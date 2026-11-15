@@ -321,17 +321,25 @@ def meta_backfill(conn, key):
     import requests
     s = requests.Session()
     h = {"Authorization": f"Bearer {key}", "apikey": key}
-    r = s.post(f"{SUPABASE_URL}/storage/v1/object/list/{BUCKET}", headers=h,
-               json={"prefix": "meta/", "limit": 1000, "sortBy": {"column": "name", "order": "asc"}}, timeout=60)
-    if r.status_code != 200:
+    # 2026-11-15 (Tala): also read the result files already in the bucket's top level (the Oct 2026
+    # traces were loaded before phone details were saved). Each is read once more for details only,
+    # remembered as "meta:<name>" so its trace status / phones / history are never touched again.
+    objs = []
+    for prefix in ("meta/", ""):
+        r = s.post(f"{SUPABASE_URL}/storage/v1/object/list/{BUCKET}", headers=h,
+                   json={"prefix": prefix, "limit": 1000, "sortBy": {"column": "name", "order": "asc"}}, timeout=60)
+        if r.status_code == 200:
+            objs += [(prefix, o) for o in r.json()]
+    if not objs:
         return 0
     with conn.cursor() as cur:
         cur.execute("select name from skiptrace_files")
         done = {x[0] for x in cur.fetchall()}
     n = 0
-    for obj in r.json():
-        name = "meta/" + (obj.get("name") or "")
-        if not obj.get("id") or name in done or not name.lower().endswith((".csv", ".xlsx")):
+    for prefix, obj in objs:
+        name = prefix + (obj.get("name") or "")
+        key_ = name if prefix else "meta:" + name
+        if not obj.get("id") or key_ in done or not name.lower().endswith((".csv", ".xlsx")):
             continue
         g = s.get(f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{name}", headers=h, timeout=120)
         if g.status_code != 200:
@@ -358,7 +366,7 @@ def meta_backfill(conn, key):
                                                  "file": name})
                     m += 1
             cur.execute("insert into skiptrace_files (name, rows_read, matched, traced, failed) "
-                        "values (%s,%s,%s,0,0) on conflict (name) do nothing", (name, len(rows), m))
+                        "values (%s,%s,%s,0,0) on conflict (name) do nothing", (key_, len(rows), m))
         conn.commit()
         n += m
         print(f"  {name}: phone details saved for {m} lead(s)")

@@ -94,6 +94,13 @@ def row_phone_meta(row):
                   "last_reported": d.isoformat() if d else "",
                   "dnc": _true(s.get("dnc")),
                   "carrier": (s.get("carrier") or "").strip()}
+        # 2026-11-15 (Tala): keep BatchData's two strongest signals too --
+        # tested = a call connected for 6+ seconds; score = BatchData's likelihood the number is right
+        if s.get("tested") not in (None, ""):
+            out[p]["tested"] = _true(s.get("tested"))
+        sc = re.sub(r"[^\d.]", "", str(s.get("score") or ""))
+        if sc:
+            out[p]["score"] = float(sc)
     return out
 
 
