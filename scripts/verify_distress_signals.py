@@ -98,7 +98,9 @@ SCOPE_SQL = {
           and coalesce(l.is_duplicate, false) = false
           and (l.id::text in (select lead_id::text from morbius_contacts where deleted_at is null)
                or l.id::text in (select lead_id from morbius_skiptrace_queue
-                                 where status in ('urgent', 'ready', 'approved', 'retrace')))
+                                 where status in ('urgent', 'ready', 'approved', 'retrace'))
+               -- 2026-11-15 (Tala): every lead on the skip-trace list is live-checked before it is traced
+               or l.id::text in (select lead_id from trace_list_export))
     """,
     "all3": """
         select id, address, source_tags, raw
