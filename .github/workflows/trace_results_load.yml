@@ -1,0 +1,46 @@
+name: Load skip-trace results (on demand)
+
+# 2026-11-16 (Tala): load a BatchData result file, check every number (Bad Numbers list,
+# Do Not Call), then start a live Morbius sync so the leads land in GHL. Logs show counts only.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: leads-database
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Upload the encrypted result file to the private bucket
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/load_trace_upload.py
+      - name: Import skip-trace results
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/run_step.py scripts/skiptrace_intake.py
+      - name: Do Not Call scrub of the new numbers
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/run_step.py scripts/dnc_scrub.py
+      - name: Start a live Morbius sync (loads the leads into GHL)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run morbius.yml -R ${{ github.repository }} -f live=true -f limit=-1
