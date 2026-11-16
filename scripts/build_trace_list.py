@@ -14,7 +14,7 @@ search the same name and address again is left out (never retrace the same infor
 Every number that comes back is checked against the Bad Numbers list and Do Not Call by
 skiptrace_intake / Morbius before anything reaches GHL.
 
-Writes out/trace_list.csv (uploaded as a GitHub Actions artifact). Read-only on the database.
+Writes the list to the private trace_list_export table (nothing else in the database changes).
 """
 
 import csv
@@ -104,12 +104,15 @@ def main():
     part_b.sort(key=lambda x: x[0])
     part_b = part_b[:NEW_AMOUNT]
 
-    os.makedirs("out", exist_ok=True)
-    with open("out/trace_list.csv", "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=HEAD)
-        w.writeheader()
-        for _k, r in part_a + part_b:
-            w.writerow(r)
+    # the list goes to a private table (never a public log or artifact: the repo is public)
+    cols = ["grp", "first_name", "last_name", "street", "city", "state", "zip", "property_address",
+            "property_city", "property_state", "property_zip", "owner_on_title", "why", "confidence", "lead_id"]
+    with conn.cursor() as wc:
+        wc.execute("delete from trace_list_export")
+        for i, (_k, r) in enumerate(part_a + part_b, 1):
+            wc.execute(f"insert into trace_list_export (pos, {', '.join(cols)}) values (%s, {', '.join(['%s'] * len(cols))})",
+                       [i] + [r[h] for h in HEAD])
+    conn.commit()
     print(f"PART A (in GHL, retrace): {len(part_a)}")
     print(f"PART B (new leads): {len(part_b)}")
     print(f"left out: {skipped}")

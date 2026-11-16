@@ -1,7 +1,7 @@
 name: Build skip-trace list (on demand)
 
 # 2026-11-15 (Tala): retraces of GHL leads whose info changed, then the best new leads.
-# Read-only on the database; the CSV comes back as a run artifact.
+# Writes only the private trace_list_export table (no artifacts: the repo is public).
 on:
   push:
     branches: [feat/trace-list]
@@ -29,8 +29,4 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           NEW_AMOUNT: ${{ inputs.new_amount || '150' }}
-        run: cd scripts && python build_trace_list.py && mv out ../out
-      - uses: actions/upload-artifact@v4
-        with:
-          name: trace_list
-          path: out/trace_list.csv
+        run: cd scripts && python build_trace_list.py
