@@ -263,7 +263,9 @@ _NAME_OK = re.compile(r"^[A-Za-z][A-Za-z'\-]+$")
 
 
 _TRUST_FILLER = {"joint", "family", "living", "revocable", "revoc", "irrevocable", "residential", "the",
-                 "trust", "trustee", "trustees", "trs", "estate", "life", "and"}
+                 "trust", "trustee", "trustees", "trs", "estate", "life", "and", "land", "in", "we", "of",
+                 "declaration", "lane", "revoable", "rev"}
+_SHORT_FIRST = {"al", "jo", "ed", "bo", "cy", "ty", "lu", "vi"}
 
 
 def _trust_person_ok(first, last):
@@ -272,6 +274,8 @@ def _trust_person_ok(first, last):
     if not (f and l and _NAME_OK.match(f) and _NAME_OK.match(l)):
         return False
     if len(f) < 2 or len(l) < 2 or f.lower() == l.lower():
+        return False
+    if len(f) == 2 and f.lower() not in _SHORT_FIRST:
         return False
     if f.lower() in _TRUST_FILLER or l.lower() in _TRUST_FILLER:
         return False
@@ -297,7 +301,7 @@ def trace_block_reason(*, first, last, owner_name, address, owner_is_entity,
         # 2026-11-16 (Tala): trusts and life estates are traced through the person named on the deed
         # (the trustee / grantor, or the life tenant living there). Held only when no real person's
         # First + Last name can be read from the deed name.
-        if not _trust_person_ok(first, last):
+        if re.match(r"\s*\d", owner_name or "") or not _trust_person_ok(first, last):
             return "trust or life estate with no person's name on the deed"
     if _UNIT_RE.search(address or ""):
         return "condo or apartment unit"

@@ -127,6 +127,7 @@ check("family trust, no first name -> held", bool(tb(first="", owner_name="SAMPL
 check("trust, first == last -> held", bool(tb(first="Sample", owner_name="SAMPLE TRUST SAMPLE MARY")), True)
 check("trust, filler word as name -> held", bool(tb(first="Joint", owner_name="SAMPLE JOINT TRUST")), True)
 check("trust, initial only -> held", bool(tb(first="P", owner_name="MARY P SAMPLE TRUST")), True)
+check("land trust on a street -> held", bool(tb(first="Lane", last="Sample", owner_name="15 SAMPLE LANE LAND TRUST")), True)
 check("trust, junk name -> held", bool(tb(first="Bcx", last="Xx", owner_name="XX BCX LIVING TRUST")), True)
 check("condo unit -> held", bool(tb(address="400 Test Ave Unit 12")), True)
 check("blank last name -> held", bool(tb(last="")), True)
