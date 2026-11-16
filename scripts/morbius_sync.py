@@ -1415,8 +1415,13 @@ def main():
     id_name_ = {v: k for k, v in fields.items()}
     for cid, s in activity.items():
         lead = by_id.get(s["lead_id"])
-        if not lead or s["dnc"]:
-            continue  # not a crawler lead, or a personal opt-out (stays as Do Not Contact)
+        if not lead:
+            continue  # not a crawler lead
+        # 2026-11-16: a personal opt-out (DND / dnc tag) stays in GHL as Do Not Contact, but its bad
+        # numbers still come off and a mail-list lead is still emptied. Skipping these cards left
+        # bad numbers on them (two cards stayed untouched on Nov 15 with no error logged).
+        if s["dnc"]:
+            c["optout_cards_checked"] = c.get("optout_cards_checked", 0) + 1
         try:
             contact = api.get_contact(cid)
             if contact is None:
@@ -1438,6 +1443,23 @@ def main():
                 gg = []
                 c["moved_to_mail"] = c.get("moved_to_mail", 0) + 1
             p_ = cc.plan(contact, cf_, remove, [p for p, _g in gg])
+            # 2026-11-16: the PR Phone field is a number too -- a bad / never-call / Do Not Call number
+            # there (or any number on a mail-list card) comes off like the Phone slots
+            pr_ = pg._norm_phone(cf_.get("pr phone"))
+            if pr_ and "pr phone" in fields and (mail_only(lead) or pr_ in bad_ or pr_ in blocked
+                                                 or pr_ in on_dnc):
+                api.update_contact(cid, {"customFields": [{"id": fields["pr phone"], "field_value": ""}]})
+                c["pr_phone_cleared"] = c.get("pr_phone_cleared", 0) + 1
+                if a.live:
+                    with conn.cursor() as cur:
+                        cur.execute("select lead_id, written from morbius_contacts where ghl_contact_id=%s", (cid,))
+                        for lid_, w_ in cur.fetchall():
+                            w_ = dict(w_ or {})
+                            w_["cf:pr phone"] = ""
+                            w_["_locked"] = [k for k in (w_.get("_locked") or []) if k != "cf:pr phone"]
+                            cur.execute("update morbius_contacts set written=%s, updated_at=now() where lead_id=%s",
+                                        (json.dumps(w_), lid_))
+                    conn.commit()
             if p_:
                 body_ = cc.update_body(p_, fields)
                 if body_:
@@ -1483,7 +1505,8 @@ def main():
             print(f"  card cleanup skipped one card: {type(e).__name__}")
     print(f"Card cleanup: {c['removed_bad_numbers']} bad + {c['removed_dnc_numbers']} DNC numbers removed; "
           f"{c['callable']} callable, {c.get('not_callable', 0)} not callable yet; "
-          f"{len(dnc_only_cards)} national-DNC-only cards to remove")
+          f"{len(dnc_only_cards)} national-DNC-only cards to remove; "
+          f"{c.get('optout_cards_checked', 0)} opt-out cards checked; {c.get('pr_phone_cleared', 0)} PR Phone fields cleared")
 
     # ---------- SKIP-TRACE QUEUE (purple = on hold)
     # Tala's rule (Nov 7 2026): no skip tracing until at least 50 crawler leads in GHL have
