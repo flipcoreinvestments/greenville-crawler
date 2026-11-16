@@ -1122,6 +1122,10 @@ def main():
         bad_l = [p for p in (lead_.get("bad_phones") or []) if p]
         if not bad_l:
             return False
+        # 2026-11-16 (Tala): a lead moves to the mail list only when nothing callable is left. A lead
+        # with a bad number that still has a good, Do-Not-Call-clean number stays in the Power Dialer.
+        if good_graded(lead_):
+            return False
         last_bad = max((bad_added.get(p) for p in bad_l if bad_added.get(p)), default=None)
         st_ = lead_.get("skiptrace_date")
         return last_bad is None or st_ is None or last_bad > st_
