@@ -1108,11 +1108,23 @@ def main():
         # Rule 23 (Tala, Nov 15): the master "Phone Numbers - Bad Numbers" list
         cur.execute("select to_regclass('public.phone_bad_numbers') is not null")
         if cur.fetchone()[0]:
-            cur.execute("select phone from phone_bad_numbers")
-            listed_bad = {x[0] for x in cur.fetchall()}
+            cur.execute("select phone, added_at from phone_bad_numbers")
+            bad_added = {x[0]: x[1] for x in cur.fetchall()}
         else:
-            listed_bad = set()
+            bad_added = {}
+        listed_bad = set(bad_added)
     print(f"Bad Numbers list: {len(listed_bad)} numbers")
+
+    def mail_only(lead_):
+        """2026-11-15 (Tala): a lead with a number marked bad (or all numbers bad, or a number she
+        deleted) is a bad lead: out of the Power Dialer, onto the direct-mail list. It comes back to
+        the dialer only after a NEW trace (skip trace newer than its last bad number)."""
+        bad_l = [p for p in (lead_.get("bad_phones") or []) if p]
+        if not bad_l:
+            return False
+        last_bad = max((bad_added.get(p) for p in bad_l if bad_added.get(p)), default=None)
+        st_ = lead_.get("skiptrace_date")
+        return last_bad is None or st_ is None or last_bad > st_
 
     def good_graded(lead_, extra_bad=()):
         bad_ = set(extra_bad) | blocked | listed_bad
@@ -1161,6 +1173,8 @@ def main():
         dec_ = bool(lead.get("trace_deceased"))
         # best graded number first (A..D), only numbers clean on Do Not Call and never reported wrong
         phones = [p for p, _g in pg.graded([p for p in good_phones(lead) if ok.get(p)], meta_, traced_deceased=dec_)]
+        if mail_only(lead):
+            phones = []  # bad-number lead: direct mail, never back on a card's phone fields
         lead["_best_dnc"] = pg.best_is_dnc(good_phones(lead), meta_, ok, on_dnc, traced_deceased=dec_)
         readd_reason = ""
         if m and m.get("deleted_at"):
@@ -1305,8 +1319,8 @@ def main():
     c.update(no_phone_added=0, no_phone_updated=0)
     for lead in rows:
         lid = str(lead["id"])
-        if (lead.get("skiptrace_status") != "failed" or lead.get("lead_status") or lead.get("litigator")
-                or not_worked(lead)):
+        if (lead.get("lead_status") or lead.get("litigator") or not_worked(lead)
+                or not (lead.get("skiptrace_status") == "failed" or mail_only(lead))):
             continue
         m = mapped.get(lid)
         if m and m.get("deleted_at"):
@@ -1418,6 +1432,11 @@ def main():
                 dnc_only_cards.append((s["lead_id"], cid))
                 continue
             gg = good_graded(lead, bad_)
+            if mail_only(lead):
+                # bad-number lead -> direct mail: every number comes off the card (they stay in our database)
+                remove = dict({n: "moved to mail list" for n in card.values() if n}, **remove)
+                gg = []
+                c["moved_to_mail"] = c.get("moved_to_mail", 0) + 1
             p_ = cc.plan(contact, cf_, remove, [p for p, _g in gg])
             if p_:
                 body_ = cc.update_body(p_, fields)
