@@ -418,7 +418,11 @@ def _tax_paid(raw):
         paid = datetime.strptime(tp["paid_on"], "%m/%d/%Y").date()
     except ValueError:
         return None, None
-    sale = (raw.get("redemption_period") or {}).get("sale_date")
+    # 2026-11-15: tax-sale leads carry the sale date under raw.tax_sale, not redemption_period.
+    # Without this fallback a year the BUYER paid after the sale read as "paid before the sale"
+    # and the lead lost its tax signal (69 GHL/trace-list leads paid 10/23 or 10/28/2026).
+    sale = ((raw.get("redemption_period") or {}).get("sale_date")
+            or (raw.get("tax_sale") or {}).get("sale_date"))
     try:
         sale_d = datetime.strptime(str(sale)[:10], "%Y-%m-%d").date() if sale else None
     except ValueError:
