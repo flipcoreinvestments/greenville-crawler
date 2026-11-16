@@ -949,6 +949,13 @@ def main():
                               retrace_reason, reach_status, skiptrace_input from leads
                        where skiptrace_status = 'traced'""")
         extra = {x["id"]: x for x in cur.fetchall()}
+    # 2026-11-16 (Tala): "do not include any DNC numbers in any of the contacts" -- a number the skip
+    # trace itself flagged Do Not Call is treated as DNC too, even when the registry copy says clean.
+    for x in extra.values():
+        for p_, m_ in (x.get("phone_meta") or {}).items():
+            if isinstance(m_, dict) and m_.get("dnc"):
+                ok[p_] = False
+                on_dnc.add(p_)
     for r in rows:
         x = extra.get(str(r["id"]))
         if x:
