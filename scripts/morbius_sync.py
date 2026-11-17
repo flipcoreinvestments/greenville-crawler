@@ -596,6 +596,7 @@ FLOW_LIVE = False
 
 
 RECHECK_TAG = "check: distress may be gone"
+FIXED_NUMBER_TAG = "fixed number"  # 2026-11-13 (Tala): a new number landed on the card
 NO_PHONE_TAG = "no phone - mail email"  # 2026-11-15 (Tala): own smart list, never in the Power Dialer
 
 
@@ -1280,7 +1281,25 @@ def main():
                 c["kept_her_edit"] += len(edits)
                 for k in edits:
                     edit_keys[k] = edit_keys.get(k, 0) + 1
+                # 2026-11-17 (Tala's Nov 13 rule): a NEW number landing on an existing card gets the
+                # "fixed number" tag so she can see the number changed and call it
+                cf_before = {id_to_name.get(f.get("id"), ""): f.get("value", f.get("field_value"))
+                             for f in (contact.get("customFields") or [])}
+                before_nums = set(pg.card_numbers(contact, cf_before).values())
+                after_nums = set()
+                if upd.get("phone"):
+                    after_nums.add(pg._norm_phone(upd["phone"]))
+                for f in upd.get("customFields") or []:
+                    if id_to_name.get(f["id"], "") in ("phone 2", "phone 3", "phone 4", "phone 5"):
+                        n_ = pg._norm_phone(f.get("field_value"))
+                        if n_:
+                            after_nums.add(n_)
+                after_nums.discard(None)
+                after_nums.discard("")
                 api.update_contact(cid, upd)
+                if after_nums - before_nums:
+                    tags = list(tags) + [FIXED_NUMBER_TAG]
+                    c["fixed_number_tagged"] = c.get("fixed_number_tagged", 0) + 1
                 if live_map:
                     fill_email(api, cid, lead, contact, c)
                 api.add_tags(cid, tags)
