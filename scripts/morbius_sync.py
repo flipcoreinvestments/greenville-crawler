@@ -1253,7 +1253,12 @@ def main():
                 if live_map:
                     fill_email(api, cid, lead, contact, c)
                 api.add_tags(cid, tags)
-                stale = {"warm", "hot", "very hot", "verified 95+", pg.BEST_DNC_TAG, pg.EMAIL_TAG, RECHECK_TAG} - set(tags)
+                # 2026-11-17 (Tala): a card that now has a callable number is no longer a no-phone lead --
+                # the "no phone - mail email" tag comes off so her "tag is not no phone" filter shows it
+                stale = {"warm", "hot", "very hot", "verified 95+", pg.BEST_DNC_TAG, pg.EMAIL_TAG, RECHECK_TAG,
+                         NO_PHONE_TAG} - set(tags)
+                if NO_PHONE_TAG in {t.strip().lower() for t in contact.get("tags") or []}:
+                    c["no_phone_tag_removed"] = c.get("no_phone_tag_removed", 0) + 1
                 api.remove_tags(cid, stale)
                 have = {f.get("id"): f.get("value", f.get("field_value")) for f in (contact.get("customFields") or [])}
                 for k in edits:
