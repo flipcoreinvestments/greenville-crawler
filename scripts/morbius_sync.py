@@ -750,6 +750,34 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
     return body, tags, call_line
 
 
+def _is_today_et(v):
+    """2026-11-17 (Tala): is a GHL date / date-time value today in Eastern time?
+    GHL returns epoch milliseconds, an ISO string, or a plain YYYY-MM-DD / MM/DD/YYYY date."""
+    if v in (None, ""):
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+    except Exception:
+        et = timezone(timedelta(hours=-5))
+    today_et = datetime.now(et).date()
+    s = str(v).strip()
+    try:
+        if s.lstrip("-").isdigit():
+            n = int(s)
+            return datetime.fromtimestamp(n / 1000 if n > 10 ** 11 else n, tz=timezone.utc).astimezone(et).date() == today_et
+        if len(s) == 10 and s[4] == "-":
+            return date.fromisoformat(s) == today_et
+        if "/" in s:
+            return datetime.strptime(s.split()[0], "%m/%d/%Y").date() == today_et
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            return d.date() == today_et
+        return d.astimezone(et).date() == today_et
+    except (ValueError, OverflowError, OSError):
+        return False
+
+
 def _iso(v):
     try:
         return datetime.strptime(str(v or "").strip(), "%m/%d/%Y").date().isoformat()
@@ -1022,6 +1050,9 @@ def main():
             if (str(cf_.get("call result") or "").strip() or str(cf_.get("call outcome") or "").strip()
                     or cf_.get("last called") or gone_):
                 s["worked"] = True
+            # 2026-11-17 (Tala): exact "calls today" = crawler cards whose Last Called is today (Eastern)
+            if _is_today_et(cf_.get("last called")):
+                c["calls_today"] = c.get("calls_today", 0) + 1
             s["added_at"] = m.get("created_at")
             s["tags"] = {t.strip().lower() for t in contact.get("tags") or []}
             s["lead_id"] = lid
