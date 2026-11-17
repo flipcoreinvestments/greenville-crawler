@@ -1,9 +1,16 @@
-name: Verify distress signals (weekly re-check of GHL leads)
+name: Verify distress signals (daily re-check of GHL leads)
 
 # 2026-11-13 (Tala): every lead in GHL and every lead waiting on a skip trace is
-# re-checked against the live county/court sources every week (Sunday night, so
-# Monday's calls start clean). scope=all3 runs the old 3+ list sweep (slow).
+# re-checked against the live county/court sources. scope=all3 runs the old 3+
+# list sweep (slow).
+# 2026-11-16 (Tala): now DAILY. Morbius's scheduled run can't open the county
+# sites (permission prompt), so the live check runs here on GitHub instead,
+# right after the Morbius GHL sync finishes. Max once per day (guard below);
+# the Sunday-night schedule stays as the backup.
 on:
+  workflow_run:
+    workflows: ["Morbius GHL sync"]
+    types: [completed]
   schedule:
     - cron: "37 3 * * 1"
   workflow_dispatch:
@@ -20,28 +27,65 @@ concurrency:
   group: leads-database
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
+      # Once a day at most: the sync can run several times a day (crawler finish,
+      # 7:47am backup, Morbius's own start), so after the first successful check
+      # today (Eastern) the rest are skipped. Hand runs always go.
+      - name: Skip if already checked today
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          today=$(TZ=America/New_York date +%Y-%m-%d)
+          done_today=0
+          for t in $(gh run list -R "$REPO" -w verify_distress.yml -L 20 \
+                       --json conclusion,createdAt --jq '.[] | select(.conclusion=="success") | .createdAt'); do
+            if [ "$(TZ=America/New_York date -d "$t" +%Y-%m-%d)" = "$today" ]; then done_today=1; fi
+          done
+          if [ "${done_today:-0}" -gt 0 ]; then
+            echo "Already checked today ($today) -- skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != 'true'
 
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
         with:
           python-version: "3.11"
 
       - name: Install dependencies
+        if: steps.guard.outputs.skip != 'true'
         run: pip install -r requirements.txt
 
       - name: Install headless browser
+        if: steps.guard.outputs.skip != 'true'
         run: playwright install --with-deps chromium
 
+      # The nightly crawler already runs this sweep every night; only the
+      # Sunday backup and hand runs repeat it here.
       - name: Freshen absentee/tired-landlord/high-equity (full county sweep)
+        if: steps.guard.outputs.skip != 'true' && github.event_name != 'workflow_run'
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/absentee_owner_ingest.py
 
       - name: Cross-verify distress signals against live sources
+        if: steps.guard.outputs.skip != 'true'
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           VERIFY_SCOPE: ${{ inputs.scope || 'ghl' }}
