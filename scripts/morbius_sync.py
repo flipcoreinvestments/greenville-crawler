@@ -622,8 +622,8 @@ def who_to_call_line(lead, raw, probate, owner, call_first, call_last, phones, m
     else:
         rel = "tied to the property on the deed"
     best = next((p_ for p_, _g in pg.graded(phones, meta, traced_deceased=dec)), None)
-    num = _fmt_phone(best) if best else "no number yet"
-    return f"WHO TO CALL: {who}, {rel}. Best number: {num}."
+    # 2026-11-17 (Tala): the story says only what we know -- no "no number yet"
+    return f"WHO TO CALL: {who}, {rel}." + (f" Best number: {_fmt_phone(best)}." if best else "")
 
 
 def build(lead, d, phones, fields, readded=False, readd_reason=""):
@@ -676,8 +676,9 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
         "confidence": conf,
         "their story": (f"{readd_reason}\n\n" if readd_reason else "") + (
             f"Bankruptcy: Chapter {BANKRUPT[str(lead['id'])][0]} filed {BANKRUPT[str(lead['id'])][1]} "
-            f"(SC case {BANKRUPT[str(lead['id'])][2]}). Check: confirm it's the same owner and this property "
-            f"before calling.\n\n" if str(lead["id"]) in BANKRUPT else "") + f"Confidence {conf}%: {why}.\n\n{story}",
+            f"(SC case {BANKRUPT[str(lead['id'])][2]}).\n\n" if str(lead["id"]) in BANKRUPT else "") + story,
+        # 2026-11-17 (Tala): the story is facts only. Confidence has its own field; the scoring
+        # notes (how the number was worked out) no longer go in the story.
         "skip trace info": "\n".join(info),
         "mailing address": d.get("Mailing Address") or "",
         "county": f"{lead.get('county') or 'Greenville'} County, SC",
