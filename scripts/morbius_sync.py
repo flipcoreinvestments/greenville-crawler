@@ -178,6 +178,10 @@ class GHL:
         if tags:
             self._req("DELETE", f"/contacts/{cid}/tags", write=True, json={"tags": sorted(set(tags))})
 
+    def add_to_workflow(self, cid, workflow_id):
+        r = self._req("POST", f"/contacts/{cid}/workflow/{workflow_id}", write=True, json={})
+        return r is None or r.status_code in (200, 201)
+
     def add_note(self, cid, body):
         self._req("POST", f"/contacts/{cid}/notes", write=True, json={"body": body})
 
@@ -598,6 +602,11 @@ FLOW_LIVE = False
 RECHECK_TAG = "check: distress may be gone"
 FIXED_NUMBER_TAG = "fixed number"  # 2026-11-13 (Tala): a new number landed on the card
 NO_PHONE_TAG = "no phone - mail email"  # 2026-11-15 (Tala): own smart list, never in the Power Dialer
+# 2026-11-17 (Tala): GHL's "Dialer 0 - Router" tags a crawler lead "needs phone" and stops when Phone 1
+# is empty the moment the lead arrives (before its skip trace). Once the card has a number, the tag
+# comes off and a never-called lead goes back through the router so it lands in its Call 3-6 bucket.
+NEEDS_PHONE_TAG = "needs phone"
+ROUTER_WORKFLOW_ID = "e42003e2-b9b7-4832-9d00-a6bf30667125"  # Power Dialer > Dialer 0 - Router
 
 
 def _fmt_phone(p):
@@ -1308,9 +1317,27 @@ def main():
                 # the "no phone - mail email" tag comes off so her "tag is not no phone" filter shows it
                 stale = {"warm", "hot", "very hot", "verified 95+", pg.BEST_DNC_TAG, pg.EMAIL_TAG, RECHECK_TAG,
                          NO_PHONE_TAG} - set(tags)
-                if NO_PHONE_TAG in {t.strip().lower() for t in contact.get("tags") or []}:
+                card_tags_ = {t.strip().lower() for t in contact.get("tags") or []}
+                if NO_PHONE_TAG in card_tags_:
                     c["no_phone_tag_removed"] = c.get("no_phone_tag_removed", 0) + 1
+                has_phone_ = bool(pg._norm_phone(upd.get("phone") or contact.get("phone")))
+                rerouted_ = False
+                if NEEDS_PHONE_TAG in card_tags_ and has_phone_:
+                    stale = stale | {NEEDS_PHONE_TAG}
+                    c["needs_phone_tag_removed"] = c.get("needs_phone_tag_removed", 0) + 1
+                    called_ = (str(cf_before.get("call attempts") or "").strip() not in ("", "0")
+                               or str(cf_before.get("last called") or "").strip()
+                               or str(cf_before.get("call result") or "").strip()
+                               or "manual-called-today" in card_tags_)
+                    rerouted_ = not called_
                 api.remove_tags(cid, stale)
+                if rerouted_:
+                    # never-called lead: back through the router so it gets its Call 3-6 bucket.
+                    # A lead she already called is left out of the new-lead buckets.
+                    if api.add_to_workflow(cid, ROUTER_WORKFLOW_ID):
+                        c["needs_phone_rerouted"] = c.get("needs_phone_rerouted", 0) + 1
+                    else:
+                        c["needs_phone_reroute_failed"] = c.get("needs_phone_reroute_failed", 0) + 1
                 have = {f.get("id"): f.get("value", f.get("field_value")) for f in (contact.get("customFields") or [])}
                 for k in edits:
                     written[k] = have.get(fields.get(k[3:])) if k.startswith("cf:") else contact.get(k)
