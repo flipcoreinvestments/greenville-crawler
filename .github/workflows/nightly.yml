@@ -201,6 +201,19 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/run_step.py scripts/health_gate.py
 
+      # 2026-11-19 (Tala approved, Morbius okayed): hands the website its
+      # nightly trouble-address list for the /roadmap address check.
+      # Runs ONLY when every step above passed (default success() check), so
+      # a broken night never sends a half-empty list. Read-only on the
+      # database, no AI, no Scrapfly. Switched off (exits cleanly) until the
+      # WEBSITE_LIST_URL and WEBSITE_LIST_KEY secrets exist.
+      - name: Send trouble-address list to the website (address check)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          WEBSITE_LIST_URL: ${{ secrets.WEBSITE_LIST_URL }}
+          WEBSITE_LIST_KEY: ${{ secrets.WEBSITE_LIST_KEY }}
+        run: python scripts/website_address_list.py
+
       # 2026-10-19: publishes a tiny status file (pass/fail + how many pulled
       # leads changed, count only) to the watchdog-status branch. Claude's
       # daily watchdog reads it from raw.githubusercontent.com, which still
