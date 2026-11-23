@@ -712,7 +712,7 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
     if yo is not None:
         cf["years owned"] = yo
 
-    tags = ["crawler"] + sorted({t.strip().lower() for t in (d.get("Distress List") or "").split(",") if t.strip()})
+    tags = ["crawler", "crawler-seller"] + sorted({t.strip().lower() for t in (d.get("Distress List") or "").split(",") if t.strip()})
     if probate and "probate" not in tags:
         tags.append("probate")
     h = heat_tag(days)
