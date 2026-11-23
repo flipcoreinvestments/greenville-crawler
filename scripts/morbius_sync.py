@@ -127,6 +127,8 @@ class GHL:
             # two fields can share a name once lowercased ("Call attempts" from the Power Dialer and
             # "Call Attempts" from her Manual Calls box) -- keep every id so neither is lost
             self.ids_by_name.setdefault(n, []).append(f["id"])
+            if f.get("fieldKey"):
+                FIELD_IDS_BY_KEY[f["fieldKey"].strip()] = f["id"]
         return out
 
     def sellers_stage(self):
@@ -594,6 +596,19 @@ def years_owned(d):
 
 
 BANKRUPT = {}  # lead id -> (chapter, date_filed, case_number), filled in main()
+FIELD_IDS_BY_KEY = {}  # GHL custom field key (e.g. contact.address_check_street) -> id, filled by custom_fields()
+# 2026-11-23 (Tala GO): crawler cards also fill the custom Property Address (full) and the street-only
+# field, found by KEY so a rename in GHL never breaks it (Flo Rida row 551 / Jarvis row 583)
+ADDRESS_FIELD_KEYS = (("contact.property_address", "property address", "full"),
+                      ("contact.address_check_street", "address check street", "street"))
+
+
+def street_only(addr):
+    """'33 Altacrest Dr' -> 'Altacrest Dr' (street name only, never the house number)."""
+    import re as _re
+    a = (addr or "").strip()
+    a = _re.sub(r"^\s*\d+[A-Za-z]?(-\d+)?\s+", "", a)
+    return a.strip()
 # 2026-11-10: the new lead-flow changes that touch GHL (deed names, holding new leads during a
 # backlog, "delete in 5 days" tags and removals) run REPORT-ONLY until Tala approves them after
 # seeing the first report. Approval = morbius_state key 'flow_live' set to 1.
@@ -757,6 +772,15 @@ def build(lead, d, phones, fields, readded=False, readd_reason=""):
         "customFields": [{"id": fields[k], "field_value": v} for k, v in cf.items()
                          if k in fields and v not in (None, "")],
     }
+    street_ = body["address1"]
+    full_ = ", ".join(x for x in (street_, body["city"], " ".join(x for x in (body["state"], body["postalCode"]) if x)) if x)
+    have_ids_ = {f["id"] for f in body["customFields"]}
+    for key_, name_, kind_ in ADDRESS_FIELD_KEYS:
+        fid_ = FIELD_IDS_BY_KEY.get(key_) or fields.get(name_)
+        val_ = full_ if kind_ == "full" else street_only(street_)
+        if fid_ and val_ and fid_ not in have_ids_:
+            body["customFields"].append({"id": fid_, "field_value": val_})
+            have_ids_.add(fid_)
     if not body["phone"]:
         body.pop("phone")  # 2026-11-15: no-phone leads go in for mail / email only
     return body, tags, call_line
