@@ -119,8 +119,9 @@ class GHL:
     def custom_fields(self):
         r = self._req("GET", f"/locations/{LOC}/customFields", params={"model": "contact"})
         r.raise_for_status()
-        out, self.ids_by_name = {}, {}
+        out, self.ids_by_name, self.ids_exact = {}, {}, {}
         for f in r.json().get("customFields", []):
+            self.ids_exact[f["name"].strip()] = f["id"]
             n = f["name"].strip().lower()
             out[n] = f["id"]
             # two fields can share a name once lowercased ("Call attempts" from the Power Dialer and
@@ -1037,11 +1038,21 @@ def main():
                     except ValueError:
                         pass
                 return best
-            # the Power Dialer keeps its own count in "Call attempts"; Confidence sets its wait (2 or 3 days)
+            # 2026-11-23 (Tala): only "Call Attempts" (+1 once a day) counts. The old "Call attempts"
+            # field went up on every Call Result change, so its value is ignored (no early delete tag).
+            def calls_():
+                fid = getattr(api, "ids_exact", {}).get("Call Attempts")
+                if not fid:
+                    return num_("call attempts")
+                try:
+                    return float(str(have_.get(fid) or 0).replace(",", ""))
+                except ValueError:
+                    return 0
+            # Confidence sets the Power Dialer's wait (2 or 3 days)
             notes_ = api.notes(cid)
             s = flow.summarize(contact, api.opportunities(cid), notes_, api.call_log(cid),
                                offer_ids, stage_id, confidence=num_("confidence"),
-                               call_attempts=num_("call attempts"))
+                               call_attempts=calls_())
             # 2026-11-12: what her Call Result / Call Outcome / Working Numbers / notes say about the numbers
             id_name_ = {v: k for k, v in fields.items()}
             cf_ = {id_name_.get(fid, ""): val for fid, val in have_.items()}
