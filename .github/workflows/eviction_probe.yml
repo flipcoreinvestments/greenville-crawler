@@ -4,6 +4,9 @@ name: Eviction source probe (one-time, structure only)
 # published. Reads page structure only. No database, no secrets, no searches.
 on:
   workflow_dispatch:
+  push:
+    branches: [eviction-source-probe]
+    paths: ["scripts/eviction_source_probe.py", ".github/workflows/eviction_probe.yml"]
 
 permissions:
   contents: read
