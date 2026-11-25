@@ -37,6 +37,7 @@ DISTRESS_TAGS = [
     "permit_demolition",
     "insurance_damage",
     "code_violation",
+    "eviction_filing",   # added 2026-11-24: landlord has a magistrate eviction filing (name-matched, see eviction_filings_ingest.py)
     "probate",
     # "out_of_state_land" moved to the is_out_of_state_land column 2026-09-28
     # PropStream exports (propstream_import.py, added 2026-09-27)

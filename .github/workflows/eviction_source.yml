@@ -1,0 +1,40 @@
+name: Eviction filings source (monthly)
+
+# 2026-11-24 (Tala): stack Greenville magistrate eviction filings on existing leads, run MONTHLY
+# (1st of the month, 06:23 UTC) instead of nightly. Window = last 45 days, so every month overlaps
+# the one before. By hand: mode=test changes nothing on leads or the hidden list and saves at most
+# 10 matches to the private table eviction_test_preview; mode=live stacks and expires.
+on:
+  schedule:
+    - cron: "23 6 1 * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test (default for hand runs) or live"
+        required: false
+        default: "test"
+
+concurrency:
+  group: leads-database
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  eviction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt pytest
+      - run: playwright install --with-deps chromium
+      - name: Run unit tests
+        run: python -m pytest -q tests/test_eviction_filings.py
+      - name: Eviction filings ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          EVICTION_MODE: ${{ github.event_name == 'schedule' && 'live' || github.event.inputs.mode || 'test' }}
+        run: python scripts/run_step.py scripts/eviction_filings_ingest.py
