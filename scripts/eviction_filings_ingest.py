@@ -66,7 +66,7 @@ def is_eviction_row(row):
 
 
 def is_open(status, filed, today=None):
-    today = today or date.today()
+    today = today or today_et()
     if CLOSED_STATUS_RE.search(status or ""):
         return False
     return filed is None or (today - filed).days <= EXPIRE_AFTER_DAYS
@@ -123,27 +123,42 @@ def fetch_day(page, day):
     return out
 
 
+def open_form(ctx):
+    """A fresh search form behind the disclaimer (the form cannot be reused after a result page)."""
+    page = ctx.new_page()
+    page.goto(START_URL, timeout=45000, wait_until="domcontentloaded")
+    page.click("input[value='Accept']")
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(1500)
+    return page
+
+
+def today_et():
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York")).date()
+
+
 def fetch_window(days):
     from playwright.sync_api import sync_playwright
     cases, day_counts, failed_days = {}, {}, []
     with sync_playwright() as p:
         browser = p.chromium.launch()
         ctx = browser.new_context(user_agent=HEADERS)
-        page = ctx.new_page()
-        page.goto(START_URL, timeout=45000, wait_until="domcontentloaded")
-        page.click("input[value='Accept']")
-        page.wait_for_load_state("domcontentloaded")
-        page.wait_for_timeout(1500)
         for i in range(days):
-            day = date.today() - timedelta(days=i)
+            day = today_et() - timedelta(days=i)
             if day.weekday() >= 5:   # courts file on weekdays
                 continue
+            page = None
             try:
+                page = open_form(ctx)
                 rows = fetch_day(page, day)
             except Exception as e:
                 failed_days.append(day.isoformat())
                 print(f"  {day}: fetch failed ({type(e).__name__})", file=sys.stderr)
                 continue
+            finally:
+                if page:
+                    page.close()
             day_counts[day.isoformat()] = len(rows)
             if len(rows) >= ROW_CAP_WARNING:
                 print(f"  WARNING: {day} returned {len(rows)} rows (may be capped)")
@@ -207,7 +222,6 @@ def stack_on_lead(conn, lead, cases_for_lead):
 
 def expire_signals(conn, today=None):
     """Remove the tag from leads whose every stored case is closed or older than 90 days."""
-    today = today or date.today()
     removed = 0
     with conn.cursor() as cur:
         cur.execute("select id, raw->'eviction_filing'->'cases' from leads where %s = any(source_tags)", (SOURCE_NAME,))
