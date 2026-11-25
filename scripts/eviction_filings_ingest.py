@@ -44,7 +44,7 @@ P = "ctl00$ContentPlaceHolder1$"
 EVICTION_SUBTYPE_RE = re.compile(r"rule to vacate|notice to quit", re.I)
 CLOSED_STATUS_RE = re.compile(r"dispos|dismiss|settled|withdraw|satisf|closed", re.I)
 EXPIRE_AFTER_DAYS = 90
-ROW_CAP_WARNING = 250
+ROW_CAP_WARNING = 500   # days run ~260-290 rows; a hard cap has not been seen
 NAME_NOISE = {"JR", "SR", "II", "III", "IV", "ETAL", "ET", "AL", "AKA", "THE"}
 HEADERS = "UnstuckHomesResearch/1.0 (+tala@unstuckhomes.com; low-volume public-record lookup)"
 
