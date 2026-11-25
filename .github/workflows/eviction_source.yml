@@ -1,19 +1,18 @@
-name: Eviction filings source (TEST mode until Tala approves LIVE)
+name: Eviction filings source (monthly)
 
-# 2026-11-24 (Tala): stack Greenville magistrate eviction filings on existing leads.
-# TEST mode (default) changes nothing on leads or the hidden list; it saves at most 10
-# matches to the private table eviction_test_preview for Tala to review. LIVE is only
-# run by hand with mode=live after she approves, and only after this is merged.
+# 2026-11-24 (Tala): stack Greenville magistrate eviction filings on existing leads, run MONTHLY
+# (1st of the month, 06:23 UTC) instead of nightly. Window = last 45 days, so every month overlaps
+# the one before. By hand: mode=test changes nothing on leads or the hidden list and saves at most
+# 10 matches to the private table eviction_test_preview; mode=live stacks and expires.
 on:
+  schedule:
+    - cron: "23 6 1 * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "test (default) or live"
+        description: "test (default for hand runs) or live"
         required: false
         default: "test"
-  push:
-    branches: [eviction-source-probe]
-    paths: ["scripts/eviction_filings_ingest.py", ".github/workflows/eviction_source.yml"]
 
 concurrency:
   group: leads-database
@@ -37,5 +36,5 @@ jobs:
       - name: Eviction filings ingest
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          EVICTION_MODE: ${{ github.event.inputs.mode || 'test' }}
+          EVICTION_MODE: ${{ github.event_name == 'schedule' && 'live' || github.event.inputs.mode || 'test' }}
         run: python scripts/run_step.py scripts/eviction_filings_ingest.py
