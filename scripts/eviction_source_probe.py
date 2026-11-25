@@ -87,7 +87,8 @@ def main():
                 heads = sorted({re.sub(r"\s+", " ", c.inner_text()).strip() for c in page.query_selector_all("th")})
                 print(f"DETAIL table_headers={heads[:60]}")
                 print(f"DETAIL mentions_address_words={sorted({m.lower() for m in re.findall(r'address|street|premises|property', text, re.I)})}")
-                print(f"DETAIL has_street_pattern={bool(re.search(r'\\b\\d{2,5} [A-Z][A-Za-z]+ (St|Rd|Dr|Ave|Ln|Ct|Cir|Way|Blvd)\\b', text))}")
+                street_re = re.compile(r"\b\d{2,5} [A-Z][A-Za-z]+ (St|Rd|Dr|Ave|Ln|Ct|Cir|Way|Blvd)\b")
+                print("DETAIL has_street_pattern=" + str(bool(street_re.search(text))))
             else:
                 print("no link for chosen case number")
         except Exception as e:
