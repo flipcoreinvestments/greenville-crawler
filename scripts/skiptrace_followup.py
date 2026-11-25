@@ -130,7 +130,7 @@ LIST_NAMES = {
     "tax_sale": "Tax Sale", "repeat_tax_delinquent": "Tax Sale 2+ Years", "foreclosure_mie": "Foreclosure Auction",
     "hoa_foreclosure": "HOA Foreclosure", "pre_foreclosure": "Pre-Foreclosure", "probate": "Probate",
     "pre_probate": "Pre-Probate", "permit_expired": "Expired Permit", "permit_demolition": "Demolition Permit",
-    "insurance_damage": "Damage Permit", "code_violation": "Code Violation", "involuntary_lien": "Involuntary Lien",
+    "insurance_damage": "Damage Permit", "code_violation": "Code Violation", "eviction_filing": "Eviction Filing", "involuntary_lien": "Involuntary Lien",
     "failed_listing": "Failed Listing",
 }
 

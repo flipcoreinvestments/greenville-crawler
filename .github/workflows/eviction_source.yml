@@ -1,0 +1,41 @@
+name: Eviction filings source (TEST mode until Tala approves LIVE)
+
+# 2026-11-24 (Tala): stack Greenville magistrate eviction filings on existing leads.
+# TEST mode (default) changes nothing on leads or the hidden list; it saves at most 10
+# matches to the private table eviction_test_preview for Tala to review. LIVE is only
+# run by hand with mode=live after she approves, and only after this is merged.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test (default) or live"
+        required: false
+        default: "test"
+  push:
+    branches: [eviction-source-probe]
+    paths: ["scripts/eviction_filings_ingest.py", ".github/workflows/eviction_source.yml"]
+
+concurrency:
+  group: leads-database
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  eviction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt pytest
+      - run: playwright install --with-deps chromium
+      - name: Run unit tests
+        run: python -m pytest -q tests/test_eviction_filings.py
+      - name: Eviction filings ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          EVICTION_MODE: ${{ github.event.inputs.mode || 'test' }}
+        run: python scripts/run_step.py scripts/eviction_filings_ingest.py

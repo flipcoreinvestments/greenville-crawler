@@ -57,6 +57,7 @@ LIST_LABELS = {
     "permit_demolition": "Demolition permit",
     "insurance_damage": "Storm/fire/water damage permit",
     "code_violation": "Code violation (unfit structure)",
+    "eviction_filing": "Eviction filing (landlord)",
     "probate": "Probate (owner deceased)",
     "pre_probate": "Pre-probate (owner deceased)",
     "pre_foreclosure": "Pre-foreclosure",
@@ -89,12 +90,13 @@ GHL_LIST_OPTIONS = {
     "permit_demolition": "Demolition Permit",
     "insurance_damage": "Damage Permit",
     "code_violation": "Code Violation",
+    "eviction_filing": "Eviction Filing",
     "involuntary_lien": "Involuntary Lien",
     "failed_listing": "Failed Listing",
 }
 # order the Call Brief mentions lists in: most urgent first
 BRIEF_ORDER = ["foreclosure_mie", "hoa_foreclosure", "pre_foreclosure", "probate", "pre_probate",
-               "tax_sale", "repeat_tax_delinquent", "code_violation", "permit_demolition",
+               "tax_sale", "repeat_tax_delinquent", "code_violation", "eviction_filing", "permit_demolition",
                "insurance_damage", "permit_expired", "involuntary_lien", "failed_listing"]
 
 COLUMNS = [
@@ -302,6 +304,8 @@ def call_brief(r, tags, raw, mail_state, reasons):
             parts.append("Also on last year's tax sale list.")
         elif tag == "code_violation":
             parts.append("Code violation: county/city found the house unfit to live in.")
+        elif tag == "eviction_filing":
+            parts.append("Landlord: the owner has a recent magistrate-court eviction filing (matched by owner name).")
         elif tag == "permit_demolition":
             parts.append("Demolition permit filed.")
         elif tag == "insurance_damage":
